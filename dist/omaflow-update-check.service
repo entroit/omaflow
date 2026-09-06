@@ -1,0 +1,8 @@
+[Unit]
+Description=OmaFlow update check
+Documentation=https://github.com/entroit/omaflow
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omaflow check-update

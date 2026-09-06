@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OmaFlow
+GenericName=Local Dictation
+Comment=Open local dictation history and settings
+Exec=omaflow launch
+Icon=omaflow
+Terminal=false
+Categories=Utility;
+Keywords=dictation;transcription;speech;voice;
+StartupNotify=false

@@ -1,0 +1,31 @@
+[Unit]
+Description=OmaFlow configured NeMo speech server
+After=graphical-session.target
+PartOf=omaflow.service graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omaflow serve-asr
+Restart=on-failure
+RestartSec=2
+RestartPreventExitStatus=78
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

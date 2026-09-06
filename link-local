@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+setup_state=""
+if (($# > 1)); then
+  printf 'Usage: ./link-local [--no-models|--with-models]\n' >&2
+  exit 1
+fi
+case "${1:-}" in
+  --no-models) setup_state=pending ;;
+  --with-models) setup_state=ready ;;
+  '') ;;
+  *) printf 'Usage: ./link-local [--no-models|--with-models]\n' >&2; exit 1 ;;
+esac
+backup_dir="$config_home/omarchy/backups/omaflow-$(date +%Y%m%d-%H%M%S)"
+
+backup_and_link() {
+  local source_path="$1"
+  local target_path="$2"
+  local backup_name="$3"
+
+  mkdir -p "$(dirname "$target_path")"
+  if [[ -e "$target_path" && "$(readlink -f "$target_path")" == "$(readlink -f "$source_path")" ]]; then
+    return
+  fi
+  if [[ -e "$target_path" || -L "$target_path" ]]; then
+    mkdir -p "$backup_dir"
+    mv "$target_path" "$backup_dir/$backup_name"
+  fi
+  ln -s "$source_path" "$target_path"
+}
+
+# Every prerequisite fails with the command that fixes it, because this is the
+# only installer and a tester has nothing else to go on.
+missing=0
+require() {
+  local command_name="$1" remedy="$2"
+  command -v "$command_name" >/dev/null 2>&1 && return
+  printf 'Missing %s. Install it with: %s\n' "$command_name" "$remedy" >&2
+  missing=1
+}
+
+require cargo 'sudo pacman -S rust'
+require python3 'sudo pacman -S python'
+require jq 'sudo pacman -S jq'
+require pw-cat 'sudo pacman -S pipewire-audio'
+require curl 'sudo pacman -S curl'
+require wl-copy 'sudo pacman -S wl-clipboard'
+require wl-paste 'sudo pacman -S wl-clipboard'
+require hyprctl 'already part of Omarchy; run this inside a Hyprland session'
+require git 'sudo pacman -S git'
+(( missing == 0 )) || exit 1
+if [[ -z $setup_state ]]; then python3 "$repo_dir/tools/model_config.py" --check; fi
+
+cargo build --locked --release --manifest-path "$repo_dir/Cargo.toml"
+
+if [[ -n $setup_state ]]; then
+  "$repo_dir/target/release/omaflow" model-setup "$setup_state"
+  python3 "$repo_dir/tools/model_config.py" --check
+fi
+if [[ $setup_state == pending ]]; then
+  systemctl --user stop omaflow-asr.service >/dev/null 2>&1 || true
+fi
+
+backup_and_link "$repo_dir" "$config_home/omarchy/plugins/entroit.omaflow" "entroit.omaflow"
+"$repo_dir/target/release/omaflow" config-init
+python3 "$repo_dir/tools/set_hotkey.py" --sync --write-only
+backup_and_link "$config_home/omaflow/shortcut.lua" "$config_home/hypr/omaflow-hotkey.lua" "omaflow-hotkey.lua"
+mkdir -p "$HOME/.local/state/omaflow"
+chmod 700 "$HOME/.local/state/omaflow"
+backup_and_link "$repo_dir/integrations/hyprland.lua" "$config_home/hypr/omaflow.lua" "omaflow.lua"
+backup_and_link "$repo_dir/dist/omaflow.service" "$config_home/systemd/user/omaflow.service" "omaflow.service"
+backup_and_link "$repo_dir/dist/omaflow-asr.service" "$config_home/systemd/user/omaflow-asr.service" "omaflow-asr.service"
+backup_and_link "$repo_dir/dist/omaflow-update-check.service" "$config_home/systemd/user/omaflow-update-check.service" "omaflow-update-check.service"
+backup_and_link "$repo_dir/dist/omaflow-update-check.timer" "$config_home/systemd/user/omaflow-update-check.timer" "omaflow-update-check.timer"
+backup_and_link "$repo_dir/target/release/omaflow" "$HOME/.local/bin/omaflow" "omaflow"
+backup_and_link "$repo_dir/dist/omaflow.desktop" "$HOME/.local/share/applications/omaflow.desktop" "omaflow.desktop"
+backup_and_link "$repo_dir/assets/icon.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/omaflow.svg" "omaflow.svg"
+
+systemctl --user daemon-reload
+systemctl --user enable omaflow.service
+systemctl --user restart omaflow.service
+systemctl --user enable --now omaflow-update-check.timer
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database "$HOME/.local/share/applications"
+fi
+printf 'OmaFlow is linked to %s\n' "$repo_dir"
+if [[ -d "$backup_dir" ]]; then
+  printf 'Replaced files were backed up to %s\n' "$backup_dir"
+fi
+
+hyprctl reload
+config_errors="$(hyprctl configerrors)"
+if [[ -n "$config_errors" ]]; then
+  printf 'Hyprland rejected the configuration:\n%s\n' "$config_errors" >&2
+  exit 1
+fi
+omarchy restart shell
+
+# Symlinking the plugin folder does not make the widget appear: the shell reads
+# its enabled list from shell.json, so a fresh machine installs everything and
+# shows nothing. enablePlugin needs a live shell that has already rescanned.
+shell_ready=0
+for _ in $(seq 1 20); do
+  if timeout 2 omarchy-shell shell listPlugins >/dev/null 2>&1; then
+    shell_ready=1
+    break
+  fi
+  sleep 0.5
+done
+if ((shell_ready == 0)); then
+  printf 'The Omarchy shell did not become ready after restart.\n' >&2
+  exit 1
+fi
+if ! omarchy plugin list --json 2>/dev/null |
+  jq -e '.[] | select(.id == "entroit.omaflow" and .enabled)' >/dev/null 2>&1; then
+  if ! omarchy plugin enable entroit.omaflow >/dev/null 2>&1; then
+    printf 'Could not enable the bar widget. Run: omarchy plugin enable entroit.omaflow right\n' >&2
+    exit 1
+  fi
+fi
+
+if [[ -f "$config_home/hypr/bindings.lua" ]] &&
+  ! grep -q 'require("omaflow")' "$config_home/hypr/bindings.lua"; then
+  printf 'Add require("omaflow") to ~/.config/hypr/bindings.lua once.\n'
+fi
+
+if ! systemctl --user is-active --quiet omaflow.service; then
+  printf 'OmaFlow did not stay active. Inspect: journalctl --user -u omaflow.service -n 30\n' >&2
+  exit 1
+fi

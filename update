@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$repo_dir"
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  printf 'The OmaFlow checkout has local changes. Commit, stash or discard them, then re-run.\n' >&2
+  git status --short >&2
+  exit 1
+fi
+
+git pull --ff-only
+exec "$repo_dir/link-local"

@@ -1,0 +1,13 @@
+[Unit]
+Description=Check daily whether a new OmaFlow commit is available
+
+[Timer]
+# OmaFlow is installed from a git checkout, so nothing else would tell the
+# user a release exists. One fetch a day is enough and costs nothing offline.
+OnStartupSec=3min
+OnUnitActiveSec=24h
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Remove OmaFlow, its data, and models and runtimes installed by OmaFlow."""
+import argparse
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+from tools.install_receipt import read_receipt, receipt_path, save_receipt
+
+ROOT = Path(__file__).resolve().parent
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.parse_args()
+    home = Path.home()
+    config = Path(os.environ.get('XDG_CONFIG_HOME', home / '.config'))
+    state = Path(os.environ.get('XDG_STATE_HOME', home / '.local/state'))
+    links = {
+        config / 'omarchy/plugins/entroit.omaflow': ROOT,
+        config / 'hypr/omaflow-hotkey.lua': config / 'omaflow/shortcut.lua',
+        config / 'hypr/omaflow.lua': ROOT / 'integrations/hyprland.lua',
+        home / '.local/bin/omaflow': ROOT / 'target/release/omaflow',
+        home / '.local/share/applications/omaflow.desktop': ROOT / 'dist/omaflow.desktop',
+        home / '.local/share/icons/hicolor/scalable/apps/omaflow.svg': ROOT / 'assets/icon.svg',
+    }
+    units = ['omaflow.service', 'omaflow-asr.service', 'omaflow-update-check.service', 'omaflow-update-check.timer']
+    for unit in units:
+        links[config / 'systemd/user' / unit] = ROOT / 'dist' / unit
+    owned = [path for path, target in links.items() if path.is_symlink() and path.resolve() == target.resolve()]
+    plugin = config / 'omarchy/plugins/entroit.omaflow'
+    direct_checkout = plugin == ROOT
+    foreign = [path for path in links if (path.exists() or path.is_symlink()) and path not in owned and not (path == plugin and direct_checkout)]
+    if foreign:
+        parser.error('Refusing to remove integration owned elsewhere: ' + ', '.join(map(str, foreign)))
+    bindings = config / 'hypr/bindings.lua'
+    before = bindings.read_text() if bindings.exists() else ''
+    after = re.sub(r'^\s*-- OmaFlow dictation hotkey\.\n', '', before, flags=re.M)
+    after = re.sub(r'^\s*require\s*\(\s*[\'\"]omaflow[\'\"]\s*\)\s*;?[^\S\n]*(?:--[^\n]*)?\n?', '', after, flags=re.M)
+    if re.search(r'require\s*\(?\s*[\'\"]omaflow[\'\"]', after):
+        parser.error('Remove the custom OmaFlow require expression in bindings.lua first; it cannot be safely removed automatically.')
+    personal = Path(os.environ.get('OMAFLOW_CONFIG', config / 'omaflow/config.toml'))
+    purge_paths = [personal, state / 'omaflow', config / 'omaflow']
+    resources = read_receipt()
+    resource_paths = []
+    model_commands = []
+    packages = []
+    cache = Path(os.environ.get('XDG_CACHE_HOME', home / '.cache')) / 'nemo-speech/models'
+    for entry in resources:
+        kind, value = entry['kind'], entry['value']
+        path = Path(value)
+        if kind == 'nemo-runtime' and path == home / '.local/lib/nemo-speech':
+            resource_paths.append(path)
+        elif kind == 'speech-cache' and path.is_relative_to(cache) and '..' not in path.parts and path != cache and path.resolve().is_relative_to(cache.resolve()) and path.resolve() != cache.resolve():
+            resource_paths.append(path)
+        elif kind == 'cleanup-model' and value and not value.startswith('-'):
+            model_commands.append(['ollama', 'rm', value])
+        elif kind == 'package' and value in ('ollama', 'ollama-vulkan', 'ollama-cuda'):
+            packages.append(value)
+        else:
+            parser.error('Invalid installer receipt entry: ' + repr(entry))
+    runtime = Path(os.environ.get('XDG_RUNTIME_DIR', Path(tempfile.gettempdir()) / ('omaflow-' + os.environ.get('USER', ''))))
+    runtime_paths = [runtime / name for name in ('omaflow.sock', 'omaflow-state.json', 'omaflow-level')]
+    purge_paths += [config / 'hypr/bindings.lua.omaflow-backup', config / 'hypr/bindings.lua.omaflow-uninstall-backup']
+    purge_paths += list((config / 'omarchy/backups').glob('omaflow-*'))
+    for command in model_commands:
+        print('Remove installed model:', command[-1])
+    if packages:
+        print('Remove installed runtime packages:', ', '.join(packages))
+    for path in resource_paths + runtime_paths + [ROOT]:
+        print('Erase:', path)
+    for path in owned:
+        print('Remove link:', path)
+    if before != after:
+        print('Remove OmaFlow registration from:', bindings)
+    for path in purge_paths:
+        print('Erase:', path)
+    # Do not leave a live widget pointing at removed files. Failure leaves links intact.
+    if plugin in owned or direct_checkout:
+        subprocess.run(['omarchy', 'plugin', 'disable', 'entroit.omaflow'], check=True)
+    for unit in units:
+        if config / 'systemd/user' / unit in owned:
+            subprocess.run(['systemctl', '--user', 'disable', '--now', unit], check=True)
+    if before != after:
+        with tempfile.NamedTemporaryFile(mode='w', dir=bindings.parent, delete=False) as file:
+            file.write(after)
+            temporary = Path(file.name)
+        temporary.chmod(bindings.stat().st_mode & 0o777)
+        temporary.replace(bindings)
+    for path in owned:
+        path.unlink()
+    # Remove weights before their runtime. Failures preserve the receipt for retry.
+    model_env = dict(os.environ, OLLAMA_HOST='http://127.0.0.1:11434')
+    for command in model_commands:
+        subprocess.run(command, env=model_env, check=True)
+        resources = [entry for entry in resources if not (entry['kind'] == 'cleanup-model' and entry['value'] == command[-1])]
+        save_receipt(resources)
+    if packages:
+        if 'ollama' in packages or 'ollama-cuda' in packages:
+            subprocess.run(['sudo', 'systemctl', 'disable', '--now', 'ollama'], check=True)
+        subprocess.run(['sudo', 'pacman', '-R', '--noconfirm', *packages], check=True)
+        resources = [entry for entry in resources if entry['kind'] != 'package']
+        save_receipt(resources)
+    for path in resource_paths + runtime_paths + purge_paths:
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+    subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True)
+    if os.environ.get('HYPRLAND_INSTANCE_SIGNATURE'):
+        subprocess.run(['hyprctl', 'reload'], check=True)
+        errors = subprocess.check_output(['hyprctl', 'configerrors'], text=True).strip()
+        if errors:
+            raise RuntimeError('Hyprland configuration errors: ' + errors)
+    if receipt_path().exists():
+        receipt_path().unlink()
+        receipt_path().parent.rmdir()
+    shutil.rmtree(ROOT)
+    print('OmaFlow removed, including its checkout and recorded models and runtimes.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, subprocess.CalledProcessError, RuntimeError) as error:
+        raise SystemExit(str(error))
