@@ -15,6 +15,7 @@ Panel {
 
   property bool editShortcut: false
   property bool editModels: false
+  property bool editCleanupModel: false
   property var modelSettings: ({})
   property var shortcutSettings: ({})
   property string personalConfigPath: configHome + "/omaflow/config.toml"
@@ -32,6 +33,15 @@ Panel {
   property bool binaryFound: true
   readonly property string pluginDir: configHome + "/omarchy/plugins/entroit.omaflow"
   property string idlePage: "history"
+  // Which tab of Settings is showing. Settings used to be one long scroll in
+  // which privacy, vocabulary and model choices were interleaved with timing
+  // knobs; each of those is now its own page you can arrive at and leave.
+  property string settingsTab: "general"
+  // The curated model lists the daemon publishes, plus the state of any
+  // download it is running for us. Empty until the daemon answers.
+  property var modelCatalog: ({})
+  property var modelDownloads: ({})
+  property int duckAudioPercent: 70
   property real micLevel: 0
   property bool micDetected: false
   property var micBars: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
@@ -75,6 +85,8 @@ Panel {
   readonly property string configHome: Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config"
   readonly property var selectedEntry: root.history.find(function(e) { return String(e.id) === root.selectedEntryId }) || null
   function preference(key, value) { Quickshell.execDetached(["omaflow", "configure", key, JSON.stringify(value)]) }
+  function selectModel(kind, id) { Quickshell.execDetached(["omaflow", "model-select", kind, String(id)]) }
+  function installModel(kind, id) { Quickshell.execDetached(["omaflow", "model-install", kind, String(id)]) }
 
 
   // The panel is loaded from the checkout while the daemon is a compiled
@@ -88,6 +100,14 @@ Panel {
   readonly property bool meterPreviewActive: phase === "idle"
     && opened && idlePage === "settings"
   readonly property bool voiceDetected: micDetected
+  property string cleanupRuntime: "ready"
+  readonly property var speechCatalog: Array.isArray(root.modelCatalog.speech) ? root.modelCatalog.speech : []
+  readonly property var cleanupCatalog: Array.isArray(root.modelCatalog.cleanup) ? root.modelCatalog.cleanup : []
+  function downloadFor(id) { return root.modelDownloads[String(id)] || null }
+  readonly property bool speechDownloading: root.speechCatalog.some(function(entry) {
+    var job = root.downloadFor(entry.id)
+    return job !== null && job.state === "downloading"
+  })
     && (phase === "recording" || meterPreviewActive)
   readonly property bool silent: !voiceDetected
   readonly property int overlayWidth: phase === "recording"
@@ -140,6 +160,8 @@ Panel {
       root.asrRunning = Boolean(next.asr_running)
       root.cleanupLoaded = Boolean(next.cleanup_loaded)
       root.cleanupAvailable = Boolean(next.cleanup_available)
+      root.cleanupRuntime = ["ready", "stopped", "missing"].indexOf(next.cleanup_runtime) >= 0
+        ? String(next.cleanup_runtime) : (root.cleanupAvailable ? "ready" : "stopped")
       root.gpuMemoryMib = Math.max(0, Number(next.gpu_memory_mib) || 0)
       root.selectedHistoryIndex = Math.max(0,
         Math.min(root.selectedHistoryIndex, root.history.length - 1))
@@ -164,6 +186,10 @@ Panel {
       root.feedback = String(next.feedback || "")
       root.feedbackError = Boolean(next.feedback_error)
       root.recordingSeconds = Math.floor(Number(next.recording_elapsed_ms || 0) / 1000)
+      if (JSON.stringify(root.modelCatalog) !== JSON.stringify(next.model_catalog || {})) root.modelCatalog = next.model_catalog || ({})
+      if (JSON.stringify(root.modelDownloads) !== JSON.stringify(next.model_downloads || {})) root.modelDownloads = next.model_downloads || ({})
+      var nextDuck = Number(next.duck_audio_percent)
+      root.duckAudioPercent = isFinite(nextDuck) ? Math.max(0, Math.min(100, Math.round(nextDuck))) : 70
 
       if (root.phase !== "recording" && !root.meterPreviewActive) root.resetMeter()
 
@@ -270,13 +296,30 @@ Panel {
       idlePageLoader.item.activateCursor()
   }
 
+  // A disclosure that opens below the fold looks like a button that did
+  // nothing. The page that expanded says where it expanded, and the settings
+  // scroller brings it into view.
+  signal revealInSettings(var anchor)
+  function openSettings() {
+    root.idlePage = "settings"
+    // Settings opens on General, except on a machine that cannot dictate yet,
+    // where the only tab worth showing is the one that fixes that.
+    if (root.modelSettings.configured === false) root.settingsTab = "models"
+  }
   function editHotkey() { root.editShortcut = !root.editShortcut }
 
+  // The custom-model fields are the one part of Settings that cannot explain
+  // itself in a caption: engines, endpoints and health URLs need a page. Open
+  // the rendered guide rather than the Markdown file, which would land in an
+  // editor.
+  readonly property string guideBaseUrl: "https://github.com/entroit/omaflow/blob/main/docs/"
+  function openGuide(page) { Quickshell.execDetached(["xdg-open", root.guideBaseUrl + page]) }
   function openEditor(path) {
     root.controller.hide()
     Quickshell.execDetached(["omarchy-launch-editor", path])
   }
 
+  readonly property bool updateChecking: checkUpdateProcess.running
   function checkForUpdate() { if (!checkUpdateProcess.running) checkUpdateProcess.running = true }
   Process {
     id:checkUpdateProcess
@@ -431,42 +474,13 @@ Panel {
   Component {
     id: pillBarsIcon
 
-    Item {
-      readonly property color iconColor: root.phase === "recording"
-        || root.phase === "error"
+    OmaFlowMark {
+      barColor: root.phase === "recording" || root.phase === "error"
         ? Color.urgent
         : root.phase === "processing" ? Color.accent : barButton.foreground
-
-      Repeater {
-        model: [
-          { "x": 1, "y": 6, "width": 2.5, "height": 4 },
-          { "x": 4.75, "y": 3, "width": 2.5, "height": 10 },
-          { "x": 8.5, "y": 1, "width": 2.5, "height": 14 },
-          { "x": 12.25, "y": 5, "width": 2.5, "height": 6 }
-        ]
-
-        Rectangle {
-          required property var modelData
-          x: parent.width * modelData.x / 16
-          y: parent.height * modelData.y / 16
-          width: parent.width * modelData.width / 16
-          height: parent.height * modelData.height / 16
-          radius: width / 2
-          color: parent.iconColor
-        }
-      }
-
       // A quiet dot is the only ambient signal that a release exists; the
       // update check never notifies, so nothing else says so.
-      Rectangle {
-        visible: root.updateAttention && root.phase === "idle"
-        width: parent.width * 0.3
-        height: width
-        radius: width / 2
-        x: parent.width - width
-        y: 0
-        color: Color.accent
-      }
+      badge: root.updateAttention && root.phase === "idle"
     }
   }
 
@@ -1094,39 +1108,60 @@ Panel {
       }
       spacing: Style.space(12)
 
+      // The app's name and its mark sit above the tabs, so the panel reads
+      // like a window: who you are looking at first, then where you are in it.
+      // No "Ready" line — a working app saying it works is noise; the line
+      // below only appears when something actually needs attention.
       RowLayout {
         Layout.fillWidth: true
-        spacing: Style.space(10)
+        spacing: Style.space(9)
+
+        OmaFlowMark {
+          Layout.preferredWidth: Style.font.display
+          Layout.preferredHeight: Style.font.display
+          barColor: Color.accent
+        }
 
         Text {
           textFormat: Text.PlainText
-          text: "󰍬"
-          color: Color.accent
+          text: "OmaFlow"
+          color: Color.popups.text
           font.family: Style.font.family
-          font.pixelSize: Style.font.display
+          font.pixelSize: Style.font.title
+          font.bold: true
         }
 
-        ColumnLayout {
-          Layout.fillWidth: true
-          spacing: 0
+        Item { Layout.fillWidth: true }
 
-          Text {
-            textFormat: Text.PlainText
-            text: "OmaFlow"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.title
-            font.bold: true
-          }
-
-          Text {
-            textFormat: Text.PlainText
-            text: !root.binaryFound ? "Daemon not built" : !root.connected ? "Stopped or reconnecting" : root.modelSettings.configured === false ? "Models not configured" : !root.asrRunning ? "Speech model loading" : !root.cleanupEnabled ? "Ready, cleanup off" : !root.cleanupAvailable ? "Ready, cleanup offline" : "Ready"
-            color: root.connected ? Util.alpha(Color.popups.text, 0.58) : Color.urgent
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
+        Text {
+          Layout.maximumWidth: parent.width * 0.5
+          visible: text.length > 0
+          textFormat: Text.PlainText
+          elide: Text.ElideRight
+          text: !root.binaryFound ? "Daemon not built"
+            : !root.connected ? "Stopped or reconnecting"
+            : root.modelSettings.configured === false ? "Models not set up"
+            : root.speechDownloading ? "Downloading the speech model"
+            : !root.asrRunning ? "Speech model loading"
+            : ""
+          color: root.connected ? Util.alpha(Color.popups.text, 0.62) : Color.urgent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
         }
+
+        ActionButton {
+          visible: !root.connected && root.binaryFound
+          text: "Start"
+          foreground: Color.popups.text
+          background: Util.alpha(Color.accent, 0.22)
+          bordered: true
+          onClicked: root.startOmaFlow()
+        }
+      }
+
+      RowLayout {
+        Layout.fillWidth: true
+        spacing: Style.space(6)
 
         ActionButton {
           text: "History " + root.history.length
@@ -1141,17 +1176,10 @@ Panel {
           foreground: Color.popups.text
           background: root.idlePage === "settings" ? Util.alpha(Color.accent, 0.22) : "transparent"
           bordered: root.idlePage === "settings"
-          onClicked: root.idlePage = "settings"
+          onClicked: root.openSettings()
         }
 
-        ActionButton {
-          visible: !root.connected && root.binaryFound
-          text: "Start"
-          foreground: Color.popups.text
-          background: Util.alpha(Color.accent, 0.22)
-          bordered: true
-          onClicked: root.startOmaFlow()
-        }
+        Item { Layout.fillWidth: true }
       }
 
       // `omarchy plugin add` lands the QML with no daemon behind it. Say what
@@ -1187,6 +1215,57 @@ Panel {
             background: Util.alpha(Color.accent, 0.22)
             bordered: true
             onClicked: Quickshell.execDetached(["wl-copy", "cd " + root.pluginDir + " && ./install"])
+          }
+        }
+      }
+
+      Rectangle {
+        visible: root.binaryFound && root.modelSettings.configured === false && !root.speechDownloading
+        Layout.fillWidth: true
+        Layout.preferredHeight: setupBanner.implicitHeight + Style.space(20)
+        radius: Style.cornerRadius
+        color: Util.alpha(Color.accent, 0.14)
+
+        RowLayout {
+          id: setupBanner
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.margins: Style.space(10)
+          spacing: Style.space(10)
+
+          ColumnLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(2)
+
+            Text {
+              Layout.fillWidth: true
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              text: "Choose a speech model to start dictating"
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+
+            Text {
+              Layout.fillWidth: true
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              text: "Nothing was downloaded during installation. Each model lists its download size and what it needs to run, so you can pick one this computer can handle."
+              color: Util.alpha(Color.popups.text, 0.68)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          ActionButton {
+            text: "Choose a model"
+            foreground: Color.popups.text
+            background: Util.alpha(Color.accent, 0.28)
+            bordered: true
+            onClicked: { root.idlePage = "settings"; root.settingsTab = "models" }
           }
         }
       }
@@ -1376,6 +1455,11 @@ Panel {
           boundsBehavior: Flickable.StopAtBounds
           currentIndex: root.selectedHistoryIndex
 
+          ScrollHint {
+            view: historyList
+            reducedMotion: root.reducedMotion
+          }
+
           delegate: CursorSurface {
             id: historyCard
             required property var modelData
@@ -1383,7 +1467,7 @@ Panel {
             hasCursor: root.cursorActive && root.selectedHistoryIndex === index
             foreground: Color.popups.text
             accent: Color.accent
-            width: ListView.view.width
+            width: ListView.view.width - Style.space(7)
             height: historyContent.implicitHeight + Style.space(18)
             color: hasCursor
               ? fill : Util.alpha(Color.popups.text, 0.055)
@@ -1452,632 +1536,124 @@ Panel {
   Component {
     id: settingsView
 
-    Flickable {
-      id: settingsFlick
-      contentWidth: width
-      contentHeight: settingsContent.implicitHeight
-      clip: true
-      boundsBehavior: Flickable.StopAtBounds
+    ColumnLayout {
+      id: settingsPage
+
+      // The keyboard cursor scrolls the page under the tabs; the tabs
+      // themselves are reached with Tab like any other control.
       function moveCursor(dy) {
-        contentY = Math.max(0, Math.min(contentHeight - height,
-          contentY + dy * Style.space(64)))
+        settingsFlick.contentY = Math.max(0,
+          Math.min(Math.max(0, settingsFlick.contentHeight - settingsFlick.height),
+            settingsFlick.contentY + dy * Style.space(64)))
       }
       function activateCursor() {}
       function deleteCursor() {}
 
-      ColumnLayout {
-        id: settingsContent
-        width: settingsFlick.width
-        spacing: Style.space(12)
+      spacing: Style.space(10)
 
-        Text {
-          Layout.fillWidth: true
-          text: "Cleanup"
-          color: Color.popups.text
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
-          font.bold: true
-        }
-        Toggle {
-          Layout.fillWidth: true
-          label: "Natural cleanup"
-          description: "Removes fillers and repeated words, applies your spoken corrections and adds punctuation and paragraphs, without changing what you said. The title of the focused window tells the model whether it is writing a chat message, an email or code. Off keeps the exact recognized wording. Custom vocabulary applies either way."
-          foreground: Color.popups.text
-          checked: root.cleanupEnabled && root.writingStyle !== "verbatim"
-          onClicked: root.preference("enabled", !checked)
-        }
-        Text {
-          Layout.fillWidth: true
-          text: "Privacy"
-          color: Color.popups.text
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
-          font.bold: true
-        }
-        Text {
-          Layout.fillWidth: true
-          text: "With the default local servers, speech recognition and cleanup run on this computer and no audio or text leaves it. Audio stays in memory and is never written to disk."
-          wrapMode: Text.Wrap
-          color: Util.alpha(Color.popups.text,0.65)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
-        }
-        RowLayout {
-          Layout.fillWidth: true
-          spacing: Style.space(7)
-
-          ColumnLayout {
-            Layout.fillWidth: true
-            spacing: Style.space(1)
-
-            Text {
-              text: "History retention"
-              color: Color.popups.text
-              font.family: Style.font.family
-              font.pixelSize: Style.font.subtitle
-            }
-            Text {
-              Layout.fillWidth: true
-              text: root.historyLimit === 0
-                ? "Nothing is saved. Each dictation is gone once it is pasted."
-                : "Keeps the last " + root.historyLimit + " dictations in a file only your user can read, so you can reopen, edit and re-paste them."
-              wrapMode: Text.Wrap
-              color: Util.alpha(Color.popups.text, 0.52)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-          }
-
-          Repeater {
-            model: [0, 30, 100, 1000]
-
-            ActionButton {
-              required property int modelData
-              text: modelData === 0 ? "Off" : String(modelData)
-              foreground: Color.popups.text
-              fontSize: Style.font.bodySmall
-              selected: root.historyLimit === modelData
-              tooltipText: modelData === 0
-                ? "Do not save dictations"
-                : "Keep the last " + modelData + " dictations"
-              Accessible.name: tooltipText
-              Accessible.checkable: true
-              Accessible.checked: selected
-              onClicked: root.preference("history_limit", modelData)
-            }
-          }
-        }
-        ActionButton {
-          text: root.eraseConfirm ? "Confirm: erase all saved dictations" : "Erase saved dictations…"
-          tooltipText: "Deletes the history file" + (root.trainingLogEnabled ? " and the training log" : "") + ". The clipboard is not touched."
-          foreground: Color.urgent
-          onClicked: {
-            if (!root.eraseConfirm) root.eraseConfirm = true
-            else { Quickshell.execDetached(["omaflow","erase-data"]); root.eraseConfirm = false }
-          }
-        }        ActionButton { visible:root.eraseConfirm; text:"Keep my data"; onClicked:root.eraseConfirm=false }
-
-        Text {
-          text: "Memory"
-          color: Color.popups.text
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
-          font.bold: true
-        }
-        Toggle {
-          Layout.fillWidth: true
-          label: "Keep models loaded"
-          description: "On: the models stay loaded between dictations, so the hotkey answers at once; with the default models that is about 6 GB of GPU memory. Off: after five minutes without dictation they are unloaded, and the next dictation loads them first, about 2.5 s with the defaults on the reference machine. Servers you run yourself are left alone."
-          foreground: Color.popups.text
-          checked: root.keepModelsLoaded
-          onClicked: root.preference("keep_models_loaded", !checked)
-        }
-
-        Text {
-          text: "Keyboard"
-          color: Color.popups.text
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
-          font.bold: true
-        }
-
-        Rectangle {
-          Layout.fillWidth: true
-          Layout.preferredHeight: shortcutContent.implicitHeight + Style.space(20)
-          radius: Style.cornerRadius
-          color: Util.alpha(Color.popups.text, 0.055)
-
-          RowLayout {
-            id: shortcutContent
-            anchors.fill: parent
-            anchors.margins: Style.space(10)
-            spacing: Style.space(12)
-
-            ColumnLayout {
-              Layout.fillWidth: true
-              spacing: Style.space(2)
-
-              Text {
-                text: root.hotkeyDisplay
-                color: Color.accent
-                font.family: Style.font.family
-                font.pixelSize: Style.font.body
-                font.bold: true
-              }
-
-              Text {
-                text: "Hold to talk, double-tap to lock"
-                color: Util.alpha(Color.popups.text, 0.55)
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-              }
-            }
-
-            ActionButton {
-              text: root.editShortcut ? "Done" : "Change"
-              foreground: Color.popups.text
-              bordered: true
-              onClicked: root.editHotkey()
-            }
-          }
-        }
-
-        HotkeySettings { Layout.fillWidth: true; visible:root.editShortcut; flow:root }
-
-        RowLayout {
-          Layout.fillWidth: true
-          spacing: Style.space(7)
-
-          ColumnLayout {
-            Layout.fillWidth: true
-            spacing: Style.space(1)
-
-            Text {
-              text: "Paste delivery"
-              color: Color.popups.text
-              font.family: Style.font.family
-              font.pixelSize: Style.font.body
-              font.bold: true
-            }
-
-            Text {
-              Layout.fillWidth: true
-              text: "Auto sends Ctrl+V, or Shift+Insert in terminals."
-              color: Util.alpha(Color.popups.text, 0.52)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.Wrap
-            }
-          }
-
-          Repeater {
-            model: [
-              { "label": "Auto", "value": "auto" },
-              { "label": "Ctrl+V", "value": "ctrl-v" },
-              { "label": "Shift+Insert", "value": "shift-insert" },
-              { "label": "Copy", "value": "clipboard" }
-            ]
-
-            ActionButton {
-              required property var modelData
-              text: modelData.label
-              foreground: Color.popups.text
-              background: root.pasteMode === modelData.value
-                ? Util.alpha(Color.accent, 0.22) : "transparent"
-              bordered: root.pasteMode === modelData.value
-              onClicked: root.setPasteMode(modelData.value)
-            }
-          }
-        }
-
-        Text {
-          text: "Microphone sensitivity (" + root.meterGateDb + " dB)"
-          color: Color.popups.text
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
-          font.bold: true
-        }
-
-        Rectangle {
-          Layout.fillWidth: true
-          Layout.preferredHeight: sensitivityContent.implicitHeight + Style.space(20)
-          radius: Style.cornerRadius
-          color: Util.alpha(Color.popups.text, 0.055)
-
-          ColumnLayout {
-            id: sensitivityContent
-            anchors.fill: parent
-            anchors.margins: Style.space(10)
-            spacing: Style.space(7)
-
-            RowLayout {
-              Layout.fillWidth: true
-
-              Text {
-                Layout.fillWidth: true
-                text: root.voiceDetected ? "Voice detected" : "Speak to test. Set the marker above room noise."
-                color: root.voiceDetected ? Color.accent : Util.alpha(Color.popups.text, 0.66)
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-              }
-
-              ActionButton {
-                text: "Reset"
-                foreground: Color.popups.text
-                onClicked: root.commitMeterGate(-60)
-              }
-            }
-
-            // One control, not two. The live meter is the track and the
-            // threshold marker is its handle, so "where my voice reaches" and
-            // "where the cutoff sits" are read on the same scale and set by
-            // dragging the thing you are looking at.
-            Item {
-              id: meterControl
-              Layout.fillWidth: true
-              Layout.preferredHeight: Style.space(22)
-
-              readonly property real minimumDb: -70
-              readonly property real maximumDb: -35
-              // The meter spans -72..0 dBFS, so the adjustable range covers
-              // only the quiet end of the track; clamp rather than rescale, or
-              // the marker would stop matching the level it is measuring.
-              readonly property real minimumPosition: (minimumDb + 72) / 72
-              readonly property real maximumPosition: (maximumDb + 72) / 72
-              readonly property real thresholdPosition:
-                Math.max(0, Math.min(1, (root.meterGateDb + 72) / 72))
-
-              function dbAt(x) {
-                var position = Math.max(minimumPosition,
-                  Math.min(maximumPosition, x / Math.max(1, width)))
-                return position * 72 - 72
-              }
-
-              Rectangle {
-                id: meterTrack
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                height: Style.space(10)
-                radius: height / 2
-                color: Util.alpha(Color.popups.text, 0.10)
-                clip: true
-
-                Rectangle {
-                  width: parent.width * root.micLevel
-                  height: parent.height
-                  radius: height / 2
-                  color: root.voiceDetected ? Color.accent : Util.alpha(Color.popups.text, 0.34)
-                  Behavior on width { NumberAnimation { duration: root.reducedMotion ? 0 : 45; easing.type: Easing.OutQuad } }
-                }
-              }
-
-              Rectangle {
-                id: meterHandle
-                x: Math.max(0, Math.min(parent.width - width,
-                  parent.width * meterControl.thresholdPosition - width / 2))
-                anchors.verticalCenter: parent.verticalCenter
-                width: Math.max(4, Style.space(4))
-                height: parent.height
-                radius: width / 2
-                color: Color.urgent
-                scale: meterDrag.pressed ? 1.12 : meterHover.hovered ? 1.06 : 1
-                Behavior on scale { NumberAnimation { duration: root.reducedMotion ? 0 : 90 } }
-              }
-
-              HoverHandler {
-                id: meterHover
-                cursorShape: Qt.SizeHorCursor
-              }
-
-              Controls.Slider {
-                id: meterDrag
-                anchors.fill: parent
-                from: -72; to: 0; stepSize: 1
-                value: root.meterGateDb
-                background: Rectangle { color: "transparent"; border.width: meterDrag.activeFocus ? 1 : 0; border.color: Color.accent }
-                handle: Item {}
-                Accessible.name: "Microphone sensitivity"
-                onMoved: pressed ? root.previewMeterGate(value) : root.commitMeterGate(value)
-                onPressedChanged: if (!pressed) root.commitMeterGate(value)
-              }
-
-            }
-
-            RowLayout {
-              Layout.fillWidth: true
-              Text {
-                text: "More sensitive"
-                color: Util.alpha(Color.popups.text, 0.48)
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-              }
-              Item { Layout.fillWidth: true }
-              Text {
-                text: "Less sensitive"
-                color: Util.alpha(Color.popups.text, 0.48)
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-              }
-            }
-          }
-        }
-
-        Text {
-          text: "Models"
-          color: Color.popups.text
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
-          font.bold: true
-        }
-
-        Rectangle {
-          Layout.fillWidth: true
-          Layout.preferredHeight: pipelineGrid.implicitHeight + Style.space(20)
-          radius: Style.cornerRadius
-          color: Util.alpha(Color.popups.text, 0.055)
-
-          GridLayout {
-            id: pipelineGrid
-            anchors.fill: parent
-            anchors.margins: Style.space(10)
-            columns: 2
-            columnSpacing: Style.space(18)
-            rowSpacing: Style.space(8)
-
-            Repeater {
-              model: [
-                { "label": "Speech", "value": (root.modelSettings.speech_model || "Not selected") + ", " + (root.asrRunning ? (root.modelSettings.speech_engine === "nemo" || root.modelSettings.speech_engine === "parakeet" ? "Running" : "Reachable") : "Stopped"), "ok": root.asrRunning },
-                { "label": "Cleanup", "value": (root.modelSettings.cleanup_model || "Not selected") + ", " + (!root.cleanupEnabled ? "Off" : !root.cleanupAvailable ? "Offline" : root.cleanupLoaded ? "Loaded" : "On demand"), "ok": root.cleanupLoaded },
-                { "label": "GPU memory", "value": root.gpuMemoryMib > 0 ? (root.gpuMemoryMib / 1024).toFixed(1) + " GB" : "Idle", "ok": root.gpuMemoryMib > 0 },
-                { "label": "Training log", "value": root.trainingLogEnabled ? "On" : "Off", "ok": root.trainingLogEnabled }
-              ]
-
-              RowLayout {
-                required property var modelData
-                Layout.fillWidth: true
-                spacing: Style.space(7)
-
-                Rectangle {
-                  Layout.preferredWidth: Style.space(7)
-                  Layout.preferredHeight: Style.space(7)
-                  radius: width / 2
-                  color: modelData.ok ? Color.accent : Util.alpha(Color.popups.text, 0.28)
-                }
-
-                ColumnLayout {
-                  Layout.fillWidth: true
-                  spacing: 0
-                  Text {
-                    text: modelData.label
-                    color: Color.popups.text
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
-                  }
-                  Text {
-                    Layout.fillWidth: true
-                    wrapMode: Text.WrapAnywhere
-                    text: modelData.value
-                    color: Util.alpha(Color.popups.text, 0.52)
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
-                  }
-                }
-              }
-            }
-          }
-        }
-
-        ActionButton { text: root.editModels ? "Close model settings" : root.modelSettings.configured === false ? "Set up models" : "Configure models"; onClicked: root.editModels = !root.editModels }
-        ModelSettings { Layout.fillWidth:true; visible:root.editModels; flow:root }
-
-        Text {
-          text: "Custom vocabulary"
-          color: Color.popups.text
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
-          font.bold: true
-        }
-
-        Text {
-          Layout.fillWidth: true
-          text: "Add names, products, and technical terms you want spelled exactly."
-          color: Util.alpha(Color.popups.text, 0.52)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.Wrap
-        }
+      Flow {
+        Layout.fillWidth: true
+        spacing: Style.space(5)
 
         Repeater {
-          model: root.customVocabulary
-
-          Rectangle {
-            required property var modelData
-            Layout.fillWidth: true
-            Layout.preferredHeight: vocabularyRow.implicitHeight + Style.space(10)
-            radius: Style.cornerRadius
-            color: Util.alpha(Color.popups.text, 0.045)
-
-            HoverHandler { id: vocabularyHover }
-
-            RowLayout {
-              id: vocabularyRow
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(6)
-
-              Text {
-                Layout.fillWidth: true
-                text: String(modelData)
-                textFormat: Text.PlainText
-                wrapMode: Text.Wrap
-                color: Color.popups.text
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-              }
-
-              ActionButton {
-                text: "Remove"
-                foreground: Util.alpha(Color.popups.text, 0.62)
-                onClicked: root.removeVocabulary(modelData)
-              }
-            }
-          }
-        }
-
-        RowLayout {
-          Layout.fillWidth: true
-          spacing: Style.space(8)
-
-          TextField {
-            id: vocabularyField
-            Layout.fillWidth: true
-            foreground: Color.popups.text
-            accent: Color.accent
-            placeholderText: "Add a word or phrase"
-            maximumLength: 80
-            onAccepted: {
-              root.addVocabulary(text)
-              focus = false
-            }
-          }
+          // General first, where every settings panel puts it, and because it
+          // holds the hotkey — the one setting you use every time you dictate.
+          // The rest follow the pipeline: the voice arrives (Speech), gets
+          // tidied (Cleanup) with your own words spelled right (Vocabulary),
+          // then the room and what is kept (Audio, Privacy). A machine with no
+          // model still opens on Speech; see openSettings().
+          model: [
+            { "key": "general", "label": "General" },
+            { "key": "models", "label": "Speech" },
+            { "key": "cleanup", "label": "Cleanup" },
+            { "key": "vocabulary", "label": "Vocabulary" },
+            { "key": "audio", "label": "Audio" },
+            { "key": "privacy", "label": "Privacy" }
+          ]
 
           ActionButton {
-            text: "Add"
+            required property var modelData
+            text: modelData.label
             foreground: Color.popups.text
-            background: Util.alpha(Color.accent, 0.22)
-            bordered: true
-            enabled: vocabularyField.text.trim().length > 0
+            fontSize: Style.font.bodySmall
+            background: root.settingsTab === modelData.key
+              ? Util.alpha(Color.accent, 0.20) : "transparent"
+            bordered: root.settingsTab === modelData.key
+            Accessible.checkable: true
+            Accessible.checked: root.settingsTab === modelData.key
             onClicked: {
-              root.addVocabulary(vocabularyField.text)
+              root.settingsTab = modelData.key
+              settingsFlick.contentY = 0
             }
           }
         }
+      }
 
-        Text {
-          text: "Updates"
-          color: Color.popups.text
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
-          font.bold: true
-        }
+      Flickable {
+        id: settingsFlick
+        Layout.fillWidth: true
+        Layout.fillHeight: true
+        contentWidth: width
+        contentHeight: tabLoader.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
 
-        Rectangle {
-          Layout.fillWidth: true
-          Layout.preferredHeight: updateContent.implicitHeight + Style.space(20)
-          radius: Style.cornerRadius
-          color: Util.alpha(Color.popups.text, 0.055)
+        readonly property real maximumY: Math.max(0, contentHeight - height)
 
-          ColumnLayout {
-            id: updateContent
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            anchors.margins: Style.space(10)
-            spacing: Style.space(6)
-
-            RowLayout {
-              Layout.fillWidth: true
-              spacing: Style.space(10)
-
-              ColumnLayout {
-                Layout.fillWidth: true
-                spacing: Style.space(2)
-
-                Text {
-                  Layout.fillWidth: true
-                  textFormat: Text.PlainText
-                  text: root.updateError
-                    ? "Could not check for updates"
-                    : !root.supportedState
-                      ? "The running daemon is newer than this panel"
-                      : root.needsRebuild
-                      ? "Version " + root.checkoutVersion + " is ready to install"
-                      : root.updateAvailable
-                        ? (root.updateRemoteVersion
-                          ? "Version " + root.updateRemoteVersion + " is available"
-                          : root.updateBehind + (root.updateBehind === 1
-                            ? " new commit is available" : " new commits are available"))
-                        : root.updateCheckedAtMs === 0 ? "Updates have not been checked" : "OmaFlow " + root.runningVersion + " is up to date"
-                  color: root.updateAttention ? Color.accent : Color.popups.text
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.body
-                  font.bold: true
-                  wrapMode: Text.Wrap
-                }
-
-                Text {
-                  Layout.fillWidth: true
-                  textFormat: Text.PlainText
-                  text: root.updateError
-                    ? "Last check failed: " + root.updateError
-                    : root.needsRebuild || !root.supportedState
-                      ? "The checkout moved but the daemon was not rebuilt. Finish update rebuilds it."
-                      : root.updateCheckedAtMs > 0
-                        ? "Checked " + root.formatHistoryTime(root.updateCheckedAtMs).toLowerCase()
-                        : "Not checked yet"
-                  color: Util.alpha(Color.popups.text, 0.55)
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  wrapMode: Text.Wrap
-                }
-              }
-
-              ActionButton {
-                visible: root.needsRebuild || !root.supportedState
-                text: "Finish update"
-                foreground: Color.popups.text
-                background: Util.alpha(Color.accent, 0.22)
-                bordered: true
-                onClicked: root.finishUpdate()
-              }
-
-              ActionButton {
-                visible: root.updateAvailable && !root.needsRebuild && root.supportedState
-                text: "Update"
-                foreground: Color.popups.text
-                background: Util.alpha(Color.accent, 0.22)
-                bordered: true
-                onClicked: root.applyUpdate()
-              }
-
-              ActionButton {
-                visible: !root.updateAttention
-                text: checkUpdateProcess.running ? "Checking…" : "Check now"
-                enabled: !checkUpdateProcess.running
-                foreground: Color.popups.text
-                bordered: true
-                onClicked: root.checkForUpdate()
-              }
-            }
+        Connections {
+          target: root
+          function onRevealInSettings(anchor) {
+            if (!anchor) return
+            // Put the thing that just opened a little below the top edge, so
+            // it is obviously the reason the view moved and the content under
+            // it is visible.
+            var top = anchor.mapToItem(tabLoader, 0, 0).y - Style.space(12)
+            revealAnimation.to = Math.max(0, Math.min(settingsFlick.maximumY, top))
+            if (root.reducedMotion) settingsFlick.contentY = revealAnimation.to
+            else revealAnimation.restart()
           }
         }
 
-        ActionButton {
-          text: "Reload config.toml"
-          onClicked: Quickshell.execDetached(["omaflow", "reload-config"])
-        }
-        ActionButton {
-          text: "Open config.toml"
-          foreground: Color.popups.text
-          bordered: true
-          onClicked: root.openEditor(root.personalConfigPath)
+        NumberAnimation {
+          id: revealAnimation
+          target: settingsFlick
+          property: "contentY"
+          duration: 220
+          easing.type: Easing.OutCubic
         }
 
-        Rectangle {
-          Layout.fillWidth: true
-          Layout.topMargin: Style.space(4)
-          Layout.preferredHeight: Style.spacing.hairline
-          color: Util.alpha(Color.popups.text, 0.12)
+        ScrollHint {
+          view: settingsFlick
+          reducedMotion: root.reducedMotion
+          height: Math.max(Style.space(24), settingsFlick.height
+            * (settingsFlick.height / Math.max(1, settingsFlick.contentHeight)))
         }
 
-        ActionButton {
-          Layout.bottomMargin: Style.space(4)
-          text: "Quit OmaFlow"
-          foreground: Color.urgent
-          onClicked: root.quitOmaFlow()
+        Loader {
+          id: tabLoader
+          // A fixed gutter for the scroll indicator, reserved whether or not
+          // the page currently scrolls. Reserving it conditionally would let a
+          // width change alter the content height that decides the condition.
+          width: settingsFlick.width - Style.space(7)
+          // A fresh instance per tab: each page owns draft text fields and
+          // expanded sections, and leaving a tab should discard them rather
+          // than keep half-typed state alive behind the scenes.
+          sourceComponent: root.settingsTab === "audio" ? audioTab
+            : root.settingsTab === "vocabulary" ? vocabularyTab
+            : root.settingsTab === "privacy" ? privacyTab
+            : root.settingsTab === "models" ? modelsTab
+            : root.settingsTab === "cleanup" ? cleanupTab
+            : generalTab
         }
+
+        Component { id: cleanupTab; SettingsCleanup { width: tabLoader.width; flow: root } }
+        Component { id: modelsTab; SettingsModels { width: tabLoader.width; flow: root } }
+        Component { id: audioTab; SettingsAudio { width: tabLoader.width; flow: root } }
+        Component { id: vocabularyTab; SettingsVocabulary { width: tabLoader.width; flow: root } }
+        Component { id: privacyTab; SettingsPrivacy { width: tabLoader.width; flow: root } }
+        Component { id: generalTab; SettingsGeneral { width: tabLoader.width; flow: root } }
       }
     }
   }
+
 }
