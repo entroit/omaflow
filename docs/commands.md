@@ -1,9 +1,9 @@
 # Command reference
 
 `omaflow` is one binary. The daemon and the speech server run as user
-services; every other command talks to the running daemon over its socket
-and returns immediately. The Hyprland binding, the bar widget and the
-installer use the same commands, so anything the panel does can be scripted.
+services; most other commands talk to the running daemon over its socket and
+return immediately. The Hyprland binding, the bar widget and the installer use
+the same commands, so anything the panel does can be scripted.
 
 ## Recording
 
@@ -43,7 +43,6 @@ History is empty unless `history_limit` is above zero.
 | Command | Effect |
 |---|---|
 | `configure KEY JSON` | Write one setting to `~/.config/omaflow/config.toml` and apply it. This is what the panel calls. |
-| `configure models JSON` | Save speech and cleanup model selections. |
 | `vocabulary-add TERM` / `vocabulary-remove TERM` | Edit the custom vocabulary. |
 | `reload-config` | Re-read `config.toml` and regenerate the Hyprland shortcut. |
 | `effective-config` | Print the merged configuration the daemon is using. |
@@ -56,7 +55,21 @@ History is empty unless `history_limit` is above zero.
 | `meter-gate DB` | Set the voice threshold in dBFS. Below it, the recording is treated as silence. |
 | `meter-gate-preview DB` | Try a threshold without saving it. |
 
-## Models and evaluation
+## Models
+
+| Command | Effect |
+|---|---|
+| `model-catalog` | Print the built-in catalog as JSON, with an `installed` and a `selected` flag per entry. |
+| `model-select speech\|cleanup ID` | Switch to a catalog model whose weights are already on disk. |
+| `model-install speech\|cleanup ID` | Download a catalog model, then switch to it. Reports progress to the panel. The first managed speech model also installs the NeMo-Speech runtime. |
+| `configure models JSON` | Save speech and cleanup model selections, including a model or server the catalog does not offer. |
+
+Both `model-select` and `model-install` take an id from `model-catalog`; an
+unknown one is refused with the list of valid ids. A model outside the catalog
+goes in through `configure models` instead. See
+[running your own model](custom-models.md).
+
+## Evaluation
 
 | Command | Effect |
 |---|---|
@@ -83,6 +96,6 @@ Used by the services, the installer and the panel; not needed from a shell.
 |---|---|
 | `daemon` | The `omaflow` service. Runs the daemon in the foreground. |
 | `serve-asr` | The `omaflow-asr` service. Runs the managed speech server. |
-| `model-setup pending\|ready` | `link-local` and `./install`, to record whether the selected models are set up. |
-| `config-shortcut JSON` | The installer, to write `[shortcut]` keys and consumed keys. |
+| `model-setup pending\|ready` | `link-local --no-models` / `--with-models`, to record whether a speech model is ready to use. |
+| `config-shortcut JSON` | `tools/set_hotkey.py`, to write `[shortcut]` keys and consumed keys. |
 | `meter-preview-start` / `meter-preview-stop` | The panel, to stream the input level while it is open. |

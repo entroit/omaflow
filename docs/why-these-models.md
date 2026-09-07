@@ -1,6 +1,9 @@
-# Why these models
+# What was measured here
 
 Checked 4–6 September 2026 on a Ryzen 5 9600X, 32 GB RAM, RTX 5060 Ti 16 GB.
+These are the measurements that decided the defaults and the cleanup prompt.
+Everything else in the model catalog is a published figure, not a number taken
+on this machine.
 
 | Stage | Selection | Disk / VRAM | Reason |
 |---|---|---:|---|
@@ -8,31 +11,9 @@ Checked 4–6 September 2026 on a Ryzen 5 9600X, 32 GB RAM, RTX 5060 Ti 16 GB.
 | Cleanup | Gemma 4 E4B Q4_K_M | 9.6 GB / 4.4 GiB | Best result in the local 32-case comparison |
 | Guard | Rust | — | Restores exact vocabulary, rejects language and number changes |
 
-NeMo-Speech.cpp is Apache-2.0, Parakeet's weights are CC-BY-4.0, Gemma 4 is
-Apache-2.0. Nothing leaves the machine.
+Nothing leaves the machine.
 
 ## Speech
-
-Hugging Face Open ASR English results, CSV of 3 September 2026, open-weight
-models only:
-
-| Model | Rank | Params | Languages | Avg WER ↓ | RTFx ↑ |
-|---|---:|---:|---:|---:|---:|
-| Qwen3-ASR 1.7B | 1 | 2.04B | 52 | 4.311 | 820× |
-| Cohere Transcribe 03-2026 | 9 | 2.0B | 14 | 4.670 | 907× |
-| **Parakeet TDT v3** | 13 | 0.60B | 25* | 4.859 | **6,076×** |
-| Qwen3-ASR 0.6B | 21 | 0.78B | 52 | 5.045 | 744× |
-| Nemotron 3.5 Streaming | 46 | 0.64B | 40 | 7.876 | 1,472× |
-
-\* The model card lists 25 European languages; the leaderboard metadata counts
-26. The card's own numbers (6.32 WER, 3,332×) predate the leaderboard's
-cleaned datasets.
-
-Parakeet gives up 0.5 WER to the 3× larger Qwen 1.7B and is seven times
-faster; against the same-size Qwen 0.6B it wins on both. Qwen3-ASR is the
-right choice for a language outside Parakeet's 25. Nemotron streams natively
-but its English WER is materially worse. Voxtral Mini 4B Realtime needs the
-whole 16 GB card.
 
 Measured against the persistent local NeMo-Speech.cpp 0.1.0 CUDA server, HTTP
 time including upload and JSON response:
@@ -43,11 +24,7 @@ time including upload and JSON response:
 | 120.00 s, 369 words | 373.6 ms | 321× real time |
 
 Sources: [Parakeet model card](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3),
-[NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp),
-[Open ASR CSV](https://huggingface.co/datasets/hf-audio/open-asr-leaderboard-results/blob/main/english_short_latest.csv),
-[Nemotron 3.5](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b),
-[Voxtral Mini 4B Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602),
-[Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR).
+[NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp).
 
 ## Cleanup
 
