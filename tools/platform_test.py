@@ -62,33 +62,30 @@ with tempfile.TemporaryDirectory(prefix="omaflow-platform-") as directory:
                XDG_CONFIG_HOME=str(base/'fresh'), XDG_CACHE_HOME=str(base/'.cache'), XDG_RUNTIME_DIR=str(base), HYPRLAND_INSTANCE_SIGNATURE="test")
     bootstrap = subprocess.run([str(ROOT/'scripts/preflight.sh'), '--bootstrap'], env=env, capture_output=True, text=True, timeout=10).stdout
     ordinary = subprocess.run([str(ROOT/'scripts/preflight.sh')], env=env, capture_output=True, text=True, timeout=10).stdout
-    for label in ['no Omarchy plugin directory', 'ollama is not running', 'pw-cat is missing']:
+    for label in ['no Omarchy plugin directory', 'pw-cat is missing']:
         assert 'warn  '+label in bootstrap, bootstrap
         assert 'FAIL  '+label in ordinary, ordinary
     print("PASS fresh bootstrap treats installer-owned dependencies as repairable")
-    deferred = subprocess.run([str(ROOT/'scripts/preflight.sh'), '--bootstrap', '--no-models'], env=env, capture_output=True, text=True, timeout=10)
-    assert deferred.returncode == 0, deferred.stdout + deferred.stderr
-    assert 'NVIDIA checks skipped' in deferred.stdout and 'ollama is not running' not in deferred.stdout
-    print('PASS model-free preflight does not require GPU or model servers')
+    # Models arrive after the install now, so preflight must never gate on a GPU,
+    # on VRAM or on a running model server.
+    for output in [bootstrap, ordinary]:
+        assert not any(word in output for word in ['GPU', 'VRAM', 'CUDA', 'ollama', 'Ollama', 'speech port']), output
+    print('PASS preflight checks only what an app-only install needs')
 
 
     for name in ["pacman", "ollama"]:
         path = commands / name
         path.write_text("#!/usr/bin/bash\nexit 0\n")
         path.chmod(0o755)
-    for active in [False, True]:
-        (commands / "systemctl").write_text(
-            '#!/usr/bin/bash\ncase "$1" in is-enabled) exit 0;; is-active) exit '
-            + ('0' if active else '1') + ';; esac\n'
-        )
-        plan = subprocess.run(
-            [str(ROOT / 'install'), '--skip-preflight', '--dry-run'],
-            env=dict(env, PATH=str(commands)+":/usr/bin", HOME=str(base)),
-            capture_output=True, text=True, timeout=10,
-        )
-        assert plan.returncode == 0, plan.stderr
-        assert ('enable the ollama system service' in plan.stdout) == (not active), plan.stdout
-    print("PASS bootstrap starts an enabled but stopped Ollama service")
+    plan = subprocess.run(
+        [str(ROOT / 'install'), '--skip-preflight', '--dry-run'],
+        env=dict(env, PATH=str(commands)+":/usr/bin", HOME=str(base)),
+        capture_output=True, text=True, timeout=10,
+    )
+    assert plan.returncode == 0, plan.stderr
+    assert 'download no models' in plan.stdout, plan.stdout
+    assert 'ollama' not in plan.stdout.lower(), plan.stdout
+    print("PASS the installer plans no model or Ollama work at all")
 
     for arguments in [["--hotkey"], ["--consume"], ["--hotkey", "--yes"], ["--consume", "Menu"]]:
         result = subprocess.run([str(ROOT/'install'), *arguments], capture_output=True, text=True, timeout=3)
@@ -117,11 +114,15 @@ omarchy() {
     print("PASS link-local fails on shell readiness or widget activation errors")
 
     alternate = base/'alternate.toml'
-    alternate.write_text('[backend]\nengine="openai"\nmodel="test-whisper"\nendpoint="http://127.0.0.1:18765/v1/audio/transcriptions"\n[cleanup]\nenabled=false\nmodel="alternate-cleanup"\n')
+    # models_configured is explicit in both fixtures: a fresh install leaves it
+    # false until the background download lands, and these cases are about a
+    # machine that is already past that.
+    alternate.write_text('[behavior]\nmodels_configured=true\n[backend]\nengine="openai"\nmodel="test-whisper"\nendpoint="http://127.0.0.1:18765/v1/audio/transcriptions"\n[cleanup]\nenabled=false\nmodel="alternate-cleanup"\n')
     alternate_env = dict(env, PATH=str(commands)+":/usr/bin", HOME=str(base), OMAFLOW_CONFIG=str(alternate))
+    # The plan is the same whatever the models are: the installer ships the app.
     plan = subprocess.run([str(ROOT/'install'), '--skip-preflight', '--dry-run'], env=alternate_env, capture_output=True, text=True, timeout=10)
     assert plan.returncode == 0, plan.stderr
-    for unwanted in ['NeMo-Speech runtime', 'ensure speech weights', 'download cleanup weights', 'enable the ollama system service']:
+    for unwanted in ['ensure speech weights', 'download cleanup weights', 'enable the ollama system service']:
         assert unwanted not in plan.stdout, plan.stdout
     result = subprocess.run(['python3', str(ROOT/'tools/model_config.py')], env=alternate_env, capture_output=True, text=True, check=True)
     assert json.loads(result.stdout)['cleanup']['model'] == 'alternate-cleanup'
@@ -132,7 +133,7 @@ omarchy() {
     binary = ROOT/'target/release/omaflow'
     result = subprocess.run([str(binary), 'serve-asr'], env=alternate_env, capture_output=True, text=True, timeout=5)
     assert result.returncode == 0 and not result.stdout, result.stderr
-    alternate.write_text('[backend]\nengine="nemo"\nmodel="another-speech-model"\nendpoint="http://127.0.0.1:18765/v1/audio/transcriptions"\ndevice="cpu"\n')
+    alternate.write_text('[behavior]\nmodels_configured=true\n[backend]\nengine="nemo"\nmodel="another-speech-model"\nendpoint="http://127.0.0.1:18765/v1/audio/transcriptions"\ndevice="cpu"\n')
     cached = base/'.cache/nemo-speech/models/another-speech-model/revision/model.gguf'
     cached.parent.mkdir(parents=True); cached.touch()
     result = subprocess.run([str(binary), 'serve-asr'], env=alternate_env, capture_output=True, text=True, timeout=5)
@@ -145,12 +146,14 @@ omarchy() {
     result = subprocess.run([str(binary), 'serve-asr'], env=alternate_env, capture_output=True, text=True, timeout=5)
     assert result.returncode == 78 and not result.stdout, result.stderr
     assert 'Install it separately' in result.stderr
-    print('PASS configured models drive install planning and managed server arguments')
+    print('PASS the configured model drives the managed server arguments')
 
-    traps = re.findall(r"trap '([^']+)' EXIT", (ROOT/'install').read_text())
+    # The temporary NeMo installer moved out of ./install into its own script;
+    # its trap still has to erase the download without touching the caller.
+    traps = re.findall(r"trap '([^']+)' EXIT", (ROOT/'scripts/install-nemo.sh').read_text())
     target = next(trap for trap in traps if 'installer' in trap)
     installer = base/'installer'; installer.touch()
     program = 'installer="$1"\ntrap '+"'"+target+"' EXIT\nexit 0\n"
     result = subprocess.run(['bash','-c',program,'test',str(installer)], start_new_session=True, timeout=3)
     assert result.returncode == 0 and not installer.exists()
-    print("PASS installer cleanup without keepalive leaves its process group alive")
+    print("PASS the NeMo installer erases its temporary download and leaves the process group alive")

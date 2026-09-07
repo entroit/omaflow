@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
 """Exercise complete installer/linker and uninstall flows in an isolated home."""
-import http.server
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import threading
 import time
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
-
-class Models(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200); self.end_headers()
-        self.wfile.write(json.dumps({'models': [{'name': 'test-cleanup'}]}).encode())
-    def log_message(self, *_):
-        pass
 
 with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     base = Path(directory); repo = base/'checkout'; repo.mkdir()
@@ -30,7 +21,8 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
         shutil.copy2(ROOT/name, repo/name)
     for name in ['config', 'dist', 'integrations', 'assets']:
         shutil.copytree(ROOT/name, repo/name)
-    (repo/'tools').mkdir(); shutil.copy2(ROOT/'tools/model_config.py', repo/'tools/model_config.py'); shutil.copy2(ROOT/'tools/set_hotkey.py', repo/'tools/set_hotkey.py')
+    (repo/'tools').mkdir(); shutil.copy2(ROOT/'tools/set_hotkey.py', repo/'tools/set_hotkey.py')
+    shutil.copytree(ROOT/'scripts', repo/'scripts')
     shutil.copy2(ROOT/'tools/install_receipt.py', repo/'tools/install_receipt.py')
     (repo/'target/release').mkdir(parents=True)
     shutil.copy2(ROOT/'target/release/omaflow', repo/'target/release/omaflow')
@@ -48,10 +40,10 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
         result = subprocess.run([str(repo/args[0]), *args[1:]], env=env, capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stdout + result.stderr
         return result.stdout
-    plan = run('install', '--no-models', '--skip-preflight', '--dry-run')
+    plan = run('install', '--skip-preflight', '--dry-run')
     assert not (config/'omaflow/config.toml').exists()
-    assert 'defer model setup' in plan
-    output = run('install', '--no-models', '--skip-preflight', '--yes')
+    assert 'download no models' in plan
+    output = run('install', '--skip-preflight', '--yes')
     personal = config/'omaflow/config.toml'
     assert tomllib.loads(personal.read_text())['behavior']['models_configured'] is False
     complete = tomllib.loads(personal.read_text())
@@ -64,12 +56,13 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     assert 'F13' in (config/'omaflow/shortcut.lua').read_text()
 
     assert not (home/'.local/state/omaflow-install/receipt.json').exists()
-    assert 'Models not configured' in output
+    assert 'no model configured yet' in output
+    assert 'Settings -> Speech' in output
     assert not any(word in log.read_text() for word in ['ollama ', 'nemo-speech', 'curl ']), log.read_text()
     assert (home/'.local/bin/omaflow').is_symlink()
     result = subprocess.run([str(home/'.local/bin/omaflow'), 'serve-asr'], env=env, capture_output=True, timeout=3)
     assert result.returncode == 0 and not result.stdout
-    print('PASS complete model-free install links app without model commands; speech service stays dormant')
+    print('PASS app-only install links the app and downloads nothing; speech service stays dormant')
     with (base/'daemon.log').open('w') as daemon_log:
         daemon = subprocess.Popen([str(repo/'target/release/omaflow'), 'daemon'], env=env, stdout=daemon_log, stderr=daemon_log)
         try:
@@ -99,19 +92,18 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     assert personal.stat().st_mode & 0o777 == 0o600
     print('PASS relinking pending setup preserves every override from a symlinked config')
 
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Models)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    url = f'http://127.0.0.1:{server.server_port}'
-    personal.write_text(f'[behavior]\nmodels_configured=false\n[backend]\nmodel="test-speech"\ndevice="cpu"\nendpoint="{url}/v1/audio/transcriptions"\n[cleanup]\nmodel="test-cleanup"\nendpoint="{url}/api/chat"\ncustom_vocabulary=["KeepMe"]\n')
+    personal.write_text('[behavior]\nmodels_configured=false\n[backend]\nmodel="test-speech"\ndevice="cpu"\n[cleanup]\nmodel="test-cleanup"\ncustom_vocabulary=["KeepMe"]\n')
     nemo = home/'.local/lib/nemo-speech/bin/nemo-speech'; nemo.parent.mkdir(parents=True)
     nemo.write_text('#!/usr/bin/bash\nprintf "%s\\n" "nemo-speech $*" >> "$TEST_LOG"\n'); nemo.chmod(0o755)
+    log.write_text('')
     run('install', '--skip-preflight', '--yes')
-    server.shutdown()
     settings = tomllib.loads(personal.read_text())
-    assert settings['behavior']['models_configured'] is True
+    # A re-install must not claim the models are ready; only a model the user
+    # actually downloaded in Settings may say that.
+    assert settings['behavior']['models_configured'] is False
     assert settings['cleanup']['custom_vocabulary'] == ['KeepMe']
-    assert 'nemo-speech pull test-speech' in log.read_text()
-    print('PASS normal install completes deferred setup using saved models and preserving vocabulary')
+    assert not any(word in log.read_text() for word in ['ollama ', 'nemo-speech', 'curl ']), log.read_text()
+    print('PASS a re-install downloads nothing and preserves saved settings')
 
     state = home/'.local/state/omaflow'; state.mkdir(parents=True, exist_ok=True)
     (state/'history.json').write_text('["private"]')
@@ -145,7 +137,6 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
         {'kind':'speech-cache', 'value':str(owned_cache)},
         {'kind':'nemo-runtime', 'value':str(nemo.parent.parent)},
         {'kind':'cleanup-model', 'value':'owned-cleanup'},
-        {'kind':'package', 'value':'ollama-vulkan'},
     ]))
     sudo = commands/'sudo'
     sudo.write_text('#!/usr/bin/bash\nprintf "%s\\n" "sudo $*" >> "$TEST_LOG"\n')
@@ -158,6 +149,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     assert not (home/'.local/bin/omaflow').is_symlink()
     assert shared_cache.exists()
     assert 'ollama rm owned-cleanup' in log.read_text()
-    assert 'sudo pacman -R --noconfirm ollama-vulkan' in log.read_text()
+    # ./install no longer installs Ollama, so ./uninstall must not remove the package.
+    assert 'pacman -R' not in log.read_text()
     assert not (base/'runtime/omaflow-state.json').exists()
     print('PASS complete removal of direct plugin checkout and recorded resources; shared model retained')

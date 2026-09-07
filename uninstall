@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Remove OmaFlow, its data, and models and runtimes installed by OmaFlow."""
+"""Remove OmaFlow, its data, and models and runtimes installed by OmaFlow.
+
+The installer no longer installs Ollama itself, so nothing here removes that
+package; models OmaFlow pulled into it are still removed.
+"""
 import argparse
 import os
 from pathlib import Path
@@ -26,8 +30,11 @@ def main():
         home / '.local/share/applications/omaflow.desktop': ROOT / 'dist/omaflow.desktop',
         home / '.local/share/icons/hicolor/scalable/apps/omaflow.svg': ROOT / 'assets/icon.svg',
     }
+    # omaflow-setup.service shipped briefly and pulled a model nobody chose. It
+    # is gone, but an upgraded machine still has the link, so keep removing it.
     units = ['omaflow.service', 'omaflow-asr.service', 'omaflow-update-check.service', 'omaflow-update-check.timer']
-    for unit in units:
+    stale_units = ['omaflow-setup.service']
+    for unit in units + stale_units:
         links[config / 'systemd/user' / unit] = ROOT / 'dist' / unit
     owned = [path for path, target in links.items() if path.is_symlink() and path.resolve() == target.resolve()]
     plugin = config / 'omarchy/plugins/entroit.omaflow'
@@ -46,7 +53,6 @@ def main():
     resources = read_receipt()
     resource_paths = []
     model_commands = []
-    packages = []
     cache = Path(os.environ.get('XDG_CACHE_HOME', home / '.cache')) / 'nemo-speech/models'
     for entry in resources:
         kind, value = entry['kind'], entry['value']
@@ -57,8 +63,6 @@ def main():
             resource_paths.append(path)
         elif kind == 'cleanup-model' and value and not value.startswith('-'):
             model_commands.append(['ollama', 'rm', value])
-        elif kind == 'package' and value in ('ollama', 'ollama-vulkan', 'ollama-cuda'):
-            packages.append(value)
         else:
             parser.error('Invalid installer receipt entry: ' + repr(entry))
     runtime = Path(os.environ.get('XDG_RUNTIME_DIR', Path(tempfile.gettempdir()) / ('omaflow-' + os.environ.get('USER', ''))))
@@ -67,8 +71,6 @@ def main():
     purge_paths += list((config / 'omarchy/backups').glob('omaflow-*'))
     for command in model_commands:
         print('Remove installed model:', command[-1])
-    if packages:
-        print('Remove installed runtime packages:', ', '.join(packages))
     for path in resource_paths + runtime_paths + [ROOT]:
         print('Erase:', path)
     for path in owned:
@@ -80,7 +82,7 @@ def main():
     # Do not leave a live widget pointing at removed files. Failure leaves links intact.
     if plugin in owned or direct_checkout:
         subprocess.run(['omarchy', 'plugin', 'disable', 'entroit.omaflow'], check=True)
-    for unit in units:
+    for unit in units + stale_units:
         if config / 'systemd/user' / unit in owned:
             subprocess.run(['systemctl', '--user', 'disable', '--now', unit], check=True)
     if before != after:
@@ -96,12 +98,6 @@ def main():
     for command in model_commands:
         subprocess.run(command, env=model_env, check=True)
         resources = [entry for entry in resources if not (entry['kind'] == 'cleanup-model' and entry['value'] == command[-1])]
-        save_receipt(resources)
-    if packages:
-        if 'ollama' in packages or 'ollama-cuda' in packages:
-            subprocess.run(['sudo', 'systemctl', 'disable', '--now', 'ollama'], check=True)
-        subprocess.run(['sudo', 'pacman', '-R', '--noconfirm', *packages], check=True)
-        resources = [entry for entry in resources if entry['kind'] != 'package']
         save_receipt(resources)
     for path in resource_paths + runtime_paths + purge_paths:
         if path.is_symlink() or (path.exists() and not path.is_dir()):

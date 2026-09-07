@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# OmaFlow bootstrap. Takes a fresh Omarchy machine to a working install:
-# packages, the ASR runtime, both models, the hotkey, then link-local.
+# OmaFlow bootstrap. Takes a fresh Omarchy machine to a working app:
+# packages, the build, the hotkey, then link-local.
+#
+# It deliberately installs no models. Weights and the ASR runtime are about
+# 10 GB and used to stand between a fresh clone and the first screen. Which
+# speech model to fetch, and whether this machine can run it, is the user's
+# decision: Settings -> Speech lists size, hardware need and licence, and the
+# runtime is installed with the first model actually downloaded.
 #
 # Safe to re-run. Every step checks before it acts, so a run that failed
 # halfway can simply be started again.
@@ -9,18 +15,14 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
-nemo_prefix="$HOME/.local/lib/nemo-speech"
-nemo_speech="$nemo_prefix/bin/nemo-speech"
-
+personal_config="${OMAFLOW_CONFIG:-$config_home/omaflow/config.toml}"
 
 hotkey=""
 consume=""
 assume_yes=0
 dry_run=0
 skip_preflight=0
-no_models=0
 set_hotkey=0
-ollama_pkgs=(ollama ollama-vulkan)
 
 usage() {
   cat <<'EOF'
@@ -30,11 +32,6 @@ Usage: ./install [options]
                           or ISO_Level3_Shift,Menu on a first install)
   --consume KEY[,KEY...]  Keysyms to swallow so applications never see them.
                           Menu needs this; a function key does not.
-  --cuda-ollama           Install ollama-cuda instead of ollama-vulkan. Pulls
-                          about 5.7 GB more and is not what this project was
-                          tested against.
-  --no-models             Install the app without model runtimes or downloads;
-                          finish model setup in Settings later.
   --skip-preflight        Do not run scripts/preflight.sh first
   --dry-run               Print what would happen and change nothing
   --yes, -y               Do not ask for confirmation
@@ -64,14 +61,6 @@ while (($# > 0)); do
     fi
     consume="${2:-}"
     shift 2
-    ;;
-  --cuda-ollama)
-    ollama_pkgs=(ollama-cuda)
-    shift
-    ;;
-  --no-models)
-    no_models=1
-    shift
     ;;
   --skip-preflight)
     skip_preflight=1
@@ -118,31 +107,22 @@ if [[ $EUID -eq 0 ]]; then
   exit 1
 fi
 
-# Python is part of the supported Omarchy desktop and reads TOML before planning.
+# Python is part of the supported Omarchy desktop; the hotkey writer needs it.
 if ! command -v python3 >/dev/null; then
-  printf 'Model configuration needs Python 3.11+. Install it with: sudo pacman -S python\n' >&2
+  printf 'OmaFlow needs Python 3.11+. Install it with: sudo pacman -S python\n' >&2
   exit 1
 fi
-model_values="$(python3 "$repo_dir/tools/model_config.py" --shell-values)"
-mapfile -t model_settings <<<"$model_values"
-speech_engine="${model_settings[0]}"
-asr_repo="${model_settings[1]}"
-speech_endpoint="${model_settings[2]}"
-speech_device="${model_settings[3]}"
-cleanup_model="${model_settings[4]}"
-export OLLAMA_HOST="${model_settings[5]}"
-cleanup_enabled="${model_settings[6]}"
-managed_speech=0
-[[ $speech_engine == nemo || $speech_engine == parakeet ]] && managed_speech=1
-local_ollama=0
-[[ $OLLAMA_HOST == http://127.0.0.1:11434 || $OLLAMA_HOST == http://localhost:11434 ]] && local_ollama=1
+
+# A machine with no personal configuration has no model either, so this is the
+# only run allowed to declare model setup pending. Re-running the installer on
+# a working machine must not disable a model the user already downloaded.
+first_install=0
+[[ -f $personal_config ]] || first_install=1
 
 # --- 1. Preflight -----------------------------------------------------------
 if ((skip_preflight == 0)); then
   say 'Checking this machine'
-  preflight_args=(--bootstrap)
-  ((no_models)) && preflight_args+=(--no-models)
-  if ! "$repo_dir/scripts/preflight.sh" "${preflight_args[@]}"; then
+  if ! "$repo_dir/scripts/preflight.sh" --bootstrap; then
     printf '\nFix the failures above, then run ./install again.\n' >&2
     exit 1
   fi
@@ -159,33 +139,6 @@ want_package jq
 want_package pipewire-audio
 want_package wl-clipboard
 want_package git
-if ((managed_speech && !no_models)) && [[ $speech_device == cuda ]]; then want_package nvidia-utils; fi
-if ((cleanup_enabled && !no_models)); then
-  for package in "${ollama_pkgs[@]}"; do want_package "$package"; done
-fi
-
-nemo_was_absent=0
-[[ -e $nemo_prefix || -L $nemo_prefix ]] || nemo_was_absent=1
-need_nemo=0
-if ((managed_speech && !no_models)); then "$nemo_speech" --version >/dev/null 2>&1 || need_nemo=1; fi
-
-# Weights are installed when the model is a file or has a pulled GGUF in the
-# NeMo-Speech cache, which is where the daemon looks for them.
-speech_cache="${XDG_CACHE_HOME:-$HOME/.cache}/nemo-speech/models/$asr_repo"
-need_asr_model=0
-if ((managed_speech && !no_models)) && [[ ! -f $asr_repo ]] &&
-  ! compgen -G "$speech_cache/*/*.gguf" >/dev/null; then
-  need_asr_model=1
-fi
-
-need_cleanup_model=0
-if ((cleanup_enabled && !no_models)); then ollama show "$cleanup_model" >/dev/null 2>&1 || need_cleanup_model=1; fi
-
-need_ollama_service=0
-if ((cleanup_enabled && local_ollama && !no_models)) && { ! systemctl is-enabled --quiet ollama 2>/dev/null ||
-  ! systemctl is-active --quiet ollama 2>/dev/null; }; then
-  need_ollama_service=1
-fi
 
 hotkey_file="$config_home/hypr/omaflow-hotkey.lua"
 need_hotkey=0
@@ -198,21 +151,15 @@ if [[ ! -f $bindings ]] || ! grep -q 'require("omaflow")' "$bindings"; then need
 # --- 3. Show the plan and confirm once --------------------------------------
 say 'Plan'
 ((${#packages[@]})) && step "install packages: ${packages[*]}"
-((need_ollama_service)) && step 'enable the ollama system service'
-((need_nemo)) && step "install the NeMo-Speech runtime into $nemo_prefix (about 110 MB)"
-((need_asr_model)) && step "ensure speech weights: $asr_repo"
-((need_cleanup_model)) && step "download cleanup weights: $cleanup_model"
 ((need_hotkey)) && step "write the hotkey to $hotkey_file"
 ((need_bindings)) && step "add require(\"omaflow\") to $bindings"
-((no_models)) && step 'defer model setup; no model runtimes, downloads or loading'
 step 'build OmaFlow and link it (./link-local)'
+step 'download no models; choose a speech model afterwards in Settings -> Speech'
 
 if ((dry_run)); then
   printf '\nDry run, nothing changed.\n'
   exit 0
 fi
-
-record_install() { python3 "$repo_dir/tools/install_receipt.py" "$@"; }
 
 if ((assume_yes == 0)); then
   printf '\nContinue? [y/N] '
@@ -221,7 +168,7 @@ if ((assume_yes == 0)); then
 fi
 
 # --- 4. Packages, with one password prompt ----------------------------------
-if ((${#packages[@]} || need_ollama_service)); then
+if ((${#packages[@]})); then
   say 'Installing packages'
   sudo -v
   # Keep the sudo timestamp alive across a long pacman run.
@@ -233,73 +180,7 @@ if ((${#packages[@]} || need_ollama_service)); then
   keepalive=$!
   trap 'kill "$keepalive" 2>/dev/null || true' EXIT
 
-  ((${#packages[@]})) && run sudo pacman -S --needed --noconfirm "${packages[@]}"
-  for package in "${packages[@]}"; do
-    case "$package" in ollama|ollama-vulkan|ollama-cuda) record_install package "$package" ;; esac
-  done
-  if ((need_ollama_service)); then
-    run sudo systemctl enable --now ollama
-  fi
-fi
-
-if ((need_cleanup_model)); then
-  say 'Waiting for the Ollama server'
-  ollama_up=0
-  for _ in $(seq 1 30); do
-    if curl -fsS --max-time 2 "${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
-      ollama_up=1
-      break
-    fi
-    sleep 2
-  done
-  if ((ollama_up)); then
-    step "Ollama is answering at $OLLAMA_HOST"
-  else
-    printf 'Ollama did not start within a minute.\n' >&2
-    printf 'Check it with: systemctl status ollama\n' >&2
-    printf 'Then run ./install again; finished steps are skipped.\n' >&2
-    exit 1
-  fi
-fi
-
-# --- 5. The ASR runtime -----------------------------------------------------
-if ((need_nemo)); then
-  say 'Installing the NeMo-Speech ASR runtime'
-  installer="$(mktemp -t nemo-speech-install-XXXXXX.sh)"
-  trap 'rm -f "$installer"; if [[ -n ${keepalive:-} ]]; then kill "$keepalive" 2>/dev/null || true; fi' EXIT
-  if ! run curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh -o "$installer"; then
-    printf 'Could not download the NeMo-Speech installer. Check the network and\n' >&2
-    printf 'that github.com is reachable, then run ./install again.\n' >&2
-    exit 1
-  fi
-  # --prefix is mandatory: the installer defaults to ~/.local/share, which the
-  # systemd unit does not look at.
-  if ! run sh "$installer" --backend cuda --prefix "$nemo_prefix" --no-modify-path; then
-    printf 'The NeMo-Speech installer failed. Review its output above, fix the\n' >&2
-    printf 'reported problem, then re-run ./install.\n' >&2
-    exit 1
-  fi
-  if ((dry_run == 0)) && [[ ! -x $nemo_speech ]]; then
-    printf 'The NeMo-Speech install did not produce %s.\n' "$nemo_speech" >&2
-    exit 1
-  fi
-fi
-
-if ((need_nemo && nemo_was_absent)); then record_install nemo-runtime "$nemo_prefix"; fi
-
-# --- 6. Models --------------------------------------------------------------
-if ((need_asr_model)); then
-  say "Ensuring speech weights: $asr_repo"
-  speech_cache_absent=0
-  [[ -e $speech_cache || -L $speech_cache ]] || speech_cache_absent=1
-  run "$nemo_speech" pull "$asr_repo"
-  if ((speech_cache_absent)); then record_install speech-cache "$speech_cache"; fi
-fi
-
-if ((need_cleanup_model)); then
-  say "Downloading the $cleanup_model cleanup model"
-  run ollama pull "$cleanup_model"
-  if ((local_ollama)); then record_install cleanup-model "$cleanup_model"; fi
+  run sudo pacman -S --needed --noconfirm "${packages[@]}"
 fi
 
 # Build once before the shortcut helper writes the complete TOML. link-local
@@ -307,7 +188,7 @@ fi
 cargo build --locked --release --manifest-path "$repo_dir/Cargo.toml"
 "$repo_dir/target/release/omaflow" config-init
 
-# --- 7. Hotkey --------------------------------------------------------------
+# --- 5. Hotkey --------------------------------------------------------------
 if ((need_hotkey)); then
   say 'Writing the hotkey'
   [[ -n $hotkey ]] || hotkey="ISO_Level3_Shift,Menu"
@@ -329,20 +210,20 @@ if ((need_bindings)); then
   step "added require(\"omaflow\") to $bindings"
 fi
 
-# --- 8. Build and link ------------------------------------------------------
+# --- 6. Build and link ------------------------------------------------------
 say 'Building and linking OmaFlow'
-if ((no_models)); then
+if ((first_install)); then
   "$repo_dir/link-local" --no-models
 else
-  "$repo_dir/link-local" --with-models
+  "$repo_dir/link-local"
 fi
 
-# --- 9. Tell the truth about the result -------------------------------------
+# --- 7. Tell the truth about the result -------------------------------------
 say 'Checking the installation'
 problems=0
-units=(omaflow.service omaflow-update-check.timer)
-((managed_speech && !no_models)) && units+=(omaflow-asr.service)
-for unit in "${units[@]}"; do
+# Only what an app-only install can promise. The speech server has no model
+# yet, so omaflow-asr.service is expected to be down until the setup finishes.
+for unit in omaflow.service omaflow-update-check.timer; do
   if systemctl --user is-active --quiet "$unit"; then
     step "$unit is active"
   else
@@ -350,25 +231,6 @@ for unit in "${units[@]}"; do
     problems=1
   fi
 done
-
-speech_health="${model_settings[7]:-}"
-if [[ -z $speech_health ]] && ((managed_speech)); then speech_health="${speech_endpoint%%/v1/*}/health"; fi
-if ((no_models)); then
-  step "Models not configured. Open Settings → Models to finish setup."
-elif [[ -n $speech_health ]]; then
-  for _ in $(seq 1 30); do
-    curl -fsS --max-time 2 "$speech_health" >/dev/null 2>&1 && break
-    sleep 2
-  done
-  if curl -fsS --max-time 2 "$speech_health" >/dev/null 2>&1; then
-    step 'the configured speech server is answering'
-  else
-    printf '  FAILED the configured speech server is not answering at %s\n' "$speech_health" >&2
-    problems=1
-  fi
-else
-  step 'External speech server selected; start it before dictating. No health URL configured.'
-fi
 
 if omarchy plugin list --json 2>/dev/null |
   jq -e '.[] | select(.id == "entroit.omaflow" and .enabled)' >/dev/null 2>&1; then
@@ -388,6 +250,8 @@ else
   printf '  otherwise the panel will show a fetch error instead of new releases.\n' >&2
 fi
 
+step 'no model configured yet; choose one in Settings -> Speech'
+
 if ((problems)); then
   printf '\nOmaFlow is installed but not healthy. Fix the failures above.\n' >&2
   exit 1
@@ -396,9 +260,6 @@ fi
 hotkey_display="$(sed -n 's/^local omaflow_hotkey = { //p' "$hotkey_file" 2>/dev/null |
   tr -d '",' | sed 's/ }//' | sed 's/ / + /g')"
 say 'Done'
-if ((no_models)); then
-  printf 'Open the bar widget → Settings → Models to configure and enable dictation.\n'
-  exit 0
-fi
-printf 'Hold %s and speak. Release to insert the text.\n' "${hotkey_display:-your hotkey}"
-printf 'Double-tap it to lock recording. Click the bar icon for history and settings.\n'
+printf 'OmaFlow is installed. Your hotkey is %s.\n' "${hotkey_display:-your hotkey}"
+printf 'Next step: open the OmaFlow panel and pick a speech model in Settings -> Speech.\n'
+printf 'It downloads there, with its size and hardware needs shown before you commit.\n'

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Read the same bundled defaults and personal model overrides as OmaFlow."""
+"""Resolve OmaFlow's model settings the way the daemon does, and print them.
+
+This used to feed shell variables into ./install and gate ./link-local. The
+installer no longer installs models, so both of those callers are gone; what
+remains is a way for tests and for a person debugging a machine to see the
+merged bundled-plus-personal model configuration as JSON.
+"""
 import argparse
 import json
 import os
 from pathlib import Path
-import shutil
 import sys
 import tomllib
-import urllib.error
-import urllib.parse
-import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
+
 
 def configuration():
     config = tomllib.loads((ROOT / 'config/config.toml').read_text())
@@ -32,40 +35,16 @@ def configuration():
         raise ValueError('Ollama endpoint must end in /api/chat')
     return config
 
-def check(config):
-    backend, cleanup = config['backend'], config['cleanup']
-    if not config['behavior'].get('models_configured', True):
-        print('Models not configured; model checks deferred until setup.')
-        return
-    if backend['engine'] in ['nemo', 'parakeet']:
-        if not os.access(Path.home()/'.local/lib/nemo-speech/bin/nemo-speech', os.X_OK):
-            raise ValueError('NeMo-Speech is missing. Run ./install to install the configured speech runtime.')
-        if backend['device'] == 'cuda' and not shutil.which('nvidia-smi'):
-            raise ValueError('The configured CUDA speech backend needs an NVIDIA driver, or choose device="cpu".')
-    if cleanup['enabled']:
-        base = cleanup['endpoint'].removesuffix('/api/chat')
-        with urllib.request.urlopen(base+'/api/tags', timeout=3) as response:
-            models = json.load(response).get('models', [])
-        if not any(m.get('name', '').removesuffix(':latest') == cleanup['model'].removesuffix(':latest') for m in models):
-            raise ValueError(f"Cleanup model {cleanup['model']} is missing. Install it separately with OLLAMA_HOST={base} ollama pull {cleanup['model']}")
-    print('Configured model prerequisites passed.')
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--shell-values', action='store_true')
-    parser.add_argument('--check', action='store_true')
-    args=parser.parse_args()
+    argparse.ArgumentParser(description=__doc__).parse_args()
     try:
-        config=configuration(); backend=config['backend']; cleanup=config['cleanup']
-        if args.shell_values:
-            for value in [backend['engine'], backend['model'], backend['endpoint'], backend['device'], cleanup['model'], cleanup['endpoint'].removesuffix('/api/chat'), int(cleanup['enabled']), backend.get('health_endpoint',''), int(config['behavior'].get('models_configured', True))]:
-                print(value)
-        elif args.check: check(config)
-        else: print(json.dumps(config))
-    except (ValueError, KeyError, OSError, urllib.error.URLError) as error:
+        print(json.dumps(configuration()))
+    except (ValueError, KeyError, OSError) as error:
         print(f'Model configuration: {error}', file=sys.stderr)
         return 1
     return 0
+
 
 if __name__ == '__main__':
     sys.exit(main())

@@ -52,13 +52,13 @@ require wl-paste 'sudo pacman -S wl-clipboard'
 require hyprctl 'already part of Omarchy; run this inside a Hyprland session'
 require git 'sudo pacman -S git'
 (( missing == 0 )) || exit 1
-if [[ -z $setup_state ]]; then python3 "$repo_dir/tools/model_config.py" --check; fi
 
 cargo build --locked --release --manifest-path "$repo_dir/Cargo.toml"
 
+# Without a flag the model state is left alone: a relink is not a statement
+# about which models exist, and models now arrive after the install.
 if [[ -n $setup_state ]]; then
   "$repo_dir/target/release/omaflow" model-setup "$setup_state"
-  python3 "$repo_dir/tools/model_config.py" --check
 fi
 if [[ $setup_state == pending ]]; then
   systemctl --user stop omaflow-asr.service >/dev/null 2>&1 || true

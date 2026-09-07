@@ -38,6 +38,14 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         "nvidia-smi": "pass",
         "curl": "import os; from pathlib import Path; (Path(os.environ[\"XDG_RUNTIME_DIR\"])/\"model-command\").touch(); print('{}')",
         "pw-cat": "import time; time.sleep(120)",
+        "wpctl": (
+            "import os, sys; from pathlib import Path\n"
+            "runtime = Path(os.environ['XDG_RUNTIME_DIR'])\n"
+            "if sys.argv[1] == 'get-volume':\n"
+            "    print('Volume: 0.80')\n"
+            "else:\n"
+            "    with (runtime / 'volume-log').open('a') as log: log.write(sys.argv[-1] + chr(10))\n"
+        ),
     }.items():
         path = commands / name
         path.write_text("#!/usr/bin/python3\n" + source + "\n")
@@ -49,9 +57,11 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         runtime = case / "runtime"
         runtime.mkdir()
         config = case / "config.toml"
-        config.write_text('[cleanup]\nenabled=false\n[behavior]\nhistory_limit=30\ndouble_tap_ms=30\n[backend]\nstatus_timeout_ms=300\n')
-        if pending:
-            config.write_text(config.read_text().replace("[behavior]", "[behavior]\nmodels_configured=false"))
+        # models_configured is explicit here: a fresh install now defaults it to
+        # false, waiting on the background weights download, and every case but
+        # the pending one is about a machine that is past that point.
+        configured = "false" if pending else "true"
+        config.write_text(f'[cleanup]\nenabled=false\n[behavior]\nmodels_configured={configured}\nhistory_limit=30\ndouble_tap_ms=30\n[backend]\nstatus_timeout_ms=300\n')
         env = dict(os.environ, PATH=f"{commands}:/usr/bin", XDG_RUNTIME_DIR=str(runtime),
                    XDG_STATE_HOME=str(case / "state"), OMAFLOW_CONFIG=str(config))
         env.pop("OMAFLOW_FAKE_TRANSCRIPT", None)
@@ -203,7 +213,24 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         wait_until(lambda: state()["feedback"] == "Copied to clipboard")
         assert not state()["feedback_error"]
 
+    def audio_ducking(case, runtime, state, send):
+        log = runtime / "volume-log"
+        assert state()["duck_audio_percent"] == 70
+        send("press")
+        wait_until(lambda: state()["phase"] == "recording")
+        # 80% of the sink, turned down by 70%, is 24%.
+        wait_until(lambda: log.exists() and log.read_text().split()[0].startswith("0.24"))
+        assert (runtime / "duck-restore").exists()
+        send("cancel")
+        wait_until(lambda: state()["phase"] != "recording")
+        # Whatever else happens, the level the daemon found has to come back and
+        # the crash-restore file has to go: a missed restore leaves a person
+        # wondering why their speakers went quiet an hour ago.
+        wait_until(lambda: log.read_text().split()[-1].startswith("0.8"))
+        wait_until(lambda: not (runtime / "duck-restore").exists())
+
     run_case("history changes survive failed storage without false success", True, failed_history_write)
+    run_case("dictation ducks the sink and always restores it", False, audio_ducking)
     run_case("clipboard-only delivery never reports a paste", True, clipboard_only)
     run_case("clipboard failure retains text; clear undo; copy errors", True, delivery)
     run_case("incomplete IPC client cannot block controls", True, ipc)
