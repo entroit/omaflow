@@ -1,3 +1,5 @@
+mod audio;
+mod catalog;
 mod cleanup;
 mod cli;
 use crate::process::CommandExt;
@@ -12,6 +14,7 @@ use config::{Config, PasteMode};
 use serde::{Deserialize, Serialize};
 use state::{Action, Phase, StateMachine};
 use std::{
+    collections::HashMap,
     env, fs,
     io::{ErrorKind, Read, Write},
     os::unix::{
@@ -73,6 +76,7 @@ enum Message {
     Completed(u64, backend::StopOutcome),
     Failed(u64, String),
     RuntimeStatus(RuntimeStatus),
+    ModelProgress(String, DownloadProgress),
     Feedback(Result<(), String>, String),
     ResultCopied(u64, Result<(), String>),
 }
@@ -95,10 +99,47 @@ struct RuntimeStatus {
     asr_running: bool,
     cleanup_loaded: bool,
     cleanup_available: bool,
+    cleanup_runtime: CleanupRuntime,
+    installed_speech: Vec<String>,
+    installed_cleanup: Vec<String>,
     gpu_memory_mib: u64,
     hotkey_display: String,
     update: update::UpdateStatus,
 }
+
+/// What the panel needs to say about Ollama: install it, start it, or nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CleanupRuntime {
+    Ready,
+    Stopped,
+    #[default]
+    Missing,
+}
+
+impl CleanupRuntime {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Stopped => "stopped",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+/// One model download in flight, as reported by an `omaflow model-install`
+/// process. `updated` is local bookkeeping: finished entries leave the panel
+/// on their own, failures stay until the next attempt replaces them.
+#[derive(Debug, Clone)]
+struct DownloadProgress {
+    state: String,
+    percent: u8,
+    message: String,
+    updated: Instant,
+}
+
+/// Long enough for the panel to show a completed bar, short enough that the
+/// list is empty again by the time the user looks back at it.
+const DOWNLOAD_DONE_LINGER: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, Default)]
 enum ResultView {
@@ -142,6 +183,7 @@ struct SurfaceState<'a> {
     error: &'a str,
     history: &'a [HistoryEntry],
     meter_gate_db: i32,
+    duck_audio_percent: u8,
     paste_mode: &'a str,
     clipboard_result_visible_ms: u64,
     error_visible_ms: u64,
@@ -154,6 +196,7 @@ struct SurfaceState<'a> {
     asr_running: bool,
     cleanup_loaded: bool,
     cleanup_available: bool,
+    cleanup_runtime: &'a str,
     gpu_memory_mib: u64,
     state_version: u32,
     running_version: &'a str,
@@ -164,6 +207,8 @@ struct SurfaceState<'a> {
     update_checked_at_ms: u64,
     update_error: &'a str,
     model_settings: serde_json::Value,
+    model_catalog: serde_json::Value,
+    model_downloads: serde_json::Value,
     config_path: String,
     shortcut_settings: serde_json::Value,
     cleanup_enabled: bool,
@@ -212,6 +257,8 @@ struct Daemon {
     feedback_error: bool,
     recording_started: Option<Instant>,
     paste_sent: bool,
+    audio_ducked: bool,
+    model_downloads: HashMap<String, DownloadProgress>,
 }
 
 fn main() -> ExitCode {
@@ -226,6 +273,7 @@ fn run_daemon() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    audio::start();
     if let Err(error) = backend::reset_meter() {
         eprintln!("omaflow: could not initialize microphone meter: {error}");
     }
@@ -300,6 +348,8 @@ fn run_daemon() -> ExitCode {
         feedback_error: false,
         recording_started: None,
         paste_sent: false,
+        audio_ducked: false,
+        model_downloads: HashMap::new(),
     };
     daemon.publish();
 
@@ -339,6 +389,7 @@ fn run_daemon() -> ExitCode {
     }
 
     let _ = fs::remove_file(socket);
+    audio::restore_now();
     let _ = backend::reset_meter();
     ExitCode::SUCCESS
 }
@@ -681,6 +732,10 @@ fn handle_message(
             daemon.error = friendly_error(&error);
             daemon.publish();
         }
+        Message::ModelProgress(id, progress) => {
+            daemon.model_downloads.insert(id, progress);
+            daemon.publish();
+        }
         Message::RuntimeStatus(status) => {
             daemon.hotkey_display = status.hotkey_display.clone();
             daemon.update = status.update.clone();
@@ -691,8 +746,14 @@ fn handle_message(
 }
 
 fn run_action(action: Action, jobs: &mpsc::Sender<BackendJob>, daemon: &mut Daemon) {
-    if action == Action::Start {
-        daemon.recording_started = Some(Instant::now());
+    match action {
+        Action::Start => {
+            daemon.recording_started = Some(Instant::now());
+            audio::duck(daemon.effective_config.behavior.duck_audio_percent);
+            daemon.audio_ducked = true;
+        }
+        Action::Stop | Action::Cancel => daemon.unduck(),
+        Action::None => {}
     }
     let Some(job) = (match action {
         Action::Start => Some(BackendJob::Start(daemon.generation)),
@@ -810,7 +871,22 @@ impl Daemon {
         self.publish();
     }
 
+    /// Idempotent: restore is cheap and a duck that is never undone leaves the
+    /// user's speakers turned down, which is the worst way for this to fail.
+    fn unduck(&mut self) {
+        if self.audio_ducked {
+            self.audio_ducked = false;
+            audio::restore();
+        }
+    }
+
     fn publish(&mut self) {
+        if !matches!(self.state.phase(), Phase::Recording { .. }) {
+            self.unduck();
+        }
+        self.model_downloads.retain(|_, progress| {
+            progress.state != "done" || progress.updated.elapsed() < DOWNLOAD_DONE_LINGER
+        });
         self.serial = self.serial.wrapping_add(1);
         let (phase, latched) = match self.state.phase() {
             Phase::Idle => ("idle", false),
@@ -842,6 +918,7 @@ impl Daemon {
             },
             history: &self.history,
             meter_gate_db: self.meter_gate_db,
+            duck_audio_percent: self.effective_config.behavior.duck_audio_percent,
             paste_mode: self.paste_mode.as_str(),
             clipboard_result_visible_ms: self.clipboard_result_visible_ms,
             error_visible_ms: self.error_visible_ms,
@@ -854,6 +931,7 @@ impl Daemon {
             asr_running: self.runtime_status.asr_running,
             cleanup_loaded: self.runtime_status.cleanup_loaded,
             cleanup_available: self.runtime_status.cleanup_available,
+            cleanup_runtime: self.runtime_status.cleanup_runtime.as_str(),
             gpu_memory_mib: self.runtime_status.gpu_memory_mib,
             state_version: update::STATE_VERSION,
             running_version: update::RUNNING_VERSION,
@@ -876,7 +954,18 @@ impl Daemon {
                 "speech_device": self.effective_config.backend.device,
                 "cleanup_model": self.effective_config.cleanup.model,
                 "cleanup_endpoint": self.effective_config.cleanup.endpoint,
+                // The keys themselves never leave the process: this file is a
+                // world of other readers, and the panel only needs to know
+                // whether to draw a set field or an empty one.
+                "speech_api_key_set": !self.effective_config.backend.api_key.is_empty(),
+                "cleanup_api_key_set": !self.effective_config.cleanup.api_key.is_empty(),
             }),
+            model_catalog: catalog::to_json(
+                &self.effective_config,
+                &self.runtime_status.installed_speech,
+                &self.runtime_status.installed_cleanup,
+            ),
+            model_downloads: downloads_json(&self.model_downloads),
             cleanup_enabled: self.effective_config.cleanup.enabled,
             style: &self.effective_config.cleanup.style,
             use_window_context: self.effective_config.cleanup.use_window_context,
@@ -1158,15 +1247,47 @@ fn start_backend_worker(
 
 fn start_status_worker(config: Config, messages: mpsc::Sender<Message>) {
     thread::spawn(move || {
+        let mut installed_cleanup: Option<(Vec<String>, Instant)> = None;
         loop {
             let current = Config::load().unwrap_or_else(|_| config.clone());
+            // Nothing here may reach for a model the user has not asked for.
+            // Cleanup is opt-in, so until it is switched on the daemon neither
+            // probes the Ollama endpoint nor enumerates what it holds.
+            let endpoint_answers =
+                current.cleanup.enabled && cleanup_server_available(&current.cleanup);
+            // Asking Ollama about every catalog model spawns a process each,
+            // so it runs far less often than the rest of this poll.
+            if current.cleanup.enabled
+                && installed_cleanup
+                    .as_ref()
+                    .is_none_or(|(_, checked): &(Vec<String>, Instant)| {
+                        checked.elapsed() >= Duration::from_secs(30)
+                    })
+            {
+                installed_cleanup = Some((
+                    catalog::installed_cleanup_ids(&current.cleanup.endpoint),
+                    Instant::now(),
+                ));
+            }
             let status = RuntimeStatus {
                 asr_running: current.behavior.models_configured
                     && backend::speech_server_ready(&current.backend),
                 cleanup_loaded: current.behavior.models_configured
                     && cleanup_model_loaded(&current.cleanup),
-                cleanup_available: current.behavior.models_configured
-                    && cleanup_server_available(&current.cleanup.endpoint),
+                cleanup_available: current.behavior.models_configured && endpoint_answers,
+                // Reported only while cleanup is on, for the same reason: with
+                // it off the panel has no notice to show and no question to ask.
+                cleanup_runtime: cleanup_runtime(
+                    current.cleanup.enabled,
+                    endpoint_answers,
+                    catalog::endpoint_is_local(&current.cleanup.endpoint),
+                    catalog::ollama_on_path(),
+                ),
+                installed_speech: catalog::installed_speech_ids(),
+                installed_cleanup: installed_cleanup
+                    .as_ref()
+                    .map(|(ids, _)| ids.clone())
+                    .unwrap_or_default(),
                 update: update::status(),
                 gpu_memory_mib: omaflow_gpu_memory_mib(),
                 hotkey_display: read_hotkey_display(),
@@ -1179,11 +1300,30 @@ fn start_status_worker(config: Config, messages: mpsc::Sender<Message>) {
     });
 }
 
-fn cleanup_server_available(endpoint: &str) -> bool {
-    let Some((base, _)) = endpoint.split_once("/api/") else {
+/// A server that answers is running, whoever installed it and wherever it is.
+/// Only a loopback endpoint that nothing answers can be a missing local
+/// install; a remote one that is silent is simply not reachable right now.
+fn cleanup_runtime(
+    enabled: bool,
+    endpoint_answers: bool,
+    endpoint_is_local: bool,
+    binary_on_path: bool,
+) -> CleanupRuntime {
+    if !enabled || endpoint_answers {
+        CleanupRuntime::Ready
+    } else if endpoint_is_local && !binary_on_path {
+        CleanupRuntime::Missing
+    } else {
+        CleanupRuntime::Stopped
+    }
+}
+
+fn cleanup_server_available(config: &crate::config::Cleanup) -> bool {
+    let Some((base, _)) = config.endpoint.split_once("/api/") else {
         return false;
     };
-    Command::new("curl")
+    let auth = crate::process::CurlAuth::new(&config.api_key);
+    auth.apply(&mut Command::new("curl"))
         .args([
             "--silent",
             "--fail",
@@ -1199,7 +1339,8 @@ fn cleanup_model_loaded(config: &crate::config::Cleanup) -> bool {
     let Some(base) = config.endpoint.strip_suffix("/api/chat") else {
         return false;
     };
-    Command::new("curl")
+    let auth = crate::process::CurlAuth::new(&config.api_key);
+    auth.apply(&mut Command::new("curl"))
         .args([
             "--silent",
             "--fail",
@@ -1338,6 +1479,9 @@ fn start_ipc(listener: UnixListener, messages: mpsc::Sender<Message>) {
                     .parse()
                     .ok()
                     .map(|id| Message::Panel(PanelCommand::CopyRaw(id))),
+                value if value.starts_with("model-progress:") => {
+                    parse_model_progress(&value["model-progress:".len()..])
+                }
                 "meter-preview-start" => Some(Message::Panel(PanelCommand::MeterPreviewStart)),
                 "meter-preview-stop" => Some(Message::Panel(PanelCommand::MeterPreviewStop)),
                 value if value.starts_with("meter-gate-preview:") => value
@@ -1424,6 +1568,71 @@ fn normalize_vocabulary_entry(value: &str) -> Option<String> {
     } else {
         Some(value)
     }
+}
+
+/// The panel only ever renders these, so anything malformed is dropped rather
+/// than shown: a stray socket write must not put text in front of the user.
+fn parse_model_progress(payload: &str) -> Option<Message> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let id = value.get("id")?.as_str()?;
+    let state = value.get("state")?.as_str()?;
+    if id.is_empty()
+        || id.len() > 512
+        || !matches!(state, "downloading" | "done" | "failed")
+        || id.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let message: String = value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(300)
+        .collect();
+    Some(Message::ModelProgress(
+        id.to_owned(),
+        DownloadProgress {
+            state: state.to_owned(),
+            percent: value
+                .get("percent")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .min(100) as u8,
+            message,
+            updated: Instant::now(),
+        },
+    ))
+}
+
+fn downloads_json(downloads: &HashMap<String, DownloadProgress>) -> serde_json::Value {
+    serde_json::Value::Object(
+        downloads
+            .iter()
+            .map(|(id, progress)| {
+                (
+                    id.clone(),
+                    serde_json::json!({
+                        "state": progress.state,
+                        "percent": progress.percent,
+                        "message": progress.message,
+                    }),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Best-effort delivery for callers that must keep working with no daemon:
+/// true when the command reached one, false when none was listening.
+pub fn send_command_quiet(command: &str) -> bool {
+    UnixStream::connect(socket_path())
+        .and_then(|mut stream| {
+            stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+            stream.write_all(command.as_bytes())
+        })
+        .is_ok()
 }
 
 fn send_command(command: &str) -> ExitCode {
@@ -1533,6 +1742,34 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn a_reachable_cleanup_server_is_ready_wherever_it_runs() {
+        use super::{CleanupRuntime, cleanup_runtime};
+        // Remote endpoint, no local ollama: answering wins, silence is stopped.
+        assert_eq!(
+            cleanup_runtime(true, true, false, false),
+            CleanupRuntime::Ready
+        );
+        assert_eq!(
+            cleanup_runtime(true, false, false, false),
+            CleanupRuntime::Stopped
+        );
+        // Loopback: installed but silent is stopped, absent is missing.
+        assert_eq!(
+            cleanup_runtime(true, false, true, true),
+            CleanupRuntime::Stopped
+        );
+        assert_eq!(
+            cleanup_runtime(true, false, true, false),
+            CleanupRuntime::Missing
+        );
+        // Cleanup off asks the user nothing at all.
+        assert_eq!(
+            cleanup_runtime(false, false, true, false),
+            CleanupRuntime::Ready
+        );
+    }
 
     #[test]
     fn displays_the_configured_hotkey_in_readable_form() {

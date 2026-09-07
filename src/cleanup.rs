@@ -276,8 +276,9 @@ fn budgeted_request(
 }
 
 fn infer(config: &Config, request: &Value, cancel: &AtomicBool) -> Result<Value, String> {
+    let auth = crate::process::CurlAuth::new(&config.cleanup.api_key);
     let mut command = Command::new("curl");
-    command
+    auth.apply(&mut command)
         .args([
             "--silent",
             "--show-error",

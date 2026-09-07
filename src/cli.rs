@@ -1,14 +1,16 @@
 //! Command-line entry points. Interactive requests use the daemon IPC channel.
+use crate::catalog::{self, CatalogEntry, Kind};
 use crate::process::CommandExt;
 use crate::surface_state_path;
 use crate::{
     backend, config::Config, history_command, meter_gate_command, paste_mode_command, run_daemon,
-    send_command, update, vocabulary_command,
+    send_command, send_command_quiet, update, vocabulary_command,
 };
 use std::{
     env, fs,
     io::Read,
     process::{Command, ExitCode},
+    time::{Duration, Instant},
 };
 
 pub fn run() -> ExitCode {
@@ -56,6 +58,9 @@ pub fn run() -> ExitCode {
                 }
             }
         }
+        "model-catalog" => model_catalog(),
+        "model-select" => model_select(args.next(), args.next()),
+        "model-install" => model_install(args.next(), args.next()),
         "serve-asr" => match backend::serve_speech() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -283,12 +288,139 @@ Delivery: copy, paste-last, paste-mode auto|ctrl-v|shift-insert|clipboard
 History: history-copy ID, history-raw ID, history-paste ID, history-edit ID TEXT,
          history-delete ID, history-undo, history-clear, erase-data
 Settings: vocabulary-add TERM, vocabulary-remove TERM, configure KEY JSON
-Models: configure models JSON
+Models: model-catalog, model-select speech|cleanup ID,
+        model-install speech|cleanup ID, configure models JSON
 Microphone: meter-gate DB, meter-preview-start, meter-preview-stop
 Evaluation: cleanup < text, evaluate < JSON, segment-file FILE.wav
 Maintenance: daemon, launch, quit, reload-config, effective-config,
              version, check-update, apply-update, rebuild"
     );
+}
+
+fn resolve_entry(
+    kind: Option<String>,
+    id: Option<String>,
+) -> Result<(Kind, &'static CatalogEntry), String> {
+    let kind = kind
+        .as_deref()
+        .and_then(Kind::parse)
+        .ok_or("Name a catalog to choose from: speech or cleanup.")?;
+    let id = id.ok_or_else(|| {
+        format!(
+            "Name a {} model from the catalog; `omaflow model-catalog` lists them.",
+            kind.as_str()
+        )
+    })?;
+    catalog::find(kind, &id)
+        .map(|entry| (kind, entry))
+        .ok_or_else(|| catalog::unknown_id(kind, &id))
+}
+
+fn model_catalog() -> ExitCode {
+    let result = Config::load().and_then(|config| {
+        serde_json::to_string(&catalog::to_json(
+            &config,
+            &catalog::installed_speech_ids(),
+            &catalog::installed_cleanup_ids(&config.cleanup.endpoint),
+        ))
+        .map_err(|error| error.to_string())
+    });
+    match result {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("omaflow: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn model_select(kind: Option<String>, id: Option<String>) -> ExitCode {
+    match resolve_entry(kind, id).and_then(|(kind, entry)| catalog::select(kind, entry)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("omaflow: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Also runs headless from a systemd unit on a fresh install, so it never
+/// needs a daemon, a terminal, or an answer from either.
+fn model_install(kind: Option<String>, id: Option<String>) -> ExitCode {
+    let (kind, entry) = match resolve_entry(kind, id) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!("omaflow: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut reporter = DownloadReporter::new(entry.id);
+    reporter.publish("downloading", None, &format!("Downloading {}", entry.label));
+    let downloaded = catalog::download(kind, entry, |percent, line| {
+        reporter.progress(percent, line);
+    });
+    if downloaded.is_ok() {
+        catalog::record_receipt(kind, entry);
+    }
+    match downloaded.and_then(|()| catalog::select(kind, entry)) {
+        Ok(()) => {
+            reporter.publish("done", Some(100), &format!("{} is ready", entry.label));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            reporter.publish("failed", None, &error);
+            eprintln!("omaflow: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Forwards download progress to a running daemon so the panel can show it.
+/// Downloaders print a new percentage many times a second; the socket sees at
+/// most one message per step of the bar.
+struct DownloadReporter {
+    id: &'static str,
+    percent: Option<u8>,
+    sent_at: Option<Instant>,
+}
+
+impl DownloadReporter {
+    fn new(id: &'static str) -> Self {
+        Self {
+            id,
+            percent: None,
+            sent_at: None,
+        }
+    }
+
+    /// A line we cannot read a number out of keeps the last percentage rather
+    /// than resetting the bar to zero; zero is what an unparsed download shows.
+    fn progress(&mut self, percent: Option<u8>, message: &str) {
+        let percent = percent.or(self.percent);
+        let stale = self
+            .sent_at
+            .is_none_or(|sent| sent.elapsed() >= Duration::from_millis(500));
+        if percent != self.percent || stale {
+            self.percent = percent;
+            self.publish("downloading", percent, message);
+        }
+    }
+
+    fn publish(&mut self, state: &str, percent: Option<u8>, message: &str) {
+        self.sent_at = Some(Instant::now());
+        send_command_quiet(&format!(
+            "model-progress:{}",
+            serde_json::json!({
+                "id": self.id,
+                "state": state,
+                "percent": percent.unwrap_or(0),
+                "message": message,
+            })
+        ));
+    }
 }
 
 fn launch_omaflow() -> ExitCode {

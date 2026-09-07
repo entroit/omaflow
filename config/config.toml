@@ -1,8 +1,9 @@
 # OmaFlow's defaults. The personal configuration lives at
 # ~/.config/omaflow/config.toml; installation copies every setting into that file.
 [behavior]
-# False runs the panel without starting models; set to true after model setup.
-models_configured = true
+# True means a speech model is ready to use. A fresh install has no weights
+# until the first download finishes, so setup flips this to true itself.
+models_configured = false
 # Two presses within this window lock the recording. Keyboards with tap/hold
 # mappings can delay Menu events, so one second is generous; long holds still
 # stop on release.
@@ -24,6 +25,10 @@ reduced_motion = false
 # the next dictation loads them first. Servers you run yourself are untouched.
 keep_models_loaded = true
 meter_gate_db = -60
+# How far other applications' audio is turned down while you dictate, so you
+# can concentrate on speaking. 0 leaves other audio alone, 100 silences it
+# completely. The previous volume comes back when the recording ends.
+duck_audio_percent = 70
 paste_mode = "auto"
 
 [backend]
@@ -32,7 +37,11 @@ endpoint = "http://127.0.0.1:18103/v1/audio/transcriptions"
 model = "nvidia/parakeet-tdt-0.6b-v3"
 language = "auto"
 # NeMo is managed locally; openai and whisper-cpp use a server you start.
+# Managed NeMo derives its own health URL and rejects a value here.
 health_endpoint = ""
+# Optional bearer token for a speech server that requires one. Sent as an
+# Authorization header only when it is not empty, and never published.
+api_key = ""
 device = "cuda"
 status_timeout_ms = 60000
 # Transcribe finished segments while recording, after a pause, once this many
@@ -43,9 +52,12 @@ live_segment_seconds = 20
 # Off by default; judge a rule with tools/segment_compare.py before enabling.
 live_segment_tiers = []
 
+# Natural cleanup is opt-in: with this off OmaFlow transcribes and pastes, and
+# nothing else has to be installed. Turning it on needs Ollama running and a
+# cleanup model downloaded (Settings -> Models, or `omaflow model-install`).
 # Gemma 4 E4B scored best in OmaFlow's multilingual dictation benchmark (tools/cleanup_bench.py).
 [cleanup]
-enabled = true
+enabled = false
 endpoint = "http://127.0.0.1:11434/api/chat"
 model = "gemma4:e4b"
 timeout_seconds = 30
@@ -66,6 +78,9 @@ use_window_context = true
 use_clipboard_context = false
 # Retry once with numbers locked when the safety guard rejects a cleanup.
 guard_retry = true
+# Optional bearer token for a cleanup server that requires one. Sent as an
+# Authorization header only when it is not empty, and never published.
+api_key = ""
 custom_vocabulary = ["OmaFlow", "Omarchy", "Hyprland", "Parakeet", "Gemma", "Quickshell"]
 
 # The cleanup model receives this as its system message. The transcript and

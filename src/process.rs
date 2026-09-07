@@ -1,9 +1,11 @@
 //! Bounded, cancellable subprocess I/O. Drain pipes while the child runs.
 use std::{
+    fs,
     io::{self, Read, Write},
-    os::fd::AsRawFd,
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -25,6 +27,72 @@ impl CommandExt for Command {
     fn bounded_status(&mut self) -> io::Result<ExitStatus> {
         self.bounded_output().map(|output| output.status)
     }
+}
+
+/// A bearer token for one curl invocation, handed over in an owner-only config
+/// file rather than argv: `/proc/<pid>/cmdline` is readable by every process on
+/// the machine, and a self-hosted server's key is a credential like any other.
+/// The file lives exactly as long as this value.
+pub struct CurlAuth {
+    path: Option<PathBuf>,
+    header: Option<String>,
+}
+
+impl CurlAuth {
+    pub fn new(api_key: &str) -> Self {
+        if api_key.is_empty() {
+            return Self {
+                path: None,
+                header: None,
+            };
+        }
+        let header = format!("Authorization: Bearer {api_key}");
+        let path = crate::runtime_dir().join(format!(
+            "omaflow-curl-{}-{}.conf",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        // A key that cannot be written to disk still has to reach the server,
+        // so the argv fallback is deliberate: a working request beats a hidden one.
+        match write_owner_only(&path, &format!("header = \"{header}\"\n")) {
+            Ok(()) => Self {
+                path: Some(path),
+                header: None,
+            },
+            Err(_) => Self {
+                path: None,
+                header: Some(header),
+            },
+        }
+    }
+
+    pub fn apply<'a>(&self, command: &'a mut Command) -> &'a mut Command {
+        if let Some(path) = &self.path {
+            command.arg("--config").arg(path);
+        } else if let Some(header) = &self.header {
+            command.arg("--header").arg(header);
+        }
+        command
+    }
+}
+
+impl Drop for CurlAuth {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn write_owner_only(path: &Path, contents: &str) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
 }
 
 pub fn nonblocking(file: &impl AsRawFd) -> io::Result<()> {

@@ -42,6 +42,7 @@ pub struct Behavior {
     pub max_recording_seconds: u64,
     pub reduced_motion: bool,
     pub meter_gate_db: i32,
+    pub duck_audio_percent: u8,
     pub paste_mode: PasteMode,
     pub keep_models_loaded: bool,
 }
@@ -91,6 +92,10 @@ pub struct Backend {
     pub language: String,
     pub health_endpoint: String,
     pub device: String,
+    /// Never serialized: `omaflow effective-config` and the panel state file
+    /// are both read by other processes, and a bearer token belongs in neither.
+    #[serde(skip_serializing)]
+    pub api_key: String,
     pub live_segment_seconds: u64,
     pub live_segment_tiers: Vec<SegmentTier>,
 }
@@ -121,6 +126,8 @@ pub struct Cleanup {
     pub use_clipboard_context: bool,
     pub custom_vocabulary: Vec<String>,
     pub guard_retry: bool,
+    #[serde(skip_serializing)]
+    pub api_key: String,
     pub system_prompt: String,
     #[serde(skip_serializing)]
     pub style: String,
@@ -141,6 +148,7 @@ impl Default for Behavior {
             reduced_motion: false,
             keep_models_loaded: true,
             meter_gate_db: -60,
+            duck_audio_percent: 70,
             paste_mode: PasteMode::Auto,
         }
     }
@@ -156,6 +164,7 @@ impl Default for Backend {
             language: "auto".into(),
             health_endpoint: String::new(),
             device: "cuda".into(),
+            api_key: String::new(),
             live_segment_seconds: 20,
             live_segment_tiers: Vec::new(),
         }
@@ -207,6 +216,7 @@ impl Default for Cleanup {
             use_clipboard_context: false,
             custom_vocabulary: Vec::new(),
             guard_retry: true,
+            api_key: String::new(),
             system_prompt: DEFAULT_CLEANUP_PROMPT.into(),
             style: "natural".into(),
         }
@@ -303,6 +313,8 @@ impl Config {
                 let (section, field) = match key.as_str() {
                     "cleanup_model" => ("cleanup", "model"),
                     "cleanup_endpoint" => ("cleanup", "endpoint"),
+                    "cleanup_api_key" => ("cleanup", "api_key"),
+                    "speech_api_key" => ("backend", "api_key"),
                     "speech_engine" => ("backend", "engine"),
                     "speech_model" => ("backend", "model"),
                     "speech_endpoint" => ("backend", "endpoint"),
@@ -340,6 +352,7 @@ impl Config {
             | "training_log_enabled"
             | "history_limit"
             | "reduced_motion"
+            | "duck_audio_percent"
             | "keep_models_loaded" => "behavior",
             "enabled" | "use_window_context" | "use_clipboard_context" | "style" => "cleanup",
             _ => return Err("Unknown setting".into()),
@@ -423,13 +436,30 @@ impl Config {
         if !["nemo", "parakeet", "openai", "whisper-cpp"].contains(&self.backend.engine.as_str()) {
             return Err("Speech engine must be parakeet, nemo, openai or whisper-cpp".into());
         }
-        for model in [&self.backend.model, &self.cleanup.model] {
+        // whisper-server takes no model field, and OmaFlow never sends one to
+        // it, so demanding a name there would be asking for an unused answer.
+        let speech_model_optional = self.backend.engine == "whisper-cpp";
+        for (model, optional) in [
+            (&self.backend.model, speech_model_optional),
+            (&self.cleanup.model, false),
+        ] {
+            if optional && model.is_empty() {
+                continue;
+            }
             if model.trim().is_empty()
                 || model.len() > 512
                 || model.chars().any(char::is_control)
                 || model.starts_with('-')
             {
                 return Err("Enter a model name or path, up to 512 characters".into());
+            }
+        }
+        // A newline here would let a key smuggle a second HTTP header in.
+        for key in [&self.backend.api_key, &self.cleanup.api_key] {
+            if key.len() > 4_096 || key.chars().any(|c| c.is_control() || c == '"') {
+                return Err(
+                    "An API key must be one line of at most 4096 characters, without quotes".into(),
+                );
             }
         }
         if self.backend.live_segment_seconds != 0
@@ -452,6 +482,19 @@ impl Config {
         }
         if self.backend.managed() {
             self.backend.listen_address()?;
+            // The health probe is derived by splitting the endpoint on /v1/,
+            // so an endpoint without it saves fine and then never reports ready.
+            if !self.backend.endpoint.contains("/v1/") {
+                return Err("A managed NeMo speech endpoint must contain /v1/, as in http://127.0.0.1:18103/v1/audio/transcriptions".into());
+            }
+            // Managed NeMo answers on its own derived /health. A URL left over
+            // from another server would otherwise keep deciding whether it runs.
+            if !self.backend.health_endpoint.is_empty() {
+                return Err(
+                    "Managed NeMo has no separate health endpoint; clear it or choose another speech engine"
+                        .into(),
+                );
+            }
         }
         if !self.backend.health_endpoint.is_empty()
             && !(self.backend.health_endpoint.starts_with("http://")
@@ -488,6 +531,9 @@ impl Config {
             if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
                 return Err("Model endpoints must be HTTP or HTTPS URLs".into());
             }
+        }
+        if self.behavior.duck_audio_percent > 100 {
+            return Err("Duck other audio by 0 to 100 percent".into());
         }
         if self.behavior.history_limit > 1000 {
             return Err("Keep at most 1000 dictations".into());
@@ -672,6 +718,45 @@ mod tests {
     }
 
     #[test]
+    fn rejects_speech_endpoints_a_health_probe_could_never_follow() {
+        let mut config = Config::default();
+        config.backend.engine = "nemo".into();
+        config.backend.endpoint = "http://127.0.0.1:18103/transcribe".into();
+        assert!(config.validate().unwrap_err().contains("/v1/"));
+
+        config.backend.endpoint = "http://127.0.0.1:18103/v1/audio/transcriptions".into();
+        assert!(config.validate().is_ok());
+
+        // A URL left behind by another engine must not answer for NeMo.
+        config.backend.health_endpoint = "http://127.0.0.1:8080/health".into();
+        assert!(config.validate().unwrap_err().contains("health endpoint"));
+        config.backend.health_endpoint = String::new();
+
+        // whisper-server takes no model name, so requiring one is asking for
+        // an answer that is never sent.
+        config.backend.engine = "whisper-cpp".into();
+        config.backend.endpoint = "http://127.0.0.1:8080/inference".into();
+        config.backend.model = String::new();
+        assert!(config.validate().is_ok());
+        config.backend.engine = "openai".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn api_keys_are_bounded_and_never_serialized() {
+        let mut config = Config::default();
+        config.backend.api_key = "sk-test".into();
+        config.cleanup.api_key = "sk-other".into();
+        assert!(config.validate().is_ok());
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert!(serialized["backend"].get("api_key").is_none());
+        assert!(serialized["cleanup"].get("api_key").is_none());
+
+        config.backend.api_key = "sk\nX-Injected: yes".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn production_config_contains_the_full_cleanup_contract() {
         let config: Config = toml::from_str(include_str!("../config/config.toml")).unwrap();
         let prompt = config.cleanup.system_prompt.to_lowercase();
@@ -685,5 +770,6 @@ mod tests {
         assert_eq!(config.cleanup.temperature, 0.0);
         assert_eq!(config.cleanup.num_ctx, 16_384);
         assert_eq!(config.cleanup.model, "gemma4:e4b");
+        assert!(!config.cleanup.enabled);
     }
 }

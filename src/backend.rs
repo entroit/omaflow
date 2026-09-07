@@ -937,10 +937,18 @@ pub fn speech_server_ready(config: &crate::config::Backend) -> bool {
             return false;
         };
         format!("{base}/health")
+    } else if config.engine == "whisper-cpp" {
+        // whisper-server registers only POST /inference, so probing the
+        // transcription endpoint answers 404 forever. It does serve /health.
+        let Some(origin) = endpoint_origin(&config.endpoint) else {
+            return false;
+        };
+        format!("{origin}/health")
     } else {
         config.endpoint.clone()
     };
-    Command::new("curl")
+    let auth = crate::process::CurlAuth::new(&config.api_key);
+    auth.apply(&mut Command::new("curl"))
         .args([
             "--silent",
             "--max-time",
@@ -958,6 +966,16 @@ pub fn speech_server_ready(config: &crate::config::Backend) -> bool {
             out.status.success()
                 && (code.starts_with('2') || (config.health_endpoint.is_empty() && code == "405"))
         })
+}
+
+/// The scheme and authority of a URL, without its path.
+pub(crate) fn endpoint_origin(endpoint: &str) -> Option<String> {
+    let (scheme, rest) = endpoint.split_once("://")?;
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|a| !a.is_empty())?;
+    Some(format!("{scheme}://{authority}"))
 }
 
 fn start_audio_capture() -> Result<Child, String> {
@@ -1147,8 +1165,9 @@ fn transcribe_pcm(config: &Config, pcm: &[u8], cancel: &AtomicBool) -> Result<St
     let timeout = timeout_seconds.to_string();
     let model = format!("model={}", config.backend.model);
     let language = format!("language={}", config.backend.language);
+    let auth = crate::process::CurlAuth::new(&config.backend.api_key);
     let mut command = Command::new("curl");
-    command
+    auth.apply(&mut command)
         .args([
             "--silent",
             "--show-error",
@@ -1566,7 +1585,8 @@ pub fn serve_speech() -> Result<(), String> {
 pub fn unload_cleanup(config: &Config) -> bool {
     let payload =
         serde_json::json!({"model":config.cleanup.model,"messages":[],"keep_alive":0}).to_string();
-    Command::new("curl")
+    let auth = crate::process::CurlAuth::new(&config.cleanup.api_key);
+    auth.apply(&mut Command::new("curl"))
         .args([
             "-fsS",
             "--max-time",
