@@ -1,12 +1,9 @@
 //! Update awareness for a plugin installed from a git checkout.
 //!
-//! OmaFlow is installed by cloning the repository and running `link-local`,
-//! not through `omarchy plugin add`, so nothing else tells a user that a new
-//! commit exists or that their checkout is ahead of the binary they are
-//! running. `omarchy plugin update` only copies files and rescans the shell;
-//! there is no manifest hook that rebuilds the Rust daemon, refreshes the
-//! systemd units, or relinks the binary, and a half-applied update leaves
-//! new QML talking to an old daemon.
+//! OmaFlow is installed from a Git checkout, so the panel reports when that
+//! checkout is behind its remote or ahead of the running binary. Update checks
+//! never modify or execute the checkout. Users review updates through Omarchy's
+//! plugin updater and run `link-local` themselves to rebuild the daemon.
 //!
 //! This module gives the panel three facts: whether the checkout is newer than
 //! the running binary, whether the remote is ahead of the checkout, and when
@@ -196,51 +193,9 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Pull and reinstall, or only reinstall. Both run in a terminal because they
-/// compile the daemon, restart its services, and reload the shell, which takes
-/// long enough that silent execution looks like nothing happened.
-pub fn run_installer(pull: bool) -> Result<(), String> {
-    let root = repo_root().ok_or_else(|| "could not locate the OmaFlow checkout".to_string())?;
-    let script = if pull { "update" } else { "link-local" };
-    let path = root.join(script);
-    if !path.is_file() {
-        return Err(format!("{} is missing", path.display()));
-    }
-
-    let command = format!(
-        "{} || {{ printf '\\nOmaFlow update failed. Press enter to close.\\n'; read -r _; }}",
-        shell_quote(&path.to_string_lossy())
-    );
-    let launched = Command::new("omarchy-launch-terminal")
-        .args(["bash", "-lc", &command])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match launched {
-        Ok(status) if status.success() => Ok(()),
-        // Without a desktop terminal, still apply the update rather than
-        // refusing: the panel button is the only entry point some users have.
-        _ => Command::new(&path)
-            .stdin(Stdio::null())
-            .status()
-            .map_err(|error| format!("could not run {}: {error}", path.display()))
-            .and_then(|status| {
-                status
-                    .success()
-                    .then_some(())
-                    .ok_or_else(|| format!("{script} exited with {status}"))
-            }),
-    }
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{RUNNING_VERSION, manifest_version, shell_quote};
+    use super::{RUNNING_VERSION, manifest_version};
 
     #[test]
     fn reads_the_version_from_the_plugin_manifest() {
@@ -250,14 +205,5 @@ mod tests {
             "manifest.json and Cargo.toml must be bumped together"
         );
         assert_eq!(manifest_version("not json"), None);
-    }
-
-    #[test]
-    fn quotes_paths_containing_shell_characters() {
-        assert_eq!(shell_quote("/home/a b/omaflow"), "'/home/a b/omaflow'");
-        assert_eq!(
-            shell_quote("/home/it's/omaflow"),
-            r"'/home/it'\''s/omaflow'"
-        );
     }
 }

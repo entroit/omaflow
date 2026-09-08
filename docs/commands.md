@@ -85,8 +85,10 @@ goes in through `configure models` instead. See
 | `quit` | Unload the cleanup model and stop the daemon and speech server. |
 | `version` | Print the version compiled into the binary. |
 | `check-update` | Fetch the remote, record how far the checkout is behind, and tell the daemon to republish. A daily timer runs this. |
-| `apply-update` | Pull the latest release and rebuild. Opens a terminal. |
-| `rebuild` | Rebuild and relink the current checkout. Opens a terminal. |
+
+Update OmaFlow with `omarchy plugin update entroit.omaflow`. Omarchy shows the
+diff and asks before changing the checkout. Review it, then run `./link-local`
+from the checkout to rebuild the daemon and refresh its integration.
 
 ## Internal
 

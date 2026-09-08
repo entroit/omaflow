@@ -160,16 +160,6 @@ pub fn run() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        "apply-update" | "rebuild" => {
-            let pull = command == "apply-update";
-            match update::run_installer(pull) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("omaflow: {error}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         "effective-config" => match Config::load() {
             Ok(config) => {
                 println!("{}", serde_json::to_string(&config).unwrap());
@@ -293,7 +283,7 @@ Models: model-catalog, model-select speech|cleanup ID,
 Microphone: meter-gate DB, meter-preview-start, meter-preview-stop
 Evaluation: cleanup < text, evaluate < JSON, segment-file FILE.wav
 Maintenance: daemon, launch, quit, reload-config, effective-config,
-             version, check-update, apply-update, rebuild"
+             version, check-update"
     );
 }
 

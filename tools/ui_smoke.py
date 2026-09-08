@@ -83,6 +83,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
         if (auditMode === "settings-cleanup-off") { root.settingsTab="cleanup"; root.cleanupEnabled=false }
         if (auditMode === "settings-cleanup-no-ollama") { root.settingsTab="cleanup"; root.cleanupRuntime="missing" }
         if (auditMode === "hotkey") { root.phase="idle"; root.idlePage="settings"; root.settingsTab="general"; root.editShortcut=true }
+        if (auditMode === "settings-update") { root.idlePage="settings"; root.settingsTab="general"; root.updateBehind=1; root.updateRemoteVersion="0.17.0"; root.updateCheckedAtMs=Date.now() }
         if (auditMode !== "empty") root.history = [
           {id:1, created_at_ms:Date.now(), text:"Please send the updated proposal to the team before Thursday's meeting. I've added the revised timeline and the notes from our last review."},
           {id:2, created_at_ms:Date.now()-300000, text:"The client approved the new layout. Let's finish the mobile version this week and schedule a final review for Monday. Please check the contact form, update the pricing page, and make sure the links in the footer work before we send it over. I'll prepare the handover notes and share them with the team."},
@@ -140,7 +141,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
 
     for component in ROOT.glob("*.qml"):
         if component.name != "OmaFlow.qml": (p/component.name).write_text(component.read_text())
-    for mode in ["history","empty","first-run","detail","settings-cleanup","settings-cleanup-custom","settings-cleanup-off","settings-cleanup-no-ollama","settings-models","settings-models-custom","settings-models-server","settings-models-pending","settings-models-downloading","settings-audio","settings-vocabulary","settings-privacy","settings-general","hotkey","recording","recording-held","processing","result","warning","success","notice","error"]:
+    for mode in ["history","empty","first-run","detail","settings-cleanup","settings-cleanup-custom","settings-cleanup-off","settings-cleanup-no-ollama","settings-models","settings-models-custom","settings-models-server","settings-models-pending","settings-models-downloading","settings-audio","settings-vocabulary","settings-privacy","settings-general","settings-update","hotkey","recording","recording-held","processing","result","warning","success","notice","error"]:
         result = subprocess.run(["quickshell","-p",str(p)], env=dict(os.environ, QT_QPA_PLATFORM="offscreen", AUDIT_MODE=mode, OMAFLOW_UI_OUTPUT=str(output)), capture_output=True, text=True, timeout=10)
         log = result.stdout+result.stderr
         (output/(mode+".log")).write_text(log)

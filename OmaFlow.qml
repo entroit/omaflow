@@ -306,6 +306,10 @@ Panel {
     // where the only tab worth showing is the one that fixes that.
     if (root.modelSettings.configured === false) root.settingsTab = "models"
   }
+  function openUpdateHelp() {
+    root.idlePage = "settings"
+    root.settingsTab = "general"
+  }
   function editHotkey() { root.editShortcut = !root.editShortcut }
 
   // The custom-model fields are the one part of Settings that cannot explain
@@ -325,16 +329,6 @@ Panel {
     id:checkUpdateProcess
     command:["omaflow","check-update"]
     onExited: stateFile.reload()
-  }
-
-  function applyUpdate() {
-    root.controller.hide()
-    Quickshell.execDetached(["omaflow", "apply-update"])
-  }
-
-  function finishUpdate() {
-    root.controller.hide()
-    Quickshell.execDetached(["omaflow", "rebuild"])
   }
 
   function quitOmaFlow() {
@@ -1291,7 +1285,7 @@ Panel {
             Layout.fillWidth: true
             textFormat: Text.PlainText
             text: root.needsRebuild || !root.supportedState
-              ? "Version " + root.checkoutVersion + " is downloaded and ready to install"
+              ? "OmaFlow needs to be rebuilt after an update"
               : root.updateRemoteVersion
                 ? "OmaFlow " + root.updateRemoteVersion + " is available"
                 : "An OmaFlow update is available"
@@ -1302,12 +1296,11 @@ Panel {
           }
 
           ActionButton {
-            text: root.needsRebuild || !root.supportedState ? "Finish update" : "Update"
+            text: "How to update"
             foreground: Color.popups.text
             background: Util.alpha(Color.accent, 0.28)
             bordered: true
-            onClicked: root.needsRebuild || !root.supportedState
-              ? root.finishUpdate() : root.applyUpdate()
+            onClicked: root.openUpdateHelp()
           }
         }
       }

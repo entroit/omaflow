@@ -35,7 +35,7 @@ exist.
 | `src/backend.rs` | Microphone capture, speech server client and the managed NeMo server. |
 | `src/catalog.rs` | The built-in model catalog, the downloader and what selecting an entry writes. |
 | `src/audio.rs` | Ducking the default output through `wpctl`, and recovering it after a crash. |
-| `src/update.rs` | Version checks and the update/rebuild launcher. |
+| `src/update.rs` | Read-only version and remote update checks. |
 | `src/config.rs` | `config.toml` schema, defaults and atomic edits. |
 | `src/cli.rs` | Every `omaflow` command. |
 | `src/process.rs` | Bounded child processes, and the API key's owner-only curl config. |

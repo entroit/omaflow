@@ -124,7 +124,7 @@ ColumnLayout {
             : !page.flow.supportedState
               ? "The running daemon is newer than this panel"
               : page.flow.needsRebuild
-                ? "Version " + page.flow.checkoutVersion + " is ready to install"
+                ? "Version " + page.flow.checkoutVersion + " needs a rebuild"
                 : page.flow.updateAvailable
                   ? (page.flow.updateRemoteVersion
                     ? "Version " + page.flow.updateRemoteVersion + " is available"
@@ -146,7 +146,9 @@ ColumnLayout {
           text: page.flow.updateError
             ? "Last check failed: " + page.flow.updateError
             : page.flow.needsRebuild || !page.flow.supportedState
-              ? "The checkout moved but the daemon was not rebuilt. Finish update rebuilds it."
+              ? "Review the checkout, then run ./link-local from it."
+              : page.flow.updateAvailable
+                ? "Use Omarchy to review the update, then rebuild OmaFlow."
               : page.flow.updateCheckedAtMs > 0
                 ? "Checked " + page.flow.formatHistoryTime(page.flow.updateCheckedAtMs).toLowerCase()
                 : "Not checked yet"
@@ -157,21 +159,12 @@ ColumnLayout {
       }
 
       ActionButton {
-        visible: page.flow.needsRebuild || !page.flow.supportedState
-        text: "Finish update"
+        visible: page.flow.updateAttention
+        text: "Copy steps"
         foreground: Color.popups.text
         background: Util.alpha(Color.accent, 0.22)
         bordered: true
-        onClicked: page.flow.finishUpdate()
-      }
-
-      ActionButton {
-        visible: page.flow.updateAvailable && !page.flow.needsRebuild && page.flow.supportedState
-        text: "Update"
-        foreground: Color.popups.text
-        background: Util.alpha(Color.accent, 0.22)
-        bordered: true
-        onClicked: page.flow.applyUpdate()
+        onClicked: Quickshell.execDetached(["wl-copy", "omarchy plugin update entroit.omaflow\ncd " + page.flow.pluginDir + " && ./link-local"])
       }
 
       ActionButton {
