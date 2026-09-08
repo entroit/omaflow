@@ -653,7 +653,7 @@ Panel {
           // Locked mode has a Stop button; a hint would only repeat it.
           visible: !root.latched
           textFormat: Text.PlainText
-          text: "Release the hotkey to finish"
+          text: "Release to finish · Double-tap to lock"
           color: Util.alpha(Color.popups.text, 0.58)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
