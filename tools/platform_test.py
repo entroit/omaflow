@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Exercise shortcut rollback, bootstrap diagnostics, and installer trap safety."""
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import tarfile
 import tempfile
 from unittest.mock import patch
 import set_hotkey
@@ -148,21 +150,52 @@ omarchy() {
     assert 'Install it separately' in result.stderr
     print('PASS the configured model drives the managed server arguments')
 
-    # The temporary NeMo installer moved out of ./install into its own script;
-    # its trap still has to erase the download without touching the caller.
-    traps = re.findall(r"trap '([^']+)' EXIT", (ROOT/'scripts/install-nemo.sh').read_text())
-    target = next(trap for trap in traps if 'installer' in trap)
-    installer = base/'installer'; installer.touch()
-    program = 'installer="$1"\ntrap '+"'"+target+"' EXIT\nexit 0\n"
-    result = subprocess.run(['bash','-c',program,'test',str(installer)], start_new_session=True, timeout=3)
-    assert result.returncode == 0 and not installer.exists()
-    print("PASS the NeMo installer erases its temporary download and leaves the process group alive")
-
     nemo_source = (ROOT/'scripts/install-nemo.sh').read_text()
-    pinned_commit = re.search(r'installer_commit="([0-9a-f]{40})"', nemo_source).group(1)
-    pinned_sha256 = re.search(r'installer_sha256="([0-9a-f]{64})"', nemo_source).group(1)
-    assert f'raw.githubusercontent.com/NVIDIA/NeMo-Speech.cpp/$installer_commit/scripts/install.sh' in nemo_source
-    assert 'raw/main/' not in nemo_source
+    runtime_version = re.search(r'runtime_version="([0-9]+\.[0-9]+\.[0-9]+)"', nemo_source).group(1)
+    runtime_bytes = int(re.search(r'runtime_bytes=([0-9]+)', nemo_source).group(1))
+    runtime_sha256 = re.search(r'runtime_sha256="([0-9a-f]{64})"', nemo_source).group(1)
+    runtime_archive = f'nemo-speech-{runtime_version}-linux-x86_64-cuda.tar.gz'
+    runtime_root = runtime_archive.removesuffix('.tar.gz')
+    assert runtime_version == '0.1.0'
+    assert runtime_bytes == 107310946
+    assert runtime_sha256 == 'e68628f396489c98fb353e070efaea5bc4977409ae7734fce56c251a79e29147'
+    assert 'releases/download/v$runtime_version/$runtime_archive' in nemo_source
+    for mutable_path in ['raw/main/', 'scripts/install.sh', 'git clone', '.tar.gz.sha256']:
+        assert mutable_path not in nemo_source
+
+    fixture_source = base/'nemo-fixture-source'/runtime_root
+    fixture_binary = fixture_source/'bin/nemo-speech'
+    fixture_binary.parent.mkdir(parents=True)
+    fixture_binary.write_text(f'''#!/usr/bin/bash
+: > "$TEST_RUNTIME_EXECUTED"
+printf 'nemo-speech {runtime_version}\\n'
+''')
+    fixture_binary.chmod(0o755)
+    (fixture_source/'share').mkdir()
+    (fixture_source/'share/runtime.txt').write_text('verified fixture\n')
+    fixture_archive = base/'runtime.tar.gz'
+    with tarfile.open(fixture_archive, 'w:gz') as archive:
+        archive.add(fixture_source, arcname=runtime_root)
+    fixture_bytes = fixture_archive.stat().st_size
+    fixture_sha256 = hashlib.sha256(fixture_archive.read_bytes()).hexdigest()
+
+    fixture_repo = base/'nemo-fixture-repo'
+    fixture_script = fixture_repo/'scripts/install-nemo.sh'
+    fixture_script.parent.mkdir(parents=True)
+    fixture_script.write_text(
+        nemo_source
+        .replace(f'runtime_bytes={runtime_bytes}', f'runtime_bytes={fixture_bytes}')
+        .replace(runtime_sha256, fixture_sha256)
+    )
+    fixture_script.chmod(0o755)
+    receipt_script = fixture_repo/'tools/install_receipt.py'
+    receipt_script.parent.mkdir()
+    receipt_script.write_text('''#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+Path(os.environ["TEST_RECEIPT"]).write_text(" ".join(sys.argv[1:]))
+''')
 
     nemo_commands = base/'nemo-bin'; nemo_commands.mkdir()
     (nemo_commands/'curl').write_text(r'''#!/usr/bin/bash
@@ -176,62 +209,78 @@ while (($#)); do
   esac
 done
 [[ -n $output ]]
-if [[ ${TEST_CURL_MODE:-small} == oversized ]]; then
-  head -c 262145 /dev/zero > "$output"
-else
-  cat > "$output" <<'INSTALLER'
-#!/bin/sh
-set -eu
-: > "$TEST_INSTALLER_EXECUTED"
-prefix=''
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --prefix) prefix="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-mkdir -p "$prefix/bin"
-printf '#!/bin/sh\nexit 0\n' > "$prefix/bin/nemo-speech"
-chmod 755 "$prefix/bin/nemo-speech"
-INSTALLER
-fi
-''')
-    (nemo_commands/'sha256sum').write_text('''#!/usr/bin/bash
-printf '%s  %s\\n' "$TEST_INSTALLER_SHA256" "$1"
+cp "$TEST_RUNTIME_ARCHIVE" "$output"
+case "${TEST_CURL_MODE:-valid}" in
+  valid) ;;
+  tampered) printf X | dd of="$output" bs=1 seek=0 conv=notrunc status=none ;;
+  oversized) printf X >> "$output" ;;
+  fail) exit 7 ;;
+esac
 ''')
     for path in nemo_commands.iterdir():
         path.chmod(0o755)
 
     curl_args = base/'curl-args'
-    executed = base/'nemo-installer-executed'
+    executed = base/'nemo-runtime-executed'
+    receipt = base/'nemo-runtime-receipt'
     nemo_env = dict(
         os.environ,
         PATH=f'{nemo_commands}:/usr/bin',
         HOME=str(base),
         XDG_STATE_HOME=str(base/'state'),
         TEST_CURL_ARGS=str(curl_args),
-        TEST_INSTALLER_EXECUTED=str(executed),
-        TEST_INSTALLER_SHA256=pinned_sha256,
+        TEST_RUNTIME_ARCHIVE=str(fixture_archive),
+        TEST_RUNTIME_EXECUTED=str(executed),
+        TEST_RECEIPT=str(receipt),
     )
     prefix = base/'nemo-runtime-good'
     result = subprocess.run(
-        [str(ROOT/'scripts/install-nemo.sh'), str(prefix)], env=nemo_env,
+        [str(fixture_script), str(prefix)], env=nemo_env,
         capture_output=True, text=True, timeout=10,
     )
     assert result.returncode == 0, result.stderr
     assert executed.exists() and (prefix/'bin/nemo-speech').exists()
+    assert (prefix/'.nemo-speech-install').read_text() == f'{runtime_version} linux x86_64 cuda\n'
+    assert receipt.read_text() == f'nemo-runtime {prefix}'
     arguments = curl_args.read_text().splitlines()
-    expected_url = f'https://raw.githubusercontent.com/NVIDIA/NeMo-Speech.cpp/{pinned_commit}/scripts/install.sh'
+    expected_url = f'https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v{runtime_version}/{runtime_archive}'
     assert expected_url in arguments
-    assert arguments[arguments.index('--max-filesize')+1] == '262144'
+    assert arguments[arguments.index('--max-filesize')+1] == str(fixture_bytes)
     assert arguments[arguments.index('--proto')+1] == '=https'
     assert arguments[arguments.index('--proto-redir')+1] == '=https'
     assert '--tlsv1.2' in arguments
+    assert arguments[arguments.index('--retry')+1] == '3'
 
     executed.unlink()
-    bad_env = dict(nemo_env, TEST_INSTALLER_SHA256='0'*64)
+    fixture_binary.write_text('''#!/usr/bin/bash
+: > "$TEST_RUNTIME_EXECUTED"
+printf 'nemo-speech 9.9.9\\n'
+''')
+    fixture_binary.chmod(0o755)
+    wrong_version_archive = base/'wrong-version.tar.gz'
+    with tarfile.open(wrong_version_archive, 'w:gz') as archive:
+        archive.add(fixture_source, arcname=runtime_root)
+    wrong_version_bytes = wrong_version_archive.stat().st_size
+    wrong_version_sha256 = hashlib.sha256(wrong_version_archive.read_bytes()).hexdigest()
+    wrong_version_script = fixture_repo/'scripts/install-nemo-wrong-version.sh'
+    wrong_version_script.write_text(
+        nemo_source
+        .replace(f'runtime_bytes={runtime_bytes}', f'runtime_bytes={wrong_version_bytes}')
+        .replace(runtime_sha256, wrong_version_sha256)
+    )
+    wrong_version_script.chmod(0o755)
+    wrong_version_env = dict(nemo_env, TEST_RUNTIME_ARCHIVE=str(wrong_version_archive))
     result = subprocess.run(
-        [str(ROOT/'scripts/install-nemo.sh'), str(base/'nemo-runtime-bad-hash')],
+        [str(wrong_version_script), str(base/'nemo-runtime-wrong-version')],
+        env=wrong_version_env, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0 and 'did not report version' in result.stderr
+    assert executed.exists() and not (base/'nemo-runtime-wrong-version').exists()
+    executed.unlink()
+
+    bad_env = dict(nemo_env, TEST_CURL_MODE='tampered')
+    result = subprocess.run(
+        [str(fixture_script), str(base/'nemo-runtime-bad-hash')],
         env=bad_env, capture_output=True, text=True, timeout=10,
     )
     assert result.returncode != 0 and 'checksum verification' in result.stderr
@@ -239,9 +288,16 @@ printf '%s  %s\\n' "$TEST_INSTALLER_SHA256" "$1"
 
     oversized_env = dict(nemo_env, TEST_CURL_MODE='oversized')
     result = subprocess.run(
-        [str(ROOT/'scripts/install-nemo.sh'), str(base/'nemo-runtime-oversized')],
+        [str(fixture_script), str(base/'nemo-runtime-oversized')],
         env=oversized_env, capture_output=True, text=True, timeout=10,
     )
-    assert result.returncode != 0 and 'larger than the reviewed' in result.stderr
+    assert result.returncode != 0 and 'expected exactly' in result.stderr
     assert not executed.exists()
-    print("PASS the NeMo installer pins, bounds and verifies remote code before execution")
+
+    traps = re.findall(r"trap '([^']+)' EXIT", nemo_source)
+    target = next(trap for trap in traps if 'temporary' in trap)
+    temporary = base/'nemo-temporary'; temporary.mkdir()
+    program = 'temporary="$1"\ntrap '+"'"+target+"' EXIT\nexit 0\n"
+    result = subprocess.run(['bash','-c',program,'test',str(temporary)], start_new_session=True, timeout=3)
+    assert result.returncode == 0 and not temporary.exists()
+    print("PASS the NeMo runtime uses one exact, bounded, verified release artifact with no source fallback")
