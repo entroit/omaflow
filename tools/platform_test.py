@@ -157,3 +157,91 @@ omarchy() {
     result = subprocess.run(['bash','-c',program,'test',str(installer)], start_new_session=True, timeout=3)
     assert result.returncode == 0 and not installer.exists()
     print("PASS the NeMo installer erases its temporary download and leaves the process group alive")
+
+    nemo_source = (ROOT/'scripts/install-nemo.sh').read_text()
+    pinned_commit = re.search(r'installer_commit="([0-9a-f]{40})"', nemo_source).group(1)
+    pinned_sha256 = re.search(r'installer_sha256="([0-9a-f]{64})"', nemo_source).group(1)
+    assert f'raw.githubusercontent.com/NVIDIA/NeMo-Speech.cpp/$installer_commit/scripts/install.sh' in nemo_source
+    assert 'raw/main/' not in nemo_source
+
+    nemo_commands = base/'nemo-bin'; nemo_commands.mkdir()
+    (nemo_commands/'curl').write_text(r'''#!/usr/bin/bash
+set -euo pipefail
+printf '%s\n' "$@" > "$TEST_CURL_ARGS"
+output=''
+while (($#)); do
+  case "$1" in
+    -o|--output) output="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ -n $output ]]
+if [[ ${TEST_CURL_MODE:-small} == oversized ]]; then
+  head -c 262145 /dev/zero > "$output"
+else
+  cat > "$output" <<'INSTALLER'
+#!/bin/sh
+set -eu
+: > "$TEST_INSTALLER_EXECUTED"
+prefix=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --prefix) prefix="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$prefix/bin"
+printf '#!/bin/sh\nexit 0\n' > "$prefix/bin/nemo-speech"
+chmod 755 "$prefix/bin/nemo-speech"
+INSTALLER
+fi
+''')
+    (nemo_commands/'sha256sum').write_text('''#!/usr/bin/bash
+printf '%s  %s\\n' "$TEST_INSTALLER_SHA256" "$1"
+''')
+    for path in nemo_commands.iterdir():
+        path.chmod(0o755)
+
+    curl_args = base/'curl-args'
+    executed = base/'nemo-installer-executed'
+    nemo_env = dict(
+        os.environ,
+        PATH=f'{nemo_commands}:/usr/bin',
+        HOME=str(base),
+        XDG_STATE_HOME=str(base/'state'),
+        TEST_CURL_ARGS=str(curl_args),
+        TEST_INSTALLER_EXECUTED=str(executed),
+        TEST_INSTALLER_SHA256=pinned_sha256,
+    )
+    prefix = base/'nemo-runtime-good'
+    result = subprocess.run(
+        [str(ROOT/'scripts/install-nemo.sh'), str(prefix)], env=nemo_env,
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert executed.exists() and (prefix/'bin/nemo-speech').exists()
+    arguments = curl_args.read_text().splitlines()
+    expected_url = f'https://raw.githubusercontent.com/NVIDIA/NeMo-Speech.cpp/{pinned_commit}/scripts/install.sh'
+    assert expected_url in arguments
+    assert arguments[arguments.index('--max-filesize')+1] == '262144'
+    assert arguments[arguments.index('--proto')+1] == '=https'
+    assert arguments[arguments.index('--proto-redir')+1] == '=https'
+    assert '--tlsv1.2' in arguments
+
+    executed.unlink()
+    bad_env = dict(nemo_env, TEST_INSTALLER_SHA256='0'*64)
+    result = subprocess.run(
+        [str(ROOT/'scripts/install-nemo.sh'), str(base/'nemo-runtime-bad-hash')],
+        env=bad_env, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0 and 'checksum verification' in result.stderr
+    assert not executed.exists()
+
+    oversized_env = dict(nemo_env, TEST_CURL_MODE='oversized')
+    result = subprocess.run(
+        [str(ROOT/'scripts/install-nemo.sh'), str(base/'nemo-runtime-oversized')],
+        env=oversized_env, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0 and 'larger than the reviewed' in result.stderr
+    assert not executed.exists()
+    print("PASS the NeMo installer pins, bounds and verifies remote code before execution")
