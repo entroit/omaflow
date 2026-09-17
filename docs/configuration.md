@@ -34,7 +34,8 @@ settable in the TOML.
 
 | Key | Default | Effect |
 |---|---:|---|
-| `[cleanup] enabled` | `false` | Off pastes exactly what the speech model recognized. On needs Ollama and a cleanup model. Settings → Cleanup. |
+| `[cleanup] enabled` | `false` | Off pastes exactly what the speech model recognized. On sends it to the configured cleanup server. Settings → Cleanup. |
+| `[cleanup] engine` | `"ollama"` | Cleanup protocol: `ollama` for `/api/chat`, or `openai` for `/v1/chat/completions`. |
 | `[behavior] models_configured` | `false` | Whether a speech model is ready to use. Selecting or downloading a catalog model sets it from the weights actually on disk. |
 | `[behavior] duck_audio_percent` | `70` | How far the default audio output is turned down while a recording is active, 0 to 100. The level found before the recording comes back on release. Settings → Audio. |
 | `[behavior] keep_models_loaded` | `true` | Keep the models loaded between dictations. `false` unloads the cleanup model and stops the managed speech server after five minutes without dictation; the next dictation loads them first. External servers are not touched. Settings → General. |

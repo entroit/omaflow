@@ -435,7 +435,8 @@ impl Runtime {
 
     pub fn reload_config(&mut self, config: Config) -> Result<(), String> {
         if self.config.behavior.models_configured
-            && (self.config.cleanup.model != config.cleanup.model
+            && (self.config.cleanup.engine != config.cleanup.engine
+                || self.config.cleanup.model != config.cleanup.model
                 || self.config.cleanup.endpoint != config.cleanup.endpoint
                 || !config.behavior.models_configured)
         {
@@ -608,7 +609,8 @@ fn fake_transcript_override() -> Option<std::ffi::OsString> {
 }
 
 pub fn warm_cleanup(config: &Config) {
-    if !config.behavior.models_configured
+    if config.cleanup.engine != "ollama"
+        || !config.behavior.models_configured
         || !config.cleanup.enabled
         || !config.behavior.keep_models_loaded
     {
@@ -947,7 +949,9 @@ pub fn speech_server_ready(config: &crate::config::Backend) -> bool {
     } else {
         config.endpoint.clone()
     };
-    let auth = crate::process::CurlAuth::new(&config.api_key);
+    let Ok(auth) = crate::process::CurlAuth::new(&config.api_key) else {
+        return false;
+    };
     auth.apply(&mut Command::new("curl"))
         .args([
             "--silent",
@@ -1165,35 +1169,37 @@ fn transcribe_pcm(config: &Config, pcm: &[u8], cancel: &AtomicBool) -> Result<St
     let timeout = timeout_seconds.to_string();
     let model = format!("model={}", config.backend.model);
     let language = format!("language={}", config.backend.language);
-    let auth = crate::process::CurlAuth::new(&config.backend.api_key);
-    let mut command = Command::new("curl");
-    auth.apply(&mut command)
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--max-time",
-            &timeout,
-            "--form",
-            "file=@-;filename=dictation.wav;type=audio/wav",
-            "--form-string",
-            "response_format=json",
-            &config.backend.endpoint,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if config.backend.engine == "openai" {
-        command.args(["--form-string", &model]);
-    }
-    if config.backend.language != "auto" || config.backend.engine != "openai" {
-        command.args(["--form-string", &language]);
-    }
+    let auth = crate::process::CurlAuth::new(&config.backend.api_key)?;
     let mut wav = Vec::with_capacity(header.len() + pcm.len());
     wav.extend_from_slice(&header);
     wav.extend_from_slice(pcm);
-    let output = crate::process::run(
-        &mut command,
+    let output = crate::process::run_http(
+        || {
+            let mut command = Command::new("curl");
+            auth.apply(&mut command)
+                .args([
+                    "--silent",
+                    "--show-error",
+                    "--fail-with-body",
+                    "--max-time",
+                    &timeout,
+                    "--form",
+                    "file=@-;filename=dictation.wav;type=audio/wav",
+                    "--form-string",
+                    "response_format=json",
+                    &config.backend.endpoint,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if config.backend.engine == "openai" {
+                command.args(["--form-string", &model]);
+            }
+            if config.backend.language != "auto" || config.backend.engine != "openai" {
+                command.args(["--form-string", &language]);
+            }
+            command
+        },
         &wav,
         cancel,
         Duration::from_secs(timeout_seconds),
@@ -1583,9 +1589,14 @@ pub fn serve_speech() -> Result<(), String> {
 
 /// Asks Ollama to drop the cleanup model now. True when the server agreed.
 pub fn unload_cleanup(config: &Config) -> bool {
+    if config.cleanup.engine != "ollama" {
+        return true;
+    }
     let payload =
         serde_json::json!({"model":config.cleanup.model,"messages":[],"keep_alive":0}).to_string();
-    let auth = crate::process::CurlAuth::new(&config.cleanup.api_key);
+    let Ok(auth) = crate::process::CurlAuth::new(&config.cleanup.api_key) else {
+        return false;
+    };
     auth.apply(&mut Command::new("curl"))
         .args([
             "-fsS",
@@ -1761,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    fn speech_adapters_send_expected_multipart_fields() {
+    fn speech_adapters_retry_with_identical_wav_and_expected_multipart_fields() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::AtomicBool;
@@ -1770,39 +1781,43 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                let mut bytes = Vec::new();
-                let mut buffer = [0; 4096];
-                loop {
-                    let count = stream.read(&mut buffer).unwrap();
-                    assert!(count > 0);
-                    bytes.extend_from_slice(&buffer[..count]);
-                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
-                        let length: usize = headers
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .unwrap()
-                            .trim()
-                            .parse()
-                            .unwrap();
-                        if bytes.len() >= end + 4 + length {
-                            break;
+                let mut requests = Vec::new();
+                for status in ["503 Service Unavailable", "200 OK"] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 4096];
+                    loop {
+                        let count = stream.read(&mut buffer).unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&buffer[..count]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                            let length: usize = headers
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .unwrap()
+                                .trim()
+                                .parse()
+                                .unwrap();
+                            if bytes.len() >= end + 4 + length {
+                                break;
+                            }
                         }
                     }
+                    let body = r#"{"text":"A recorded sentence."}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                    requests.push(bytes);
                 }
-                let body = r#"{"text":"A recorded sentence."}"#;
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
-                .unwrap();
-                bytes
+                requests
             });
             let mut config = crate::config::Config::default();
             config.backend.engine = engine.into();
@@ -1811,16 +1826,48 @@ mod tests {
             let text =
                 super::transcribe_speech(&config, &[0; 3200], &AtomicBool::new(false)).unwrap();
             assert_eq!(text, "A recorded sentence.");
-            let bytes = server.join().unwrap();
-            let request = String::from_utf8_lossy(&bytes);
-            assert!(request.contains("RIFF"));
-            assert!(request.contains("name=\"response_format\"\r\n\r\njson"));
-            assert_eq!(request.contains("name=\"model\""), engine == "openai");
-            assert_eq!(request.contains("name=\"language\""), engine != "openai");
-            if engine == "openai" {
-                assert!(request.contains("@literal-model-name"));
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 2);
+            let wavs: Vec<_> = requests
+                .iter()
+                .map(|bytes| {
+                    let start = bytes.windows(4).position(|w| w == b"RIFF").unwrap();
+                    &bytes[start..start + 44 + 3200]
+                })
+                .collect();
+            assert_eq!(wavs[0], wavs[1]);
+            for bytes in requests {
+                let request = String::from_utf8_lossy(&bytes);
+                assert!(request.contains("RIFF"));
+                assert!(request.contains("name=\"response_format\"\r\n\r\njson"));
+                assert_eq!(request.contains("name=\"model\""), engine == "openai");
+                assert_eq!(request.contains("name=\"language\""), engine != "openai");
+                if engine == "openai" {
+                    assert!(request.contains("@literal-model-name"));
+                }
             }
         }
+    }
+
+    #[test]
+    fn openai_cleanup_never_receives_lifecycle_requests() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut config = crate::config::Config::default();
+        config.behavior.models_configured = true;
+        config.behavior.keep_models_loaded = true;
+        config.cleanup.enabled = true;
+        config.cleanup.engine = "openai".into();
+        config.cleanup.endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        super::warm_cleanup(&config);
+        assert!(super::unload_cleanup(&config));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

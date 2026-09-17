@@ -53,11 +53,12 @@ live_segment_seconds = 20
 live_segment_tiers = []
 
 # Natural cleanup is opt-in: with this off OmaFlow transcribes and pastes, and
-# nothing else has to be installed. Turning it on needs Ollama running and a
-# cleanup model downloaded (Settings -> Models, or `omaflow model-install`).
+# nothing else has to be installed. Turning it on needs Ollama or an
+# OpenAI-compatible chat server and a cleanup model.
 # Gemma 4 E4B scored best in OmaFlow's multilingual dictation benchmark (tools/cleanup_bench.py).
 [cleanup]
 enabled = false
+engine = "ollama"
 endpoint = "http://127.0.0.1:11434/api/chat"
 model = "gemma4:e4b"
 timeout_seconds = 30

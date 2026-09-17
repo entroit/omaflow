@@ -81,7 +81,8 @@ cleanup** and a second local model strips fillers, applies the corrections you
 speak out loud, and punctuates — keeping every language exactly as spoken. A
 Rust guard rejects any cleanup that changes a number or a name.
 
-Cleanup needs Ollama; the Cleanup tab hands you the command if it is missing.
+Cleanup uses Ollama by default and also supports OpenAI-compatible chat
+servers. The Cleanup tab hands you the Ollama command if it is missing.
 
 ## Yours to configure
 

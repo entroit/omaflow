@@ -149,32 +149,46 @@ omaflow configure models '{"speech_engine":"whisper-cpp","speech_endpoint":"http
 
 ## Your own cleanup model
 
-Cleanup speaks Ollama and nothing else. A cleanup endpoint that does not end in
-`/api/chat` is rejected outright, and the reply is read as Ollama shapes it, so
-llama.cpp's server, LM Studio and vLLM cannot drive cleanup even if you edit the
-TOML by hand. Ollama's own OpenAI-compatible `/v1/chat/completions` surface does
-not help either, because it is the path that is refused. Speech recognition is
-where the choice of server lives.
+Cleanup supports Ollama's `/api/chat` protocol and the OpenAI-compatible
+`/v1/chat/completions` protocol used by gateways, vLLM and LM Studio. Choose
+the protocol in Settings → Cleanup. The configured address must end in the
+matching path.
 
 Any Ollama tag you have pulled yourself works, whether or not it is in the
 catalog. `ollama list` shows what your server holds; `ollama pull TAG` adds
 one. A bare GGUF has to be imported into Ollama first, with Ollama's own tools.
 
-In the panel the two fields are **Ollama model tag** and **Ollama address**.
-The address must end in `/api/chat`. OmaFlow posts a system message
-holding the cleanup prompt and a user message holding your transcript, with
-`stream` off. Pointing the endpoint at another machine means the transcript,
-and the class and title of the focused window, leave this computer for that
-server, so use one you trust. Set `OLLAMA_HOST` when you manage that server
-from this shell.
+OmaFlow posts a system message holding the cleanup prompt and a user message
+holding your transcript, with streaming disabled. Pointing the endpoint at
+another machine means the transcript and focused window information leave
+this computer. Clipboard context also leaves when you enable it. Use a server
+you trust. A local gateway may forward the request according to its own
+configuration.
 
-When the model name or endpoint changes, OmaFlow asks the previous model to
-unload so it stops holding memory.
+When an Ollama model name or endpoint changes, OmaFlow asks the previous model
+to unload so it stops holding memory. OmaFlow does not manage the lifecycle of
+an OpenAI-compatible server.
 
 ```bash
 ollama pull qwen3:8b
 omaflow configure models '{"cleanup_model":"qwen3:8b","cleanup_endpoint":"http://127.0.0.1:11434/api/chat"}'
+
+omaflow configure models '{"cleanup_engine":"openai","cleanup_model":"my-model","cleanup_endpoint":"http://127.0.0.1:4000/v1/chat/completions"}'
 ```
+
+Speech and cleanup requests make up to three attempts within the configured
+overall timeout. OmaFlow retries connection failures, timeouts, rate limits
+and temporary server errors. It does not retry authentication or other client
+errors. Every attempt receives the same audio or cleanup request. A server may
+have processed a request before the connection failed, so a retry can repeat
+one inference and its provider cost.
+The first request keeps its full remaining deadline. A server's `Retry-After`
+delay is respected in seconds or HTTP-date form. If that delay uses up the
+deadline, OmaFlow stops without another request. OpenAI-compatible cleanup
+servers receive no automatic warm-up or unload requests.
+Application HTTP requests ignore personal curl configuration files so those
+files cannot add retries or redirects. Put endpoint and credential settings in
+OmaFlow's configuration rather than `.curlrc`.
 
 Cleanup quality is not something a connection check can tell you. The gates in
 [CONTRIBUTING](../CONTRIBUTING.md#model-gates) score the guarded output,
@@ -196,10 +210,10 @@ rejects a bare GET. For whisper.cpp and for the server OmaFlow runs, it derives
 `/health` instead. Reachable is not the same as loaded, and never the same as
 accurate.
 
-Cleanup has no status card. Settings → Cleanup warns only when the address is
-not answering, and it offers the install command just for the case that
-deserves it: a loopback address with no `ollama` on this machine's `PATH`. A
-remote server that answers is simply ready, with no notice at all.
+Cleanup has no status card. Settings → Cleanup warns when the configured
+server is not answering. It offers the install command only for Ollama on a
+local address when `ollama` is missing. An OpenAI-compatible server remains
+under the control of the person who configured it.
 
 Every field checks itself as you type. A bad one turns red and says why, and
 **Save** stays disabled until they are all valid, so the panel refuses what the
@@ -208,22 +222,35 @@ nothing is written unless the whole configuration passes.
 
 ### Test it from the panel
 
-**Test connection** sends one GET and tells you what came back. On the Speech
+**Test connection** on the Speech tab sends one unauthenticated GET and tells you what came back. On the Speech
 tab it appears once you answer **A server I run**, and asks the health address if
 you filled one in, otherwise the URL the daemon's own probe would use: the
-server address, or `/health` on the same origin for whisper.cpp. On the Cleanup
-tab it asks the Ollama server's root, because `/api/chat` only answers POST.
+server address, or `/health` on the same origin for whisper.cpp.
 
 | Result | Means |
 |---|---|
 | 2xx | Something is listening. Ollama's root and the NeMo server's `/health` both answer 200. |
 | 405 | A POST-only endpoint answering correctly. `/api/chat` returns this. Fine. |
+| 401 or 403 | The server is reachable but access was denied. This button does not test credentials. |
 | 404 | Fix this. A path that only takes POST often answers 404 to a GET, and OmaFlow reads 404 as offline, so fill in a health address if your server has one. Measured here: the NeMo server's `/v1/audio/transcriptions` answers 404 to a GET while its `/health` answers 200. Otherwise the path is wrong. |
 | Anything else | The server answered, but not with something that means ready. |
 | No answer | curl's own error, printed as it came. |
 
 A passing test says the address is real. It says nothing about which model is
 loaded behind it.
+
+On the Cleanup tab, **Test saved cleanup model** sends one authenticated POST
+using the saved protocol, endpoint, model and API key. Save edits before testing;
+unsaved fields are not used. It sends a short synthetic prompt, never your
+dictation, custom prompt, vocabulary, window title or clipboard. The provider
+may charge for this request. The test does not retry.
+
+The result distinguishes denied credentials, unavailable models when the server
+identifies them, endpoint/request errors, rate limits and invalid replies. A
+successful test means the saved model returned text, not that its cleanup
+quality is good. You can run the same test with `omaflow test-cleanup`.
+Credentials use a private temporary curl configuration, never process arguments;
+if private credential storage fails, the request is not sent.
 
 A failure at dictation time appears on the recording result instead: a request
 that fails, a reply that is not JSON, a reply with no `text`, or an empty
@@ -247,13 +274,15 @@ changes.
 | `speech_language` | Language |
 | `speech_device` | Device, OmaFlow-runs-it only |
 | `speech_api_key` | API key (optional), your own server only |
-| `cleanup_model` | Ollama model tag |
-| `cleanup_endpoint` | Ollama address |
+| `cleanup_engine` | `ollama` or `openai` |
+| `cleanup_model` | Cleanup model name or Ollama tag |
+| `cleanup_endpoint` | Cleanup server address |
 | `cleanup_api_key` | API key (optional) |
 
 The remaining cleanup options, and the prompt itself, are under `[cleanup]` in
 `~/.config/omaflow/config.toml`. See the
 [configuration map](configuration.md).
 
-Protocol references: [Ollama chat API](https://docs.ollama.com/api/chat) and
-[whisper.cpp server](https://github.com/ggml-org/whisper.cpp/blob/master/examples/server/README.md).
+Protocol references: [Ollama chat API](https://docs.ollama.com/api/chat),
+[OpenAI chat completions](https://platform.openai.com/docs/api-reference/chat)
+and [whisper.cpp server](https://github.com/ggml-org/whisper.cpp/blob/master/examples/server/README.md).

@@ -21,7 +21,7 @@ use std::{
 /// Shape of the JSON the daemon publishes for the panel. The panel refuses to
 /// render a version it does not know, which is the failure a partial update
 /// produces: new QML, old daemon.
-pub const STATE_VERSION: u32 = 2;
+pub const STATE_VERSION: u32 = 3;
 
 pub const RUNNING_VERSION: &str = env!("CARGO_PKG_VERSION");
 

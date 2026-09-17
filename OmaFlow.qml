@@ -92,7 +92,7 @@ Panel {
   // The panel is loaded from the checkout while the daemon is a compiled
   // binary, so a git pull without a rebuild leaves the two out of step. The
   // daemon reports both versions and the contract version of this JSON.
-  readonly property bool supportedState: root.stateVersion === 2
+  readonly property bool supportedState: root.stateVersion === 3
   readonly property bool updateAvailable: root.updateBehind > 0
   readonly property bool updateAttention: root.needsRebuild
     || root.updateAvailable || (root.connected && !root.supportedState)

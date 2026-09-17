@@ -11,11 +11,12 @@ ColumnLayout {
   id: page
 
   required property var flow
-  readonly property bool localSpeech: (page.flow.modelSettings.speech_endpoint || "").indexOf("127.0.0.1") >= 0
-    || (page.flow.modelSettings.speech_endpoint || "").indexOf("localhost") >= 0
+  function localEndpoint(value) {
+    return /^https?:\/\/(localhost|127(?:\.[0-9]{1,3}){3}|\[::1\])(?::[0-9]+)?(?:\/|$)/i.test(String(value).trim())
+  }
+  readonly property bool localSpeech: page.localEndpoint(page.flow.modelSettings.speech_endpoint || "")
   readonly property bool localCleanup: !page.flow.cleanupEnabled
-    || (page.flow.modelSettings.cleanup_endpoint || "").indexOf("127.0.0.1") >= 0
-    || (page.flow.modelSettings.cleanup_endpoint || "").indexOf("localhost") >= 0
+    || page.localEndpoint(page.flow.modelSettings.cleanup_endpoint || "")
 
   spacing: Style.space(12)
 
@@ -44,7 +45,7 @@ ColumnLayout {
         textFormat: Text.PlainText
         wrapMode: Text.Wrap
         text: page.localSpeech && page.localCleanup
-          ? "Everything runs on this computer."
+          ? "OmaFlow sends requests only to addresses on this computer."
           : "Some of your dictation leaves this computer."
         color: Color.popups.text
         font.family: Style.font.family
@@ -57,7 +58,7 @@ ColumnLayout {
         textFormat: Text.PlainText
         wrapMode: Text.Wrap
         text: page.localSpeech && page.localCleanup
-          ? "Microphone audio is held in memory, transcribed locally and discarded. It is never written to disk and never sent anywhere."
+          ? "Microphone audio is held in memory and discarded after transcription. A local gateway may still forward requests according to its own configuration."
           : "You have pointed a model at an address that is not this machine. Audio goes to the speech endpoint and your transcript, plus the focused window's title, goes to the cleanup endpoint."
         color: Util.alpha(Color.popups.text, 0.68)
         font.family: Style.font.family
