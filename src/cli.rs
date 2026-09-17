@@ -138,8 +138,30 @@ pub fn run() -> ExitCode {
         "vocabulary-add" => vocabulary_command("vocabulary-add", args.next()),
         "vocabulary-remove" => vocabulary_command("vocabulary-remove", args.next()),
         "version" => {
-            println!("{}", update::RUNNING_VERSION);
+            if args.next().as_deref() == Some("--json") {
+                println!("{}", update::version_json());
+            } else {
+                println!("{}", update::RUNNING_VERSION);
+            }
             ExitCode::SUCCESS
+        }
+        "health" => {
+            let result = match (args.next().as_deref(), args.next()) {
+                (Some("--expect-commit"), Some(commit)) => update::health(&commit),
+                _ => Err("Usage: omaflow health --expect-commit FULL_SHA".into()),
+            };
+            command_result(result)
+        }
+        "update" => {
+            let result = match args.next().as_deref() {
+                Some("check") => update::check().map(|_| ()),
+                Some("request") => update::request().map(|_| ()),
+                Some("later") => update::later(),
+                Some("run") => update::run(),
+                Some("reconcile") => update::reconcile(),
+                _ => Err("Usage: omaflow update check|request|later|run|reconcile".into()),
+            };
+            command_result(result)
         }
         "check-update" => match update::check_remote() {
             Ok(status) => {
@@ -297,8 +319,18 @@ Models: model-catalog, model-select speech|cleanup ID,
 Microphone: meter-gate DB, meter-preview-start, meter-preview-stop
 Evaluation: cleanup < text, evaluate < JSON, segment-file FILE.wav, test-cleanup
 Maintenance: daemon, launch, quit, reload-config, effective-config,
-             version, check-update"
+             version [--json], check-update, update check|request|later|run|reconcile"
     );
+}
+
+fn command_result(result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("omaflow: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn resolve_entry(

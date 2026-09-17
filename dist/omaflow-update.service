@@ -1,20 +1,19 @@
 [Unit]
-Description=OmaFlow local dictation daemon
-After=graphical-session.target
-Requires=omaflow-update-reconcile.service
-After=omaflow-update-reconcile.service
-PartOf=graphical-session.target
+Description=Install a verified OmaFlow update
+Documentation=https://github.com/entroit/omaflow
+After=network-online.target
 
 [Service]
-Type=simple
-ExecStart=%h/.local/lib/omaflow/current/omaflow daemon
+Type=oneshot
+ExecStart=%h/.local/lib/omaflow/trusted-runner update run
+TimeoutStartSec=90min
 Restart=on-failure
-RestartSec=1
+RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%t %h/.config/omaflow %h/.local/state/omaflow
+ReadWritePaths=%h/.config/omarchy/plugins/entroit.omaflow %h/.local/lib/omaflow %h/.local/state/omaflow %t
 RestrictSUIDSGID=true
 LockPersonality=true
 ProtectKernelTunables=true
@@ -27,6 +26,3 @@ RestrictNamespaces=true
 RestrictRealtime=true
 SystemCallArchitectures=native
 UMask=0077
-
-[Install]
-WantedBy=graphical-session.target

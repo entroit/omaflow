@@ -30,6 +30,9 @@ meter_gate_db = -60
 # completely. The previous volume comes back when the recording ends.
 duck_audio_percent = 70
 paste_mode = "auto"
+# Used when paste_mode is "custom". The key is an XKB key name; modifiers can
+# be ctrl, shift, alt or super. Settings -> General writes both values together.
+paste_shortcut = { modifiers = ["ctrl"], key = "V" }
 
 [backend]
 engine = "nemo"

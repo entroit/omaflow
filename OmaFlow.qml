@@ -51,6 +51,7 @@ Panel {
   property var waveHistory: []
   property int meterGateDb: -60
   property string pasteMode: "auto"
+  property var pasteShortcut: ({modifiers:["ctrl"], key:"V"})
   property int errorVisibleMs: 5000
   property int noticeVisibleMs: 5000
   property bool trainingLogEnabled: false
@@ -72,6 +73,9 @@ Panel {
   property string updateRemoteVersion: ""
   property double updateCheckedAtMs: 0
   property string updateError: ""
+  property var updateOffer: ({})
+  property var updateTransaction: ({})
+  property var updateDeferral: ({})
   property string historyQuery: ""
   property string selectedEntryId: ""
   property string feedback: ""
@@ -83,6 +87,8 @@ Panel {
   property int historyLimit: 30
   property bool eraseConfirm: false
   readonly property string configHome: Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config"
+  readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state"
+  readonly property string trustedRunner: Quickshell.env("HOME") + "/.local/lib/omaflow/trusted-runner"
   readonly property var selectedEntry: root.history.find(function(e) { return String(e.id) === root.selectedEntryId }) || null
   function preference(key, value) { Quickshell.execDetached(["omaflow", "configure", key, JSON.stringify(value)]) }
   function selectModel(kind, id) { Quickshell.execDetached(["omaflow", "model-select", kind, String(id)]) }
@@ -92,10 +98,25 @@ Panel {
   // The panel is loaded from the checkout while the daemon is a compiled
   // binary, so a git pull without a rebuild leaves the two out of step. The
   // daemon reports both versions and the contract version of this JSON.
-  readonly property bool supportedState: root.stateVersion === 3
-  readonly property bool updateAvailable: root.updateBehind > 0
-  readonly property bool updateAttention: root.needsRebuild
-    || root.updateAvailable || (root.connected && !root.supportedState)
+  readonly property bool supportedState: root.stateVersion === 5
+  readonly property bool updaterControlsEnabled: root.supportedState
+  readonly property var verifiedUpdate: root.updateOffer.target
+    && !(root.updateTransaction.state === "succeeded"
+      && root.updateTransaction.targetCommit === root.updateOffer.target.commit)
+    ? root.updateOffer.target : null
+  readonly property bool updateAvailable: root.verifiedUpdate !== null
+  readonly property string updateState: String(root.updateTransaction.state || "")
+  readonly property bool updateRunning: ["queued", "preparing", "waiting-for-idle", "activating", "verifying"].indexOf(root.updateState) >= 0
+  readonly property bool updateFailed: ["rolled-back", "needs-recovery"].indexOf(root.updateState) >= 0
+  readonly property bool updateActionsAvailable: root.updaterControlsEnabled
+    && root.updateAvailable && !root.updateRunning
+    && !root.updateOffer.externalCheckoutWarning && !root.updateOffer.error
+  readonly property bool laterActionAvailable: root.updateActionsAvailable && !root.updateFailed
+  readonly property bool updateDeferred: root.updateAvailable
+    && root.updateDeferral.commit === root.verifiedUpdate.commit
+    && Number(root.updateDeferral.untilMs || 0) > root.currentTimeMs
+  readonly property bool updateAttention: root.updateAvailable || root.updateRunning
+    || root.updateFailed || Boolean(root.updateOffer.externalCheckoutWarning)
 
   readonly property bool meterPreviewActive: phase === "idle"
     && opened && idlePage === "settings"
@@ -141,8 +162,12 @@ Panel {
       var nextGate = Number(next.meter_gate_db)
       root.meterGateDb = isFinite(nextGate)
         ? Math.max(-70, Math.min(-35, Math.round(nextGate))) : -60
-      root.pasteMode = ["auto", "ctrl-v", "shift-insert", "clipboard"].indexOf(next.paste_mode) >= 0
+      root.pasteMode = ["auto", "ctrl-v", "shift-insert", "clipboard", "custom"].indexOf(next.paste_mode) >= 0
         ? String(next.paste_mode) : "auto"
+      if (next.paste_shortcut
+          && Array.isArray(next.paste_shortcut.modifiers)
+          && typeof next.paste_shortcut.key === "string")
+        root.pasteShortcut = next.paste_shortcut
       var nextErrorTimeout = Number(next.error_visible_ms)
       root.errorVisibleMs = isFinite(nextErrorTimeout)
         ? Math.max(1000, Math.min(60000, Math.round(nextErrorTimeout))) : 5000
@@ -208,7 +233,7 @@ Panel {
   }
 
   function togglePanel() {
-    if (!root.connected) {
+    if (!root.connected && !root.updateAttention) {
       root.startOmaFlow()
       return
     }
@@ -310,6 +335,15 @@ Panel {
     root.idlePage = "settings"
     root.settingsTab = "general"
   }
+  function requestUpdate() { Quickshell.execDetached([root.trustedRunner, "update", "request"]) }
+  function deferUpdate() { Quickshell.execDetached([root.trustedRunner, "update", "later"]) }
+  function copyMigrationSteps() {
+    var sha = String(root.verifiedUpdate ? root.verifiedUpdate.commit || "" : "")
+    if (!/^[0-9a-f]{40}$/.test(sha)) return
+    Quickshell.execDetached(["wl-copy", "git -C " + root.pluginDir + " fetch --no-tags https://github.com/entroit/omaflow " + sha
+      + "\ngit -C " + root.pluginDir + " merge --ff-only " + sha
+      + "\ncd " + root.pluginDir + " && ./install --yes"])
+  }
   function editHotkey() { root.editShortcut = !root.editShortcut }
 
   // The custom-model fields are the one part of Settings that cannot explain
@@ -328,7 +362,7 @@ Panel {
   Process {
     id:checkUpdateProcess
     command:["omaflow","check-update"]
-    onExited: stateFile.reload()
+    onExited: { stateFile.reload(); updateOfferFile.reload() }
   }
 
   function quitOmaFlow() {
@@ -358,6 +392,13 @@ Panel {
     if (mode === root.pasteMode) return
     root.pasteMode = mode
     Quickshell.execDetached(["omaflow", "paste-mode", mode])
+  }
+
+  function savePasteShortcut(modifiers, key) {
+    root.preference("paste_delivery", {
+      mode: "custom",
+      shortcut: {modifiers: modifiers, key: String(key).trim()}
+    })
   }
 
   function resetMeter() {
@@ -400,6 +441,43 @@ Panel {
     printErrors: false
     onLoaded: root.applyState(text())
     onLoadFailed: root.connected = false
+    onFileChanged: reload()
+  }
+
+  FileView {
+    id: updateOfferFile
+    path: root.stateHome + "/omaflow/update/offer.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      try { root.updateOffer = JSON.parse(text() || "{}") }
+      catch (error) { root.updateOffer = ({error:"Saved update information is invalid."}) }
+    }
+    onFileChanged: reload()
+  }
+
+  FileView {
+    id: updateTransactionFile
+    path: root.stateHome + "/omaflow/update/transaction.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      try { root.updateTransaction = JSON.parse(text() || "{}") }
+      catch (error) { root.updateTransaction = ({state:"needs-recovery",message:"Saved update progress is invalid."}) }
+    }
+    onFileChanged: reload()
+  }
+
+  FileView {
+    id: updateDeferralFile
+    path: root.stateHome + "/omaflow/update/deferral.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      try { root.updateDeferral = JSON.parse(text() || "{}") }
+      catch (error) { root.updateDeferral = ({}) }
+    }
+    onLoadFailed: root.updateDeferral = ({})
     onFileChanged: reload()
   }
 
@@ -472,8 +550,8 @@ Panel {
       barColor: root.phase === "recording" || root.phase === "error"
         ? Color.urgent
         : root.phase === "processing" ? Color.accent : barButton.foreground
-      // A quiet dot is the only ambient signal that a release exists; the
-      // update check never notifies, so nothing else says so.
+      // Keep a quiet, persistent signal after the one-time desktop
+      // notification is dismissed or the home card is deferred.
       badge: root.updateAttention && root.phase === "idle"
     }
   }
@@ -1267,7 +1345,9 @@ Panel {
       // The panel opens on History, so an available update has to be visible
       // here rather than only inside Settings.
       Rectangle {
-        visible: root.updateAttention
+        visible: root.updaterControlsEnabled && root.idlePage === "history" && (root.updateRunning || root.updateFailed
+          || Boolean(root.updateOffer.externalCheckoutWarning)
+          || (root.updateAvailable && !root.updateDeferred))
         Layout.fillWidth: true
         Layout.preferredHeight: updateBanner.implicitHeight + Style.space(20)
         radius: Style.cornerRadius
@@ -1281,26 +1361,98 @@ Panel {
           anchors.margins: Style.space(10)
           spacing: Style.space(10)
 
-          Text {
+          ColumnLayout {
             Layout.fillWidth: true
-            textFormat: Text.PlainText
-            text: root.needsRebuild || !root.supportedState
-              ? "OmaFlow needs to be rebuilt after an update"
-              : root.updateRemoteVersion
-                ? "OmaFlow " + root.updateRemoteVersion + " is available"
-                : "An OmaFlow update is available"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.Wrap
+            spacing: Style.space(2)
+
+            Text {
+              Layout.fillWidth: true
+              textFormat: Text.PlainText
+              text: root.updateOffer.externalCheckoutWarning
+                ? "The plugin checkout changed outside OmaFlow"
+                : root.updateOffer.error
+                  ? "Could not confirm the OmaFlow update"
+                : root.updateRunning || root.updateFailed
+                ? String(root.updateTransaction.message || "Preparing the OmaFlow update")
+                : "OmaFlow " + String(root.verifiedUpdate ? root.verifiedUpdate.version : "") + " is available"
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              wrapMode: Text.Wrap
+            }
+
+            Text {
+              visible: Boolean(root.updateOffer.externalCheckoutWarning)
+                || (root.updateAvailable && !root.updateRunning)
+              Layout.fillWidth: true
+              textFormat: Text.PlainText
+              text: root.updateOffer.externalCheckoutWarning
+                ? String(root.updateOffer.externalCheckoutWarning)
+                : root.updateOffer.error
+                  ? String(root.updateOffer.error)
+                : root.verifiedUpdate
+                ? String(root.verifiedUpdate.summary || "")
+                  + (Array.isArray(root.verifiedUpdate.changes)
+                    ? "\n" + root.verifiedUpdate.changes.join(" · ") : "")
+                : ""
+              color: Util.alpha(Color.popups.text, 0.68)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.Wrap
+            }
           }
 
           ActionButton {
-            text: "How to update"
+            visible: root.updateActionsAvailable
+            text: root.updateFailed ? "Retry" : "Update"
             foreground: Color.popups.text
             background: Util.alpha(Color.accent, 0.28)
             bordered: true
-            onClicked: root.openUpdateHelp()
+            onClicked: root.requestUpdate()
+          }
+
+          ActionButton {
+            visible: root.laterActionAvailable
+            text: "Later"
+            foreground: Color.popups.text
+            onClicked: root.deferUpdate()
+          }
+        }
+      }
+
+      Rectangle {
+        visible: root.binaryFound && root.connected && !root.supportedState
+        Layout.fillWidth: true
+        Layout.preferredHeight: migrationBanner.implicitHeight + Style.space(20)
+        radius: Style.cornerRadius
+        color: Util.alpha(Color.urgent, 0.14)
+
+        RowLayout {
+          id: migrationBanner
+          anchors.fill: parent
+          anchors.margins: Style.space(10)
+          spacing: Style.space(10)
+
+          Text {
+            Layout.fillWidth: true
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            text: root.verifiedUpdate && /^[0-9a-f]{40}$/.test(String(root.verifiedUpdate.commit || ""))
+              ? "OmaFlow needs a one-time exact-version bridge before in-app updates can take over. Copy the reviewed commit steps and run them in a terminal. Nothing runs from this card."
+              : "This OmaFlow panel and daemon use different state formats. Open the marketplace listing, confirm its exact reviewed commit, and use the documented one-time bridge. This card will not run mutable checkout code."
+            color: Color.popups.text
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          ActionButton {
+            visible: root.verifiedUpdate && /^[0-9a-f]{40}$/.test(String(root.verifiedUpdate.commit || ""))
+            text: "Copy bridge steps"
+            foreground: Color.popups.text
+            background: Util.alpha(Color.accent, 0.22)
+            bordered: true
+            onClicked: root.copyMigrationSteps()
           }
         }
       }
@@ -1326,7 +1478,7 @@ Panel {
         id: pageLoader
         Layout.fillWidth: true
         Layout.fillHeight: true
-        active: root.supportedState && root.connected
+        active: root.connected || root.updateAttention
         sourceComponent: root.idlePage === "settings" ? settingsView : historyView
       }
     }

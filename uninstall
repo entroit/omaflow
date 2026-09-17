@@ -22,17 +22,18 @@ def main():
     home = Path.home()
     config = Path(os.environ.get('XDG_CONFIG_HOME', home / '.config'))
     state = Path(os.environ.get('XDG_STATE_HOME', home / '.local/state'))
+    install_root = home / '.local/lib/omaflow'
     links = {
         config / 'omarchy/plugins/entroit.omaflow': ROOT,
         config / 'hypr/omaflow-hotkey.lua': config / 'omaflow/shortcut.lua',
         config / 'hypr/omaflow.lua': ROOT / 'integrations/hyprland.lua',
-        home / '.local/bin/omaflow': ROOT / 'target/release/omaflow',
+        home / '.local/bin/omaflow': install_root / 'current/omaflow',
         home / '.local/share/applications/omaflow.desktop': ROOT / 'dist/omaflow.desktop',
         home / '.local/share/icons/hicolor/scalable/apps/omaflow.svg': ROOT / 'assets/icon.svg',
     }
     # omaflow-setup.service shipped briefly and pulled a model nobody chose. It
     # is gone, but an upgraded machine still has the link, so keep removing it.
-    units = ['omaflow.service', 'omaflow-asr.service', 'omaflow-update-check.service', 'omaflow-update-check.timer']
+    units = ['omaflow.service', 'omaflow-asr.service', 'omaflow-update-check.service', 'omaflow-update-check.timer', 'omaflow-update.service', 'omaflow-update-reconcile.service']
     stale_units = ['omaflow-setup.service']
     for unit in units + stale_units:
         links[config / 'systemd/user' / unit] = ROOT / 'dist' / unit
@@ -49,7 +50,7 @@ def main():
     if re.search(r'require\s*\(?\s*[\'\"]omaflow[\'\"]', after):
         parser.error('Remove the custom OmaFlow require expression in bindings.lua first; it cannot be safely removed automatically.')
     personal = Path(os.environ.get('OMAFLOW_CONFIG', config / 'omaflow/config.toml'))
-    purge_paths = [personal, state / 'omaflow', config / 'omaflow']
+    purge_paths = [personal, state / 'omaflow', config / 'omaflow', install_root]
     resources = read_receipt()
     resource_paths = []
     model_commands = []

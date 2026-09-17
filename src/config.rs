@@ -44,6 +44,7 @@ pub struct Behavior {
     pub meter_gate_db: i32,
     pub duck_audio_percent: u8,
     pub paste_mode: PasteMode,
+    pub paste_shortcut: PasteShortcut,
     pub keep_models_loaded: bool,
 }
 
@@ -55,6 +56,7 @@ pub enum PasteMode {
     CtrlV,
     ShiftInsert,
     Clipboard,
+    Custom,
 }
 
 impl PasteMode {
@@ -64,6 +66,7 @@ impl PasteMode {
             Self::CtrlV => "ctrl-v",
             Self::ShiftInsert => "shift-insert",
             Self::Clipboard => "clipboard",
+            Self::Custom => "custom",
         }
     }
 }
@@ -77,7 +80,100 @@ impl FromStr for PasteMode {
             "ctrl-v" => Ok(Self::CtrlV),
             "shift-insert" => Ok(Self::ShiftInsert),
             "clipboard" => Ok(Self::Clipboard),
+            "custom" => Ok(Self::Custom),
             _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PasteModifier {
+    Ctrl,
+    Shift,
+    Alt,
+    Super,
+}
+
+impl PasteModifier {
+    pub fn as_hyprland(self) -> &'static str {
+        match self {
+            Self::Ctrl => "CTRL",
+            Self::Shift => "SHIFT",
+            Self::Alt => "ALT",
+            Self::Super => "SUPER",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PasteShortcut {
+    pub modifiers: Vec<PasteModifier>,
+    pub key: String,
+}
+
+impl Default for PasteShortcut {
+    fn default() -> Self {
+        Self {
+            modifiers: vec![PasteModifier::Ctrl],
+            key: "V".into(),
+        }
+    }
+}
+
+impl PasteShortcut {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.modifiers.is_empty()
+            || self.modifiers.len() > 4
+            || self
+                .modifiers
+                .iter()
+                .enumerate()
+                .any(|(index, modifier)| self.modifiers[..index].contains(modifier))
+        {
+            return Err("A custom paste shortcut needs one to four distinct modifiers".into());
+        }
+        if self.key.is_empty()
+            || self.key.len() > 80
+            || !self
+                .key
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(
+                "The custom paste key must be an XKB key name using letters, numbers or underscore"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn hyprland_modifiers(&self) -> String {
+        [
+            PasteModifier::Ctrl,
+            PasteModifier::Shift,
+            PasteModifier::Alt,
+            PasteModifier::Super,
+        ]
+        .into_iter()
+        .filter(|modifier| self.modifiers.contains(modifier))
+        .map(PasteModifier::as_hyprland)
+        .collect::<Vec<_>>()
+        .join(" ")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PasteDelivery {
+    pub mode: PasteMode,
+    pub shortcut: PasteShortcut,
+}
+
+impl Behavior {
+    pub fn paste_delivery(&self) -> PasteDelivery {
+        PasteDelivery {
+            mode: self.paste_mode,
+            shortcut: self.paste_shortcut.clone(),
         }
     }
 }
@@ -151,6 +247,7 @@ impl Default for Behavior {
             meter_gate_db: -60,
             duck_audio_percent: 70,
             paste_mode: PasteMode::Auto,
+            paste_shortcut: PasteShortcut::default(),
         }
     }
 }
@@ -289,6 +386,24 @@ impl Config {
     }
 
     pub fn save_setting(key: &str, value: serde_json::Value) -> Result<Self, String> {
+        if key == "paste_delivery" {
+            let delivery: PasteDelivery =
+                serde_json::from_value(value).map_err(|e| e.to_string())?;
+            delivery.shortcut.validate()?;
+            return Self::write_values(&[
+                (
+                    "behavior",
+                    "paste_mode",
+                    toml::Value::String(delivery.mode.as_str().into()),
+                ),
+                (
+                    "behavior",
+                    "paste_shortcut",
+                    toml::Value::try_from(delivery.shortcut).map_err(|e| e.to_string())?,
+                ),
+            ])
+            .and_then(|_| Self::load());
+        }
         if key == "shortcut" {
             let shortcut: Shortcut = serde_json::from_value(value).map_err(|e| e.to_string())?;
             Self::write_values(&[
@@ -413,6 +528,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        self.behavior.paste_shortcut.validate()?;
         let keys = &self.shortcut.keys;
         if keys.is_empty()
             || keys.len() > 4
@@ -654,7 +770,42 @@ fn replace_toml_key(text: &str, section: &str, key: &str, value: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, replace_toml_key};
+    use super::{Config, PasteModifier, PasteShortcut, replace_toml_key};
+
+    #[test]
+    fn custom_paste_shortcut_rejects_unsafe_or_ambiguous_values() {
+        let valid = PasteShortcut {
+            modifiers: vec![PasteModifier::Shift, PasteModifier::Ctrl],
+            key: "F8".into(),
+        };
+        assert!(valid.validate().is_ok());
+        assert_eq!(valid.hyprland_modifiers(), "CTRL SHIFT");
+
+        for key in [
+            "",
+            "V\" }); os.execute('touch /tmp/pwned') --",
+            "V\nX",
+            "V X",
+        ] {
+            let shortcut = PasteShortcut {
+                modifiers: vec![PasteModifier::Ctrl],
+                key: key.into(),
+            };
+            assert!(shortcut.validate().is_err());
+        }
+
+        let duplicate = PasteShortcut {
+            modifiers: vec![PasteModifier::Ctrl, PasteModifier::Ctrl],
+            key: "V".into(),
+        };
+        assert!(duplicate.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_behavior_gets_a_safe_custom_paste_default() {
+        let behavior: super::Behavior = toml::from_str("paste_mode = 'auto'").unwrap();
+        assert_eq!(behavior.paste_shortcut, PasteShortcut::default());
+    }
 
     #[test]
     fn unknown_cleanup_keys_are_ignored() {

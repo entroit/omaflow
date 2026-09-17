@@ -32,7 +32,12 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
     for name, source in {
         "wl-paste": "import sys; sys.exit(1)",
         "wl-copy": "import sys, os; from pathlib import Path; runtime=Path(os.environ[\"XDG_RUNTIME_DIR\"]); (runtime/\"copy-attempt\").write_bytes(sys.stdin.buffer.read()); sys.exit(0 if (runtime/\"clipboard-ok\").exists() else 1)",
-        "hyprctl": "print('{\"address\":\"0xtest\",\"class\":\"test\"}')",
+        "hyprctl": (
+            "import json, os, sys; from pathlib import Path\n"
+            "runtime = Path(os.environ['XDG_RUNTIME_DIR'])\n"
+            "with (runtime / 'hyprctl-log').open('a') as log: log.write(json.dumps(sys.argv[1:]) + chr(10))\n"
+            "print('{\"address\":\"0xtest\",\"class\":\"test\"}')\n"
+        ),
         "systemctl": "import os; from pathlib import Path; (Path(os.environ[\"XDG_RUNTIME_DIR\"])/\"model-command\").touch()",
         "ollama": "print('NAME ID SIZE')",
         "nvidia-smi": "pass",
@@ -214,6 +219,48 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         wait_until(lambda: state()["feedback"] == "Copied to clipboard")
         assert not state()["feedback_error"]
 
+    def custom_paste(case, runtime, state, send):
+        (runtime / "clipboard-ok").touch()
+        update = {
+            "key": "paste_delivery",
+            "value": {
+                "mode": "custom",
+                "shortcut": {"modifiers": ["shift", "ctrl"], "key": "F8"},
+            },
+        }
+        send("configure:" + json.dumps(update))
+        wait_until(lambda: state()["paste_mode"] == "custom")
+        assert state()["paste_shortcut"] == {"modifiers": ["shift", "ctrl"], "key": "F8"}
+        stored = __import__("tomllib").loads((case / "config.toml").read_text())
+        assert stored["behavior"]["paste_mode"] == "custom"
+        assert stored["behavior"]["paste_shortcut"] == {
+            "modifiers": ["shift", "ctrl"], "key": "F8"
+        }
+
+        before = (case / "config.toml").read_bytes()
+        malicious = {
+            "key": "paste_delivery",
+            "value": {
+                "mode": "custom",
+                "shortcut": {"modifiers": ["ctrl"], "key": 'V\"}); os.execute("bad")--'},
+            },
+        }
+        send("configure:" + json.dumps(malicious))
+        wait_until(lambda: state()["feedback_error"])
+        assert (case / "config.toml").read_bytes() == before
+
+        send("press"); time.sleep(.06); send("release")
+        wait_until(lambda: state()["phase"] == "success")
+        dispatches = [
+            json.loads(line) for line in (runtime / "hyprctl-log").read_text().splitlines()
+            if "send_key_state" in line
+        ]
+        assert dispatches
+        script = dispatches[-1][1]
+        assert 'mods = "CTRL SHIFT"' in script
+        assert 'key = "F8"' in script
+        assert "os.execute" not in script
+
     def audio_ducking(case, runtime, state, send):
         log = runtime / "volume-log"
         assert state()["duck_audio_percent"] == 70
@@ -233,6 +280,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
     run_case("history changes survive failed storage without false success", True, failed_history_write)
     run_case("dictation ducks the sink and always restores it", False, audio_ducking)
     run_case("clipboard-only delivery never reports a paste", True, clipboard_only)
+    run_case("custom paste saves atomically and injects only a validated chord", True, custom_paste)
     run_case("clipboard failure retains text; clear undo; copy errors", True, delivery)
     run_case("incomplete IPC client cannot block controls", True, ipc)
     run_case("cancel stalled capture then record again", False, stalled_capture)

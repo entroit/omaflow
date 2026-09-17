@@ -1,0 +1,21 @@
+name: Release binary
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify-release-binary:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux@sha256:307b7161a9ad33b180f6a24532c9c05841012d129acc0ceafa8b9c7234b62148
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Pin the Arch package repository snapshot
+        run: printf 'Server = https://archive.archlinux.org/repos/2026/09/17/$repo/os/$arch\n' >/etc/pacman.d/mirrorlist
+      - name: Install the recorded build tools
+        run: pacman -Syy --noconfirm base-devel rust jq
+      - name: Verify the bundled binary
+        run: scripts/package-release --verify
+      - name: Test the updater and daemon
+        run: cargo test --locked

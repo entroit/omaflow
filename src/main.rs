@@ -10,7 +10,7 @@ mod state;
 mod update;
 mod vocabulary;
 
-use config::{Config, PasteMode};
+use config::{Config, PasteDelivery, PasteMode};
 use serde::{Deserialize, Serialize};
 use state::{Action, Phase, StateMachine};
 use std::{
@@ -73,6 +73,8 @@ enum PanelCommand {
 enum Message {
     Session(SessionCommand),
     Panel(PanelCommand),
+    PrepareUpdate(String),
+    CancelUpdate(String, mpsc::Sender<bool>),
     Completed(u64, backend::StopOutcome),
     Failed(u64, String),
     RuntimeStatus(RuntimeStatus),
@@ -89,7 +91,7 @@ enum BackendJob {
     MeterPreviewStart,
     MeterPreviewStop,
     SetMeterGate(i32),
-    SetPasteMode(PasteMode),
+    SetPasteDelivery(PasteDelivery),
     SetCustomVocabulary(Vec<String>),
     ReloadConfig(Box<Config>),
 }
@@ -185,6 +187,7 @@ struct SurfaceState<'a> {
     meter_gate_db: i32,
     duck_audio_percent: u8,
     paste_mode: &'a str,
+    paste_shortcut: serde_json::Value,
     clipboard_result_visible_ms: u64,
     error_visible_ms: u64,
     notice_visible_ms: u64,
@@ -248,7 +251,7 @@ struct Daemon {
     custom_vocabulary: Vec<String>,
     runtime_status: RuntimeStatus,
     meter_gate_db: i32,
-    paste_mode: PasteMode,
+    paste_delivery: PasteDelivery,
     generation: u64,
     update: update::UpdateStatus,
     effective_config: Config,
@@ -259,6 +262,7 @@ struct Daemon {
     paste_sent: bool,
     audio_ducked: bool,
     model_downloads: HashMap<String, DownloadProgress>,
+    pending_update: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -291,7 +295,7 @@ fn run_daemon() -> ExitCode {
     }
 
     let meter_gate_db = clamp_meter_gate(config.behavior.meter_gate_db);
-    let paste_mode = config.behavior.paste_mode;
+    let paste_delivery = config.behavior.paste_delivery();
     let listener = match UnixListener::bind(&socket) {
         Ok(listener) => listener,
         Err(error) => {
@@ -339,7 +343,7 @@ fn run_daemon() -> ExitCode {
         custom_vocabulary: config.cleanup.custom_vocabulary.clone(),
         runtime_status: RuntimeStatus::default(),
         meter_gate_db,
-        paste_mode,
+        paste_delivery,
         generation: 0,
         update: update::status(),
         effective_config: config.clone(),
@@ -350,8 +354,12 @@ fn run_daemon() -> ExitCode {
         paste_sent: false,
         audio_ducked: false,
         model_downloads: HashMap::new(),
+        pending_update: None,
     };
     daemon.publish();
+    if let Err(error) = update::finalize_recovery_for_running_daemon() {
+        eprintln!("omaflow: could not finalize update recovery: {error}");
+    }
 
     loop {
         let now = epoch.elapsed();
@@ -378,6 +386,9 @@ fn run_daemon() -> ExitCode {
         let now = epoch.elapsed();
         let action = daemon.state.tick(now);
         run_action(action, &job_tx, &mut daemon);
+        if finish_update_handoff(&mut daemon) {
+            break;
+        }
         if daemon.close_at.is_some_and(|deadline| now >= deadline)
             && matches!(daemon.state.phase(), Phase::Result | Phase::Error)
         {
@@ -409,6 +420,21 @@ fn handle_message(
     jobs: &mpsc::Sender<BackendJob>,
 ) {
     match message {
+        Message::PrepareUpdate(transaction_id) => {
+            daemon.pending_update = Some(transaction_id);
+            daemon.feedback = "Finishing your dictation before the update.".into();
+            daemon.feedback_error = false;
+            daemon.publish();
+        }
+        Message::CancelUpdate(transaction_id, acknowledgement) => {
+            let cancelled = cancel_pending_update(&mut daemon.pending_update, &transaction_id);
+            let _ = acknowledgement.send(cancelled);
+            if cancelled {
+                daemon.feedback = "The update wait was cancelled. You can retry it.".into();
+                daemon.feedback_error = true;
+                daemon.publish();
+            }
+        }
         Message::Feedback(result, label) => daemon.operation_feedback(result, &label),
         Message::ResultCopied(generation, result) => {
             if generation == daemon.generation {
@@ -488,7 +514,8 @@ fn handle_message(
         }
         Message::Panel(PanelCommand::SetMeterGate(gate_db)) => {
             let next = clamp_meter_gate(gate_db);
-            if let Err(error) = Config::write_behavior_preferences(next, daemon.paste_mode) {
+            if let Err(error) = Config::write_behavior_preferences(next, daemon.paste_delivery.mode)
+            {
                 daemon.meter_gate_db =
                     clamp_meter_gate(daemon.effective_config.behavior.meter_gate_db);
                 let _ = jobs.send(BackendJob::SetMeterGate(daemon.meter_gate_db));
@@ -507,8 +534,8 @@ fn handle_message(
                 return;
             }
             daemon.effective_config.behavior.paste_mode = paste_mode;
-            daemon.paste_mode = paste_mode;
-            let _ = jobs.send(BackendJob::SetPasteMode(paste_mode));
+            daemon.paste_delivery = daemon.effective_config.behavior.paste_delivery();
+            let _ = jobs.send(BackendJob::SetPasteDelivery(daemon.paste_delivery.clone()));
             daemon.publish();
         }
         Message::Panel(PanelCommand::AddVocabulary(value)) => {
@@ -646,6 +673,13 @@ fn handle_message(
             let phase_before = daemon.state.phase().clone();
             let action = match command {
                 SessionCommand::Press => {
+                    if daemon.pending_update.is_some() || update::blocks_new_dictation() {
+                        daemon.feedback =
+                            "OmaFlow is finishing an update. New dictation is paused.".into();
+                        daemon.feedback_error = false;
+                        daemon.publish();
+                        return;
+                    }
                     daemon.view = ResultView::None;
                     daemon.error.clear();
                     let action = daemon.state.press(now);
@@ -824,10 +858,10 @@ impl Daemon {
 
     fn paste_async(&self, text: String) {
         let messages = self.message_tx.clone();
-        let mode = self.paste_mode;
+        let delivery = self.paste_delivery.clone();
         thread::spawn(move || {
-            let result = backend::paste_text_now(&text, mode);
-            let label = if mode == PasteMode::Clipboard {
+            let result = backend::paste_text_now(&text, &delivery);
+            let label = if delivery.mode == PasteMode::Clipboard {
                 "Copied to clipboard"
             } else {
                 "Paste shortcut sent; text also on clipboard"
@@ -853,7 +887,7 @@ impl Daemon {
         self.error_visible_ms = config.behavior.error_visible_ms;
         self.notice_visible_ms = config.behavior.notice_visible_ms;
         self.meter_gate_db = clamp_meter_gate(config.behavior.meter_gate_db);
-        self.paste_mode = config.behavior.paste_mode;
+        self.paste_delivery = config.behavior.paste_delivery();
         self.custom_vocabulary = config.cleanup.custom_vocabulary.clone();
         self.cleanup_model = config.cleanup.model.clone();
         self.state.configure(
@@ -919,7 +953,8 @@ impl Daemon {
             history: &self.history,
             meter_gate_db: self.meter_gate_db,
             duck_audio_percent: self.effective_config.behavior.duck_audio_percent,
-            paste_mode: self.paste_mode.as_str(),
+            paste_mode: self.paste_delivery.mode.as_str(),
+            paste_shortcut: serde_json::to_value(&self.paste_delivery.shortcut).unwrap_or_default(),
             clipboard_result_visible_ms: self.clipboard_result_visible_ms,
             error_visible_ms: self.error_visible_ms,
             notice_visible_ms: self.notice_visible_ms,
@@ -1235,8 +1270,8 @@ fn start_backend_worker(
                 BackendJob::SetMeterGate(gate_db) => {
                     runtime.set_meter_gate(gate_db);
                 }
-                BackendJob::SetPasteMode(paste_mode) => {
-                    runtime.set_paste_mode(paste_mode);
+                BackendJob::SetPasteDelivery(delivery) => {
+                    runtime.set_paste_delivery(delivery);
                 }
                 BackendJob::SetCustomVocabulary(vocabulary) => {
                     runtime.set_custom_vocabulary(vocabulary);
@@ -1465,6 +1500,25 @@ fn start_ipc(listener: UnixListener, messages: mpsc::Sender<Message>) {
                 continue;
             }
             let value = value.trim();
+            if let Some(expected) = value.strip_prefix("health:") {
+                if update::running_release_commit().as_deref() == Some(expected) {
+                    let _ = stream.write_all(format!("ready:{expected}\n").as_bytes());
+                }
+                continue;
+            }
+            if let Some(id) = value.strip_prefix("cancel-update:") {
+                if valid_transaction_id(id) {
+                    let (acknowledgement, received) = mpsc::channel();
+                    if messages
+                        .send(Message::CancelUpdate(id.into(), acknowledgement))
+                        .is_ok()
+                        && received.recv_timeout(Duration::from_secs(2)) == Ok(true)
+                    {
+                        let _ = stream.write_all(format!("cancelled:{id}\n").as_bytes());
+                    }
+                }
+                continue;
+            }
             let command = match value {
                 "press" => Some(Message::Session(SessionCommand::Press)),
                 "release" => Some(Message::Session(SessionCommand::Release)),
@@ -1487,6 +1541,14 @@ fn start_ipc(listener: UnixListener, messages: mpsc::Sender<Message>) {
                                 v.get("value")?.clone(),
                             )))
                         })
+                }
+                value if value.starts_with("prepare-update:") => {
+                    let id = &value["prepare-update:".len()..];
+                    if valid_transaction_id(id) {
+                        Some(Message::PrepareUpdate(id.into()))
+                    } else {
+                        None
+                    }
                 }
                 value if value.starts_with("history-edit:") => {
                     serde_json::from_str::<serde_json::Value>(&value[13..])
@@ -1548,6 +1610,47 @@ fn start_ipc(listener: UnixListener, messages: mpsc::Sender<Message>) {
     });
 }
 
+fn valid_transaction_id(id: &str) -> bool {
+    id.len() <= 96
+        && !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn cancel_pending_update(pending: &mut Option<String>, id: &str) -> bool {
+    if pending.as_deref() != Some(id) {
+        return false;
+    }
+    *pending = None;
+    true
+}
+
+fn finish_update_handoff(daemon: &mut Daemon) -> bool {
+    if !matches!(
+        daemon.state.phase(),
+        Phase::Idle | Phase::Result | Phase::Error
+    ) {
+        return false;
+    }
+    let Some(transaction_id) = daemon.pending_update.take() else {
+        return false;
+    };
+    let marker = runtime_dir().join(format!("omaflow-update-ready-{transaction_id}"));
+    let result = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&marker)
+        .and_then(|mut file| file.write_all(b"ready\n"))
+        .and_then(|_| fs::File::open(runtime_dir())?.sync_all());
+    if let Err(error) = result {
+        eprintln!("omaflow: could not prepare update handoff: {error}");
+        return false;
+    }
+    true
+}
+
 fn history_command(command: &str, id: Option<String>) -> ExitCode {
     let Some(id) = id.and_then(|value| value.parse::<u64>().ok()) else {
         eprintln!("omaflow: {command} requires a numeric history ID");
@@ -1570,7 +1673,7 @@ fn meter_gate_command(command: &str, gate_db: Option<String>) -> ExitCode {
 
 fn paste_mode_command(paste_mode: Option<String>) -> ExitCode {
     let Some(paste_mode) = paste_mode.and_then(|value| value.parse::<PasteMode>().ok()) else {
-        eprintln!("omaflow: paste-mode must be auto, ctrl-v, shift-insert, or clipboard");
+        eprintln!("omaflow: paste-mode must be auto, ctrl-v, shift-insert, clipboard, or custom");
         return ExitCode::FAILURE;
     };
     send_command(&format!("paste-mode:{}", paste_mode.as_str()))
@@ -1728,6 +1831,15 @@ fn training_log_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn update_cancel_only_clears_the_matching_handoff() {
+        let mut pending = Some("tx-one".to_string());
+        assert!(!super::cancel_pending_update(&mut pending, "tx-two"));
+        assert_eq!(pending.as_deref(), Some("tx-one"));
+        assert!(super::cancel_pending_update(&mut pending, "tx-one"));
+        assert!(pending.is_none());
+    }
 
     #[test]
     fn every_backend_failure_becomes_one_actionable_sentence() {

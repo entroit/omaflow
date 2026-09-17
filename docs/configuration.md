@@ -12,8 +12,10 @@ edit by hand.
 | `~/.config/hypr/omaflow-hotkey.lua` | Compatibility symlink to the generated shortcut |
 | `~/.config/hypr/omaflow.lua` | Symlink to the Hyprland adapter `integrations/hyprland.lua` |
 | `~/.config/systemd/user/omaflow*.service`, `omaflow-update-check.timer` | Symlinks to the units in `dist/` |
-| `~/.local/bin/omaflow` | Symlink to the built binary |
+| `~/.local/bin/omaflow` | Symlink to the active versioned binary under `~/.local/lib/omaflow/current/` |
 | `~/.local/state/omaflow/` | Private history and optional training examples |
+| `~/.local/state/omaflow/update/` | Owner-only update offers, deferrals, receipts and recovery journal |
+| `~/.local/lib/omaflow/` | Versioned bundled binaries, the atomic `current` link and trusted update runner |
 | `~/.local/state/omaflow-install/receipt.json` | Records the speech runtime when OmaFlow installed it, so `./uninstall` knows it may delete it |
 | `$XDG_RUNTIME_DIR/omaflow.sock` and `omaflow-state.json` | Daemon communication and UI state |
 | `$XDG_RUNTIME_DIR/duck-restore` | The output volume replaced by a duck, so a crash cannot leave your speakers turned down |
@@ -42,6 +44,8 @@ settable in the TOML.
 | `[behavior] history_limit` | `30` | Entries kept, up to 1000; `0` saves nothing. Settings → Privacy. |
 | `[behavior] training_log_enabled` | `false` | Append raw ASR and cleaned output to an owner-only JSONL file under `~/.local/state/omaflow/`. Settings → Privacy. |
 | `[behavior] meter_gate_db` | `-60` | Voice threshold in dBFS. Below it the room counts as silence. Settings → Audio. |
+| `[behavior] paste_mode` | `"auto"` | `auto`, `ctrl-v`, `shift-insert`, `clipboard` or `custom`. Auto uses Shift+Insert in terminal-tagged windows and Ctrl+V elsewhere. Settings → General. |
+| `[behavior] paste_shortcut` | `{ modifiers = ["ctrl"], key = "V" }` | Chord used by `custom`. Choose one to four distinct `ctrl`, `shift`, `alt` or `super` modifiers and one XKB key name. Settings → General validates and saves the mode and chord together. |
 | `[behavior] max_recording_seconds` | `1200` | A recording stops itself here. |
 | `[behavior] reduced_motion` | `false` | Disable panel animation. |
 | `[backend] api_key`, `[cleanup] api_key` | empty | Sent as an `Authorization: Bearer` header to a speech or cleanup server that wants one, and only when set. Never published to the panel or `effective-config`. Settings → Speech and Settings → Cleanup, as **API key (optional)**. See [running your own model](custom-models.md#if-your-server-needs-a-key). |

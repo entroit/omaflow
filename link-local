@@ -4,16 +4,16 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 setup_state=""
-if (($# > 1)); then
-  printf 'Usage: ./link-local [--no-models|--with-models]\n' >&2
-  exit 1
-fi
-case "${1:-}" in
-  --no-models) setup_state=pending ;;
-  --with-models) setup_state=ready ;;
-  '') ;;
-  *) printf 'Usage: ./link-local [--no-models|--with-models]\n' >&2; exit 1 ;;
-esac
+bundled=0
+while (($#)); do
+  case "$1" in
+    --no-models) setup_state=pending ;;
+    --with-models) setup_state=ready ;;
+    --bundled) bundled=1 ;;
+    *) printf 'Usage: ./link-local [--no-models|--with-models] [--bundled]\n' >&2; exit 1 ;;
+  esac
+  shift
+done
 backup_dir="$config_home/omarchy/backups/omaflow-$(date +%Y%m%d-%H%M%S)"
 
 backup_and_link() {
@@ -42,7 +42,7 @@ require() {
   missing=1
 }
 
-require cargo 'sudo pacman -S rust'
+if ((bundled == 0)); then require cargo 'sudo pacman -S rust'; fi
 require python3 'sudo pacman -S python'
 require jq 'sudo pacman -S jq'
 require pw-cat 'sudo pacman -S pipewire-audio'
@@ -53,19 +53,32 @@ require hyprctl 'already part of Omarchy; run this inside a Hyprland session'
 require git 'sudo pacman -S git'
 (( missing == 0 )) || exit 1
 
-cargo build --locked --release --manifest-path "$repo_dir/Cargo.toml"
+if ((bundled)); then
+  "$repo_dir/scripts/install-release"
+  binary="$HOME/.local/lib/omaflow/current/omaflow"
+else
+  cargo build --locked --release --manifest-path "$repo_dir/Cargo.toml"
+  binary="$repo_dir/target/release/omaflow"
+  dev_release="$HOME/.local/lib/omaflow/releases/dev-$(git -C "$repo_dir" rev-parse --short=12 HEAD)"
+  mkdir -p "$dev_release" "$HOME/.local/lib/omaflow" "$HOME/.local/bin"
+  install -m 700 "$binary" "$dev_release/omaflow"
+  ln -sfn "$dev_release" "$HOME/.local/lib/omaflow/current"
+  install -m 700 "$binary" "$HOME/.local/lib/omaflow/trusted-runner"
+  ln -sfn "$HOME/.local/lib/omaflow/current/omaflow" "$HOME/.local/bin/omaflow"
+  rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/omaflow/update/installed.json"
+fi
 
 # Without a flag the model state is left alone: a relink is not a statement
 # about which models exist, and models now arrive after the install.
 if [[ -n $setup_state ]]; then
-  "$repo_dir/target/release/omaflow" model-setup "$setup_state"
+  "$binary" model-setup "$setup_state"
 fi
 if [[ $setup_state == pending ]]; then
   systemctl --user stop omaflow-asr.service >/dev/null 2>&1 || true
 fi
 
 backup_and_link "$repo_dir" "$config_home/omarchy/plugins/entroit.omaflow" "entroit.omaflow"
-"$repo_dir/target/release/omaflow" config-init
+"$binary" config-init
 python3 "$repo_dir/tools/set_hotkey.py" --sync --write-only
 backup_and_link "$config_home/omaflow/shortcut.lua" "$config_home/hypr/omaflow-hotkey.lua" "omaflow-hotkey.lua"
 mkdir -p "$HOME/.local/state/omaflow"
@@ -75,7 +88,8 @@ backup_and_link "$repo_dir/dist/omaflow.service" "$config_home/systemd/user/omaf
 backup_and_link "$repo_dir/dist/omaflow-asr.service" "$config_home/systemd/user/omaflow-asr.service" "omaflow-asr.service"
 backup_and_link "$repo_dir/dist/omaflow-update-check.service" "$config_home/systemd/user/omaflow-update-check.service" "omaflow-update-check.service"
 backup_and_link "$repo_dir/dist/omaflow-update-check.timer" "$config_home/systemd/user/omaflow-update-check.timer" "omaflow-update-check.timer"
-backup_and_link "$repo_dir/target/release/omaflow" "$HOME/.local/bin/omaflow" "omaflow"
+backup_and_link "$repo_dir/dist/omaflow-update.service" "$config_home/systemd/user/omaflow-update.service" "omaflow-update.service"
+backup_and_link "$repo_dir/dist/omaflow-update-reconcile.service" "$config_home/systemd/user/omaflow-update-reconcile.service" "omaflow-update-reconcile.service"
 backup_and_link "$repo_dir/dist/omaflow.desktop" "$HOME/.local/share/applications/omaflow.desktop" "omaflow.desktop"
 backup_and_link "$repo_dir/assets/icon.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/omaflow.svg" "omaflow.svg"
 

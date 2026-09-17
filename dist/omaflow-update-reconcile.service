@@ -1,17 +1,17 @@
 [Unit]
-Description=OmaFlow update check
+Description=Recover an interrupted OmaFlow update
 Documentation=https://github.com/entroit/omaflow
-After=network-online.target
+Before=omaflow.service
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/lib/omaflow/trusted-runner update check
+ExecStart=%h/.local/lib/omaflow/trusted-runner update reconcile
 TimeoutStartSec=3min
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.config/omarchy/plugins/entroit.omaflow/.git %h/.local/state/omaflow %t
+ReadWritePaths=%h/.config/omarchy/plugins/entroit.omaflow %h/.local/lib/omaflow %h/.local/state/omaflow %t
 RestrictSUIDSGID=true
 LockPersonality=true
 ProtectKernelTunables=true

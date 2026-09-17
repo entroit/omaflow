@@ -21,7 +21,7 @@ the same commands, so anything the panel does can be scripted.
 |---|---|
 | `copy` | Copy the last result to the clipboard without pasting. |
 | `paste-last` | Paste the most recent dictation into the focused window again. |
-| `paste-mode auto\|ctrl-v\|shift-insert\|clipboard` | Choose how text reaches the focused window. `clipboard` copies only. |
+| `paste-mode auto\|ctrl-v\|shift-insert\|clipboard\|custom` | Choose how text reaches the focused window. `clipboard` copies only; `custom` uses the chord saved in Settings → General. |
 
 ## History
 
@@ -83,12 +83,11 @@ goes in through `configure models` instead. See
 |---|---|
 | `launch` | Open the panel. |
 | `quit` | Unload the cleanup model and stop the daemon and speech server. |
-| `version` | Print the version compiled into the binary. |
-| `check-update` | Fetch the remote, record how far the checkout is behind, and tell the daemon to republish. A daily timer runs this. |
+| `version` | Print the version compiled into the binary. `--json` also prints the plugin and target identities. |
+| `check-update` | Check the official marketplace for an exact reviewed snapshot. A daily timer runs this. |
 
-Update OmaFlow with `omarchy plugin update entroit.omaflow`. Omarchy shows the
-diff and asks before changing the checkout. Review it, then run `./link-local`
-from the checkout to rebuild the daemon and refresh its integration.
+Normal updates use **Update** in the OmaFlow panel. The panel shows the summary
+and changes bundled with the reviewed release.
 
 ## Internal
 
@@ -101,3 +100,7 @@ Used by the services, the installer and the panel; not needed from a shell.
 | `model-setup pending\|ready` | `link-local --no-models` / `--with-models`, to record whether a speech model is ready to use. |
 | `config-shortcut JSON` | `tools/set_hotkey.py`, to write `[shortcut]` keys and consumed keys. |
 | `meter-preview-start` / `meter-preview-stop` | The panel, to stream the input level while it is open. |
+| `update check` | Fetch the official marketplace catalog and save a verified offer. |
+| `update request` / `update later` | Queue the displayed offer or defer its home card for one day. |
+| `update run` / `update reconcile` | Install a queued release or recover an interrupted update. |
+| `health --expect-commit SHA` | Confirm that a versioned release binary matches the activated commit. |

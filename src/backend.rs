@@ -2,7 +2,7 @@ use crate::cleanup::cleanup;
 pub use crate::cleanup::{cleanup_text, evaluate_text};
 use crate::process::CommandExt;
 use crate::{
-    config::{Config, PasteMode, SegmentTier},
+    config::{Config, PasteDelivery, PasteMode, PasteModifier, PasteShortcut, SegmentTier},
     vocabulary,
 };
 use serde_json::Value;
@@ -429,8 +429,9 @@ impl Runtime {
             .store(gate_db.clamp(-70, -35), Ordering::Relaxed);
     }
 
-    pub fn set_paste_mode(&mut self, paste_mode: PasteMode) {
-        self.config.behavior.paste_mode = paste_mode;
+    pub fn set_paste_delivery(&mut self, delivery: PasteDelivery) {
+        self.config.behavior.paste_mode = delivery.mode;
+        self.config.behavior.paste_shortcut = delivery.shortcut;
     }
 
     pub fn reload_config(&mut self, config: Config) -> Result<(), String> {
@@ -1297,7 +1298,7 @@ fn finish_transcript(
         && delivery_error.is_empty()
         && config.behavior.paste_mode != PasteMode::Clipboard
         && active_window_matches(window)
-        && paste(config.behavior.paste_mode, window).is_ok();
+        && paste(&config.behavior.paste_delivery(), window).is_ok();
     drop(delivery_guard);
     let output_elapsed = output_started.elapsed();
     eprintln!(
@@ -1325,12 +1326,12 @@ pub fn copy_text(text: &str) -> Result<(), String> {
     set_clipboard(text.as_bytes(), None)
 }
 
-pub fn paste_text_now(text: &str, mode: PasteMode) -> Result<(), String> {
+pub fn paste_text_now(text: &str, delivery: &PasteDelivery) -> Result<(), String> {
     let _guard = DELIVERY_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     set_clipboard(text.as_bytes(), None)?;
-    if mode == PasteMode::Clipboard {
+    if delivery.mode == PasteMode::Clipboard {
         return Ok(());
     }
     // The panel defers this command until its fade has released keyboard
@@ -1346,7 +1347,7 @@ pub fn paste_text_now(text: &str, mode: PasteMode) -> Result<(), String> {
     if !active_window_matches(Some(&window)) {
         return Err("Focus changed; text remains on the clipboard".into());
     }
-    paste(mode, Some(&window))
+    paste(delivery, Some(&window))
 }
 
 fn focus_window(window: &Value) -> Result<(), String> {
@@ -1448,15 +1449,19 @@ fn is_text_mime(mime_type: &str) -> bool {
             .any(|text_type| mime_type.eq_ignore_ascii_case(text_type))
 }
 
-fn paste(mode: PasteMode, window: Option<&Value>) -> Result<(), String> {
-    let (modifier, key) = paste_shortcut(mode, window);
-    send_hyprland_shortcut(modifier, key)
+fn paste(delivery: &PasteDelivery, window: Option<&Value>) -> Result<(), String> {
+    let Some(shortcut) = paste_shortcut(delivery, window) else {
+        return Ok(());
+    };
+    send_hyprland_shortcut(&shortcut)
 }
 
-fn send_hyprland_shortcut(modifier: &str, key: &str) -> Result<(), String> {
+fn send_hyprland_shortcut(shortcut: &PasteShortcut) -> Result<(), String> {
     // Keep down and delayed up in one Hyprland Lua evaluation. Separate
     // `hyprctl` calls lose the synthetic key between Lua contexts, which can
     // leave the shortcut pressed or make the release fail.
+    let modifier = shortcut.hyprland_modifiers();
+    let key = &shortcut.key;
     let dispatcher = format!(
         "function() \
          hl.dispatch(hl.dsp.send_key_state({{ mods = \"{modifier}\", key = \"{key}\", state = \"down\" }})); \
@@ -1476,12 +1481,22 @@ fn send_hyprland_shortcut(modifier: &str, key: &str) -> Result<(), String> {
     }
 }
 
-fn paste_shortcut(mode: PasteMode, window: Option<&Value>) -> (&'static str, &'static str) {
-    match mode {
-        PasteMode::Clipboard | PasteMode::CtrlV => ("CTRL", "V"),
-        PasteMode::ShiftInsert => ("SHIFT", "Insert"),
-        PasteMode::Auto if window_has_tag(window, "terminal") => ("SHIFT", "Insert"),
-        PasteMode::Auto => ("CTRL", "V"),
+fn paste_shortcut(delivery: &PasteDelivery, window: Option<&Value>) -> Option<PasteShortcut> {
+    let ctrl_v = || PasteShortcut {
+        modifiers: vec![PasteModifier::Ctrl],
+        key: "V".into(),
+    };
+    let shift_insert = || PasteShortcut {
+        modifiers: vec![PasteModifier::Shift],
+        key: "Insert".into(),
+    };
+    match delivery.mode {
+        PasteMode::Clipboard => None,
+        PasteMode::CtrlV => Some(ctrl_v()),
+        PasteMode::ShiftInsert => Some(shift_insert()),
+        PasteMode::Auto if window_has_tag(window, "terminal") => Some(shift_insert()),
+        PasteMode::Auto => Some(ctrl_v()),
+        PasteMode::Custom => Some(delivery.shortcut.clone()),
     }
 }
 
@@ -1617,7 +1632,7 @@ pub fn unload_cleanup(config: &Config) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::PasteMode;
+    use crate::config::{PasteDelivery, PasteMode, PasteModifier, PasteShortcut};
     use serde_json::json;
 
     use super::{
@@ -1903,18 +1918,51 @@ mod tests {
     fn automatic_paste_matches_omarchy_terminal_behavior() {
         let terminal = json!({"tags": ["default-opacity*", "terminal*"]});
         let graphical = json!({"tags": ["browser*"]});
+        let delivery = |mode| PasteDelivery {
+            mode,
+            shortcut: PasteShortcut::default(),
+        };
         assert_eq!(
-            paste_shortcut(PasteMode::Auto, Some(&terminal)),
-            ("SHIFT", "Insert")
+            paste_shortcut(&delivery(PasteMode::Auto), Some(&terminal)),
+            Some(PasteShortcut {
+                modifiers: vec![PasteModifier::Shift],
+                key: "Insert".into(),
+            })
         );
         assert_eq!(
-            paste_shortcut(PasteMode::Auto, Some(&graphical)),
-            ("CTRL", "V")
+            paste_shortcut(&delivery(PasteMode::Auto), Some(&graphical)),
+            Some(PasteShortcut::default())
         );
         assert_eq!(
-            paste_shortcut(PasteMode::CtrlV, Some(&terminal)),
-            ("CTRL", "V")
+            paste_shortcut(&delivery(PasteMode::CtrlV), Some(&terminal)),
+            Some(PasteShortcut::default())
         );
+        assert_eq!(
+            paste_shortcut(&delivery(PasteMode::ShiftInsert), Some(&graphical)),
+            Some(PasteShortcut {
+                modifiers: vec![PasteModifier::Shift],
+                key: "Insert".into(),
+            })
+        );
+        assert_eq!(
+            paste_shortcut(&delivery(PasteMode::Clipboard), Some(&graphical)),
+            None
+        );
+    }
+
+    #[test]
+    fn custom_paste_uses_the_saved_chord_in_every_window() {
+        let shortcut = PasteShortcut {
+            modifiers: vec![PasteModifier::Shift, PasteModifier::Ctrl],
+            key: "F8".into(),
+        };
+        let delivery = PasteDelivery {
+            mode: PasteMode::Custom,
+            shortcut: shortcut.clone(),
+        };
+        let terminal = json!({"tags": ["terminal*"]});
+        assert_eq!(paste_shortcut(&delivery, Some(&terminal)), Some(shortcut));
+        assert_eq!(delivery.shortcut.hyprland_modifiers(), "CTRL SHIFT");
     }
 
     #[test]

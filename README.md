@@ -42,7 +42,38 @@ cd ~/.config/omarchy/plugins/entroit.omaflow
 
 Replace `F13` with the key you want to hold.
 
-## Nothing is downloaded behind your back
+The marketplace command downloads the plugin. `./install` installs its bundled
+binary, user services, and hotkey integration. It shows the plan before it
+changes your system and does not download a speech model. You do not need Rust
+or Cargo.
+
+## Updates stay inside OmaFlow
+
+OmaFlow checks the official Omarchy plugin marketplace once a day. When the
+marketplace publishes a verified OmaFlow commit, a desktop notification opens
+the panel. The bar also keeps a dot visible, and the panel shows the release
+summary and changes. Click **Update** to install it. Click **Later** to hide the
+home card for one day. The bar dot and the Settings row remain.
+
+An update waits for an active dictation to finish. OmaFlow then switches the
+plugin and daemon together, checks the new service, and restores the previous
+release if that check fails. It never installs the repository's current branch
+or an unreviewed GitHub release.
+
+OmaFlow 0.17 and older cannot perform this handoff automatically. After the
+marketplace lists 0.18, use the exact 40-character verified commit shown there
+for the one-time bridge below. Do not substitute a branch name such as `main`.
+
+```bash
+git -C ~/.config/omarchy/plugins/entroit.omaflow fetch --no-tags https://github.com/entroit/omaflow <FULL_VERIFIED_COMMIT>
+git -C ~/.config/omarchy/plugins/entroit.omaflow merge --ff-only <FULL_VERIFIED_COMMIT>
+cd ~/.config/omarchy/plugins/entroit.omaflow && ./install --yes
+```
+
+Automatic in-app updates begin only after that bridge installs the trusted
+runner and release receipt.
+
+## Nothing else is downloaded behind your back
 
 No model weights come with the install. **Settings → Speech** lists every model
 with its size, the hardware it needs and its licence. You pick one, and only
@@ -61,6 +92,7 @@ Your own model or server works too. [Details →](docs/custom-models.md)
 | Dictate a sentence | Hold your hotkey, speak, then release. |
 | Talk hands-free | Double-tap to lock. Press again or click **Stop**. |
 | Copy without pasting | Choose **Copy only** in Settings → General. |
+| Use an app-specific paste key | Choose **Custom** in Settings → General, select the modifiers and enter the key. |
 | Fix a result | Open it in History to edit or copy again. |
 
 <!-- MEDIA 3 — WORKS EVERYWHERE (missing)

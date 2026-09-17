@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+mode="${1:-write}"
+if [[ $mode != write && $mode != --verify ]]; then
+  printf 'Usage: scripts/package-release [--verify]\n' >&2
+  exit 1
+fi
+expected_rustc='rustc 1.98.1 (48a229cea 2026-09-01) (Arch Linux rust 1:1.98.1-1)'
+[[ $(rustc -V) == "$expected_rustc" ]] || {
+  printf 'Expected %s, found %s.\n' "$expected_rustc" "$(rustc -V)" >&2
+  exit 1
+}
+version="$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' "$repo_dir/Cargo.toml" | head -1)"
+[[ -n $version ]] || { printf 'Could not read the Cargo package version.\n' >&2; exit 1; }
+export SOURCE_DATE_EPOCH
+SOURCE_DATE_EPOCH="$(git -C "$repo_dir" show -s --format=%ct HEAD)"
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+export RUSTFLAGS="--remap-path-prefix=$repo_dir=/usr/src/omaflow --remap-path-prefix=$cargo_home=/usr/local/cargo -C link-arg=-Wl,--build-id=none"
+cargo build --locked --release --manifest-path "$repo_dir/Cargo.toml"
+built="$repo_dir/target/release/omaflow"
+destination="$repo_dir/dist/bin/x86_64-unknown-linux-gnu/omaflow"
+bytes="$(stat -c %s "$built")"
+sha="$(sha256sum "$built" | cut -d' ' -f1)"
+identity="$($built version --json)"
+[[ $(jq -er '.version' <<<"$identity") == "$version" ]] || { printf 'Built binary version does not match.\n' >&2; exit 1; }
+
+if [[ $mode == --verify ]]; then
+  [[ -x $destination ]] || { printf 'The committed release binary is missing.\n' >&2; exit 1; }
+  cmp --silent "$built" "$destination" || { printf 'The committed release binary is not reproducible.\n' >&2; exit 1; }
+  jq -e --arg version "$version" --arg sha "$sha" --argjson bytes "$bytes" \
+    '.version==$version and .binary.sha256==$sha and .binary.bytes==$bytes' \
+    "$repo_dir/dist/release.json" >/dev/null
+  exit 0
+fi
+
+mkdir -p "$(dirname "$destination")"
+install -m 755 "$built" "$destination"
+jq -n \
+  --arg version "$version" \
+  --arg sha "$sha" \
+  --argjson bytes "$bytes" \
+  '{schemaVersion:1,pluginId:"entroit.omaflow",version:$version,summary:"Install verified updates and choose how text is pasted.",changes:["See and install approved releases without a terminal","Set a custom paste shortcut in Settings","Restore the previous release when a health check fails"],binary:{target:"x86_64-unknown-linux-gnu",path:"dist/bin/x86_64-unknown-linux-gnu/omaflow",bytes:$bytes,sha256:$sha},stateSchemaVersion:5}' \
+  >"$repo_dir/dist/release.json"
+printf 'Wrote %s (%s bytes, %s).\n' "$destination" "$bytes" "$sha"

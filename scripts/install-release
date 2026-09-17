@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+release_json="$repo_dir/dist/release.json"
+binary_rel="dist/bin/x86_64-unknown-linux-gnu/omaflow"
+binary="$repo_dir/$binary_rel"
+
+[[ -d $repo_dir/.git && ! -L $repo_dir/.git ]] || { printf 'Production installation requires a direct Git checkout, not a linked worktree.\n' >&2; exit 1; }
+git_config="$repo_dir/.git/config"
+if [[ -f $git_config ]] && grep -Eiq '\[(include|url |filter )|insteadOf|smudge|clean[[:space:]]*=|sshCommand|proxyCommand|fsmonitor|sslVerify|extraHeader|uploadPack|receivePack' "$git_config"; then
+  printf 'Production installation refuses unsafe repository-local Git configuration.\n' >&2
+  exit 1
+fi
+for release_input in manifest.json dist/release.json "$binary_rel"; do
+  working_input="$repo_dir/$release_input"
+  [[ -f $working_input && ! -L $working_input ]] || { printf 'Release input must be a regular in-repository file: %s\n' "$release_input" >&2; exit 1; }
+  [[ $(realpath -- "$working_input") == "$repo_dir/$release_input" ]] || { printf 'Release input escapes the checkout: %s\n' "$release_input" >&2; exit 1; }
+done
+origin="$(/usr/bin/git -C "$repo_dir" remote get-url origin 2>/dev/null || true)"
+[[ $origin == https://github.com/entroit/omaflow || $origin == https://github.com/entroit/omaflow.git ]] || { printf 'Production installation requires the canonical OmaFlow checkout.\n' >&2; exit 1; }
+/usr/bin/git -C "$repo_dir" diff --quiet --exit-code HEAD -- || { printf 'Production installation requires a clean checkout.\n' >&2; exit 1; }
+/usr/bin/git -C "$repo_dir" diff --cached --quiet --exit-code HEAD -- || { printf 'Production installation requires a clean checkout.\n' >&2; exit 1; }
+[[ -z $(/usr/bin/git -C "$repo_dir" status --porcelain=v1 --untracked-files=all) ]] || { printf 'Production installation requires a clean checkout.\n' >&2; exit 1; }
+for release_input in manifest.json dist/release.json "$binary_rel"; do
+  working_input="$repo_dir/$release_input"
+  /usr/bin/git -C "$repo_dir" ls-files --error-unmatch "$release_input" >/dev/null 2>&1 || { printf 'Release input is not committed: %s\n' "$release_input" >&2; exit 1; }
+  [[ $(/usr/bin/git -C "$repo_dir" cat-file -t "HEAD:$release_input") == blob ]] || { printf 'Release input is not a committed file: %s\n' "$release_input" >&2; exit 1; }
+  cmp --silent "$working_input" <(/usr/bin/git -C "$repo_dir" show "HEAD:$release_input") || { printf 'Release input differs from HEAD: %s\n' "$release_input" >&2; exit 1; }
+done
+
+plugin_id="$(jq -er '.pluginId' "$release_json")"
+version="$(jq -er '.version' "$release_json")"
+manifest_binary_rel="$(jq -er '.binary.path' "$release_json")"
+expected_bytes="$(jq -er '.binary.bytes' "$release_json")"
+expected_sha="$(jq -er '.binary.sha256' "$release_json")"
+
+[[ $plugin_id == entroit.omaflow ]] || { printf 'Release metadata names another plugin.\n' >&2; exit 1; }
+[[ $manifest_binary_rel == "$binary_rel" ]] || { printf 'Release binary path is invalid.\n' >&2; exit 1; }
+[[ -x $binary ]] || { printf 'Bundled OmaFlow binary is missing.\n' >&2; exit 1; }
+[[ $(stat -c %s "$binary") == "$expected_bytes" ]] || { printf 'Bundled OmaFlow binary has the wrong size.\n' >&2; exit 1; }
+[[ $(sha256sum "$binary" | cut -d' ' -f1) == "$expected_sha" ]] || { printf 'Bundled OmaFlow binary checksum does not match.\n' >&2; exit 1; }
+identity="$($binary version --json)"
+[[ $(jq -er '.pluginId' <<<"$identity") == entroit.omaflow ]] || { printf 'Bundled binary identity is invalid.\n' >&2; exit 1; }
+[[ $(jq -er '.version' <<<"$identity") == "$version" ]] || { printf 'Bundled binary version does not match.\n' >&2; exit 1; }
+
+commit="$(/usr/bin/git -C "$repo_dir" rev-parse HEAD)"
+[[ $commit =~ ^[0-9a-f]{40}$ ]] || { printf 'Checkout commit is invalid.\n' >&2; exit 1; }
+install_root="$HOME/.local/lib/omaflow"
+release_dir="$install_root/releases/$commit"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omaflow/update"
+mkdir -p "$release_dir" "$state_dir" "$HOME/.local/bin"
+chmod 700 "$install_root" "$install_root/releases" "$release_dir" "$state_dir"
+install -m 700 "$binary" "$release_dir/omaflow"
+install -m 600 "$release_json" "$release_dir/release.json"
+printf '%s\n' "$commit" >"$release_dir/commit"
+
+current_tmp="$install_root/.current.$$.tmp"
+runner_tmp="$install_root/.trusted-runner.$$.tmp"
+link_tmp="$HOME/.local/bin/.omaflow.$$.tmp"
+trap 'rm -f "$current_tmp" "$runner_tmp" "$link_tmp"' EXIT
+ln -s "$release_dir" "$current_tmp"
+mv -Tf "$current_tmp" "$install_root/current"
+install -m 700 "$binary" "$runner_tmp"
+mv -f "$runner_tmp" "$install_root/trusted-runner"
+ln -s "$install_root/current/omaflow" "$link_tmp"
+mv -Tf "$link_tmp" "$HOME/.local/bin/omaflow"
+
+receipt_tmp="$state_dir/.installed.$$.tmp"
+jq -n \
+  --arg commit "$commit" \
+  --arg version "$version" \
+  --arg sha "$expected_sha" \
+  --argjson installedAtMs "$(date +%s%3N)" \
+  '{schemaVersion:1,commit:$commit,version:$version,binarySha256:$sha,installedAtMs:$installedAtMs}' \
+  >"$receipt_tmp"
+chmod 600 "$receipt_tmp"
+mv -f "$receipt_tmp" "$state_dir/installed.json"
+sync -f "$release_dir" "$install_root" "$state_dir"

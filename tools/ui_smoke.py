@@ -27,7 +27,8 @@ with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
     s=s.replace('  moduleName: "entroit.omaflow"\n  ipcTarget: "entroit.omaflow"','''  property bool opened: true
       property var bar: null
       property QtObject controller: QtObject { function hide() {} function show() {} }
-      function auditExec(args) {}
+      property var auditCalls: []
+      function auditExec(args) { auditCalls.push(args) }
       property string auditMode: Quickshell.env("AUDIT_MODE") || "history"
     ''',1)
     s=s.replace('implicitWidth: barButton.implicitWidth','implicitWidth: 520').replace('implicitHeight: barButton.implicitHeight','implicitHeight: 610')
@@ -36,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
     a=s.index('  BarIconButton {'); b=s.index('  component Waveform:',a); s=s[:a]+s[b:]
     s=s[:-2]+'''
       Component.onCompleted: {
-        root.stateVersion = 3; root.connected = true
+        root.stateVersion = 5; root.connected = true
         root.asrRunning = true; root.cleanupLoaded = true; root.cleanupAvailable = true
         root.trainingLogEnabled = true; root.gpuMemoryMib = 6300
         root.runningVersion = "0.14.0"; root.hotkeyDisplay = "AltGr + Menu"
@@ -56,6 +57,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
           ]
         }
         root.shortcutSettings = {keys:["ISO_Level3_Shift","Menu"],consumed:["Menu"]}
+        root.pasteShortcut = {modifiers:["ctrl","shift"],key:"F8"}
         root.customVocabulary = ["OmaFlow", "Omarchy", "Hyprland", "Parakeet", "Gemma", "Quickshell"]
         root.transcript = "The completed transcript is safely on your clipboard. This is a synthetic audit sample."
         root.errorText = "OmaFlow could not reach the microphone. Check the input device in your sound settings."
@@ -87,7 +89,52 @@ with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
         if (auditMode === "settings-cleanup-off") { root.settingsTab="cleanup"; root.cleanupEnabled=false }
         if (auditMode === "settings-cleanup-no-ollama") { root.settingsTab="cleanup"; root.cleanupRuntime="missing" }
         if (auditMode === "hotkey") { root.phase="idle"; root.idlePage="settings"; root.settingsTab="general"; root.editShortcut=true }
-        if (auditMode === "settings-update") { root.idlePage="settings"; root.settingsTab="general"; root.updateBehind=1; root.updateRemoteVersion="0.17.0"; root.updateCheckedAtMs=Date.now() }
+        if (auditMode === "settings-general-custom") {
+          root.phase="idle"; root.idlePage="settings"; root.settingsTab="general"; root.pasteMode="custom"
+          root.savePasteShortcut(["ctrl","shift"], "F8")
+          if (root.auditCalls.length !== 1
+              || JSON.stringify(root.auditCalls[0].slice(0, 3)) !== JSON.stringify(["omaflow","configure","paste_delivery"]))
+            throw new Error("Custom paste must use the atomic paste_delivery setting")
+          var savedPaste = JSON.parse(root.auditCalls[0][3])
+          if (savedPaste.mode !== "custom" || savedPaste.shortcut.key !== "F8"
+              || savedPaste.shortcut.modifiers.join("+") !== "ctrl+shift")
+            throw new Error("Custom paste must save one structured chord")
+        }
+        if (auditMode === "settings-update") { root.idlePage="settings"; root.settingsTab="general";
+          root.updateOffer={schemaVersion:1,checkedAtMs:Date.now(),target:{commit:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",version:"0.18.0",summary:"A smoother update is ready.",changes:["Update inside OmaFlow","Keep the previous release for recovery"]}} }
+        if (["update","update-later","update-progress","update-failed","update-daemon-down","update-migration"].indexOf(auditMode) >= 0) {
+          root.phase="idle"; root.idlePage="history"
+          root.updateOffer={schemaVersion:1,checkedAtMs:Date.now(),target:{commit:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",version:"0.18.0",summary:"A smoother update is ready.",changes:["Update inside OmaFlow","Keep the previous release for recovery"]}}
+        }
+        if (auditMode === "update-later") root.updateDeferral={schemaVersion:1,commit:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",untilMs:Date.now()+86400000}
+        if (auditMode === "update-progress") root.updateTransaction={state:"waiting-for-idle",message:"Finishing your dictation first"}
+        if (auditMode === "update-failed") root.updateTransaction={state:"rolled-back",message:"The update did not finish. Your previous version is still running."}
+        if (auditMode === "update-daemon-down") root.connected=false
+        if (auditMode === "update-migration") root.stateVersion=4
+        if (auditMode === "update-later" && (!root.updateDeferred || !root.updateAttention
+            || !root.updateActionsAvailable || !root.laterActionAvailable))
+          throw new Error("Later must hide only the home card while preserving badge and Settings actions")
+        if (auditMode === "update-migration" && (root.supportedState || root.updaterControlsEnabled
+            || root.updateActionsAvailable || root.laterActionAvailable || !root.updateAttention))
+          throw new Error("Migration mode must preserve attention without enabling updater controls")
+        if (auditMode === "update") {
+          root.requestUpdate()
+          if (JSON.stringify(root.auditCalls[0]) !== JSON.stringify([root.trustedRunner,"update","request"]))
+            throw new Error("Update must invoke the trusted runner with fixed arguments")
+        }
+        if (auditMode === "update-later") {
+          root.deferUpdate()
+          if (JSON.stringify(root.auditCalls[0]) !== JSON.stringify([root.trustedRunner,"update","later"]))
+            throw new Error("Later must invoke the trusted runner with fixed arguments")
+        }
+        if (auditMode === "update-migration") {
+          root.copyMigrationSteps()
+          if (root.auditCalls.length !== 1 || root.auditCalls[0][0] !== "wl-copy"
+              || root.auditCalls[0].length !== 2
+              || root.auditCalls[0][1].indexOf("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") < 0
+              || root.auditCalls[0][1].indexOf(" main") >= 0)
+            throw new Error("Migration must only copy exact-commit bridge steps")
+        }
         if (auditMode !== "empty") root.history = [
           {id:1, created_at_ms:Date.now(), text:"Please send the updated proposal to the team before Thursday's meeting. I've added the revised timeline and the notes from our last review."},
           {id:2, created_at_ms:Date.now()-300000, text:"The client approved the new layout. Let's finish the mobile version this week and schedule a final review for Monday. Please check the contact form, update the pricing page, and make sure the links in the footer work before we send it over. I'll prepare the handover notes and share them with the team."},
@@ -145,7 +192,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
 
     for component in ROOT.glob("*.qml"):
         if component.name != "OmaFlow.qml": (p/component.name).write_text(component.read_text())
-    for mode in ["history","empty","first-run","detail","settings-cleanup","settings-cleanup-custom","settings-cleanup-openai","settings-cleanup-off","settings-cleanup-no-ollama","settings-models","settings-models-custom","settings-models-server","settings-models-pending","settings-models-downloading","settings-audio","settings-vocabulary","settings-privacy","settings-general","settings-update","hotkey","recording","recording-held","processing","result","warning","success","notice","error"]:
+    for mode in ["history","empty","first-run","detail","update","update-later","update-progress","update-failed","update-daemon-down","update-migration","settings-cleanup","settings-cleanup-custom","settings-cleanup-openai","settings-cleanup-off","settings-cleanup-no-ollama","settings-models","settings-models-custom","settings-models-server","settings-models-pending","settings-models-downloading","settings-audio","settings-vocabulary","settings-privacy","settings-general","settings-general-custom","settings-update","hotkey","recording","recording-held","processing","result","warning","success","notice","error"]:
         result = subprocess.run(["quickshell","-p",str(p)], env=dict(os.environ, QT_QPA_PLATFORM="offscreen", AUDIT_MODE=mode, OMAFLOW_UI_OUTPUT=str(output)), capture_output=True, text=True, timeout=10)
         log = result.stdout+result.stderr
         (output/(mode+".log")).write_text(log)

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -26,6 +27,28 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     shutil.copy2(ROOT/'tools/install_receipt.py', repo/'tools/install_receipt.py')
     (repo/'target/release').mkdir(parents=True)
     shutil.copy2(ROOT/'target/release/omaflow', repo/'target/release/omaflow')
+    subprocess.run(['/usr/bin/git', 'init', '-q', '-b', 'main', str(repo)], check=True)
+    subprocess.run(['/usr/bin/git', '-C', str(repo), 'add', '.'], check=True)
+    subprocess.run(['/usr/bin/git', '-C', str(repo), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture'], check=True)
+    subprocess.run(['/usr/bin/git', '-C', str(repo), 'remote', 'add', 'origin', 'https://github.com/entroit/omaflow'], check=True)
+    release_installer = repo/'scripts/install-release'
+    direct_git = repo/'.git'; saved_git = repo/'.git.saved'
+    direct_git.rename(saved_git); direct_git.write_text('gitdir: /tmp/not-trusted\n')
+    rejected = subprocess.run([str(release_installer)], env=dict(os.environ, HOME=str(home)), capture_output=True, text=True)
+    assert rejected.returncode != 0 and 'linked worktree' in rejected.stderr
+    direct_git.unlink(); saved_git.rename(direct_git)
+    manifest = repo/'manifest.json'; manifest_bytes = manifest.read_bytes(); manifest.rename(repo/'manifest.real')
+    manifest.symlink_to(repo/'manifest.real')
+    rejected = subprocess.run([str(release_installer)], env=dict(os.environ, HOME=str(home)), capture_output=True, text=True)
+    assert rejected.returncode != 0 and 'regular in-repository file' in rejected.stderr
+    manifest.unlink(); (repo/'manifest.real').rename(manifest)
+    subprocess.run(['/usr/bin/git', '-C', str(repo), 'update-index', '--skip-worktree', 'manifest.json'], check=True)
+    manifest.write_bytes(manifest_bytes + b'\n')
+    rejected = subprocess.run([str(release_installer)], env=dict(os.environ, HOME=str(home)), capture_output=True, text=True)
+    assert rejected.returncode != 0 and 'differs from HEAD' in rejected.stderr
+    manifest.write_bytes(manifest_bytes)
+    subprocess.run(['/usr/bin/git', '-C', str(repo), 'update-index', '--no-skip-worktree', 'manifest.json'], check=True)
+    print('PASS production release install rejects linked worktrees, symlinks, and hidden byte drift')
     log = base/'commands.log'
     for name in ['cargo','pacman','systemctl','hyprctl','omarchy','omarchy-shell','pw-cat','wl-copy','wl-paste','git','update-desktop-database','ollama','curl']:
         body = f'printf "%s\\n" "{name} $*" >> "$TEST_LOG"\n'
@@ -60,6 +83,8 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     assert 'Settings -> Speech' in output
     assert not any(word in log.read_text() for word in ['ollama ', 'nemo-speech', 'curl ']), log.read_text()
     assert (home/'.local/bin/omaflow').is_symlink()
+    for unit in ['omaflow.service', 'omaflow-update.service', 'omaflow-update-reconcile.service', 'omaflow-update-check.service', 'omaflow-update-check.timer']:
+        assert (config/'systemd/user'/unit).is_symlink(), unit
     result = subprocess.run([str(home/'.local/bin/omaflow'), 'serve-asr'], env=env, capture_output=True, timeout=3)
     assert result.returncode == 0 and not result.stdout
     print('PASS app-only install links the app and downloads nothing; speech service stays dormant')
@@ -79,8 +104,16 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
                 time.sleep(.02)
             assert surface['shortcut_settings']['keys'] == ['F14']
             assert 'F14' in (config/'omaflow/shortcut.lua').read_text()
+            transaction_id = 'installation-test'
+            with socket.socket(socket.AF_UNIX) as client:
+                client.connect(str(base/'runtime/omaflow.sock'))
+                client.sendall(f'prepare-update:{transaction_id}'.encode())
+            daemon.wait(timeout=5)
+            assert (base/f'runtime/omaflow-update-ready-{transaction_id}').read_text() == 'ready\n'
+            print('PASS an idle daemon acknowledges the update gate and exits cleanly')
         finally:
-            daemon.terminate(); daemon.wait(timeout=5)
+            if daemon.poll() is None:
+                daemon.terminate(); daemon.wait(timeout=5)
     print('PASS agent TOML edits reload into the daemon and generated Hyprland shortcut')
 
 
@@ -96,12 +129,15 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     nemo = home/'.local/lib/nemo-speech/bin/nemo-speech'; nemo.parent.mkdir(parents=True)
     nemo.write_text('#!/usr/bin/bash\nprintf "%s\\n" "nemo-speech $*" >> "$TEST_LOG"\n'); nemo.chmod(0o755)
     log.write_text('')
-    run('install', '--skip-preflight', '--yes')
+    reinstall_output = run('install', '--skip-preflight', '--yes')
     settings = tomllib.loads(personal.read_text())
     # A re-install must not claim the models are ready; only a model the user
     # actually downloaded in Settings may say that.
     assert settings['behavior']['models_configured'] is False
     assert settings['cleanup']['custom_vocabulary'] == ['KeepMe']
+    assert 'existing model configuration is preserved' in reinstall_output
+    assert 'OmaFlow is ready with your existing settings.' in reinstall_output
+    assert 'no model configured yet' not in reinstall_output
     assert not any(word in log.read_text() for word in ['ollama ', 'nemo-speech', 'curl ']), log.read_text()
     print('PASS a re-install downloads nothing and preserves saved settings')
 

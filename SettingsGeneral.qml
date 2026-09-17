@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls as Controls
 import QtQuick.Layouts
 import Quickshell
 import qs.Commons
@@ -67,7 +68,8 @@ ColumnLayout {
         { "label": "Auto", "value": "auto" },
         { "label": "Ctrl+V", "value": "ctrl-v" },
         { "label": "Shift+Insert", "value": "shift-insert" },
-        { "label": "Copy only", "value": "clipboard" }
+        { "label": "Copy only", "value": "clipboard" },
+        { "label": "Custom", "value": "custom" }
       ]
 
       ActionButton {
@@ -82,6 +84,114 @@ ColumnLayout {
     }
 
     Item { Layout.fillWidth: true }
+  }
+
+  Rectangle {
+    id: customPaste
+    Layout.fillWidth: true
+    Layout.preferredHeight: customPasteContent.implicitHeight + Style.space(20)
+    visible: page.flow.pasteMode === "custom"
+    radius: Style.cornerRadius
+    color: Util.alpha(Color.popups.text, 0.055)
+
+    property bool ctrlOn: true
+    property bool shiftOn: false
+    property bool altOn: false
+    property bool superOn: false
+
+    function syncFromFlow() {
+      var modifiers = Array.isArray(page.flow.pasteShortcut.modifiers)
+        ? page.flow.pasteShortcut.modifiers : ["ctrl"]
+      ctrlOn = modifiers.indexOf("ctrl") >= 0
+      shiftOn = modifiers.indexOf("shift") >= 0
+      altOn = modifiers.indexOf("alt") >= 0
+      superOn = modifiers.indexOf("super") >= 0
+      pasteKey.text = String(page.flow.pasteShortcut.key || "V")
+    }
+
+    Component.onCompleted: syncFromFlow()
+    Connections {
+      target: page.flow
+      function onPasteShortcutChanged() { customPaste.syncFromFlow() }
+    }
+
+    ColumnLayout {
+      id: customPasteContent
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.margins: Style.space(10)
+      spacing: Style.space(8)
+
+      Text {
+        Layout.fillWidth: true
+        text: "Choose modifiers and one XKB key, such as V, Insert or F8."
+        textFormat: Text.PlainText
+        wrapMode: Text.Wrap
+        color: Util.alpha(Color.popups.text, 0.65)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      RowLayout {
+        Layout.fillWidth: true
+        spacing: Style.space(6)
+
+        Repeater {
+          model: [
+            {"label":"Ctrl", "value":"ctrl"},
+            {"label":"Shift", "value":"shift"},
+            {"label":"Alt", "value":"alt"},
+            {"label":"Super", "value":"super"}
+          ]
+          ActionButton {
+            required property var modelData
+            readonly property bool active: modelData.value === "ctrl" ? customPaste.ctrlOn
+              : modelData.value === "shift" ? customPaste.shiftOn
+              : modelData.value === "alt" ? customPaste.altOn : customPaste.superOn
+            text: modelData.label
+            selected: active
+            Accessible.name: modelData.label + " modifier"
+            Accessible.checkable: true
+            Accessible.checked: active
+            onClicked: {
+              if (modelData.value === "ctrl") customPaste.ctrlOn = !customPaste.ctrlOn
+              else if (modelData.value === "shift") customPaste.shiftOn = !customPaste.shiftOn
+              else if (modelData.value === "alt") customPaste.altOn = !customPaste.altOn
+              else customPaste.superOn = !customPaste.superOn
+            }
+          }
+        }
+
+        Controls.TextField {
+          id: pasteKey
+          Layout.preferredWidth: Style.space(100)
+          placeholderText: "Key"
+          maximumLength: 80
+          color: Color.popups.text
+          Accessible.name: "Custom paste key"
+        }
+
+        Item { Layout.fillWidth: true }
+
+        ActionButton {
+          text: "Save"
+          foreground: Color.popups.text
+          background: Util.alpha(Color.accent, 0.22)
+          bordered: true
+          enabled: (customPaste.ctrlOn || customPaste.shiftOn || customPaste.altOn || customPaste.superOn)
+            && /^[A-Za-z0-9_]+$/.test(pasteKey.text.trim())
+          onClicked: {
+            var modifiers = []
+            if (customPaste.ctrlOn) modifiers.push("ctrl")
+            if (customPaste.shiftOn) modifiers.push("shift")
+            if (customPaste.altOn) modifiers.push("alt")
+            if (customPaste.superOn) modifiers.push("super")
+            page.flow.savePasteShortcut(modifiers, pasteKey.text)
+          }
+        }
+      }
+    }
   }
 
   SettingsHeading { title: "Memory" }
@@ -119,18 +229,15 @@ ColumnLayout {
           Layout.fillWidth: true
           textFormat: Text.PlainText
           wrapMode: Text.Wrap
-          text: page.flow.updateError
-            ? "Could not check for updates"
-            : !page.flow.supportedState
-              ? "The running daemon is newer than this panel"
-              : page.flow.needsRebuild
-                ? "Version " + page.flow.checkoutVersion + " needs a rebuild"
+          text: page.flow.updateRunning || page.flow.updateFailed
+            ? String(page.flow.updateTransaction.message || "Preparing the OmaFlow update")
+            : page.flow.updateOffer.externalCheckoutWarning
+              ? "The plugin checkout changed outside OmaFlow"
+              : page.flow.updateOffer.error
+                ? "Could not check for updates"
                 : page.flow.updateAvailable
-                  ? (page.flow.updateRemoteVersion
-                    ? "Version " + page.flow.updateRemoteVersion + " is available"
-                    : page.flow.updateBehind + (page.flow.updateBehind === 1
-                      ? " new commit is available" : " new commits are available"))
-                  : page.flow.updateCheckedAtMs === 0
+                  ? "OmaFlow " + String(page.flow.verifiedUpdate.version || "") + " is available"
+                  : Number(page.flow.updateOffer.checkedAtMs || 0) === 0
                     ? "Updates have not been checked"
                     : "OmaFlow " + page.flow.runningVersion + " is up to date"
           color: page.flow.updateAttention ? Color.accent : Color.popups.text
@@ -143,15 +250,17 @@ ColumnLayout {
           Layout.fillWidth: true
           textFormat: Text.PlainText
           wrapMode: Text.Wrap
-          text: page.flow.updateError
-            ? "Last check failed: " + page.flow.updateError
-            : page.flow.needsRebuild || !page.flow.supportedState
-              ? "Review the checkout, then run ./link-local from it."
+          text: page.flow.updateOffer.externalCheckoutWarning
+            ? String(page.flow.updateOffer.externalCheckoutWarning)
+            : page.flow.updateOffer.error
+              ? String(page.flow.updateOffer.error)
               : page.flow.updateAvailable
-                ? "Use Omarchy to review the update, then rebuild OmaFlow."
-              : page.flow.updateCheckedAtMs > 0
-                ? "Checked " + page.flow.formatHistoryTime(page.flow.updateCheckedAtMs).toLowerCase()
-                : "Not checked yet"
+                ? String(page.flow.verifiedUpdate.summary || "")
+                  + (Array.isArray(page.flow.verifiedUpdate.changes)
+                    ? "\n" + page.flow.verifiedUpdate.changes.join(" · ") : "")
+                : Number(page.flow.updateOffer.checkedAtMs || 0) > 0
+                  ? "Checked " + page.flow.formatHistoryTime(Number(page.flow.updateOffer.checkedAtMs)).toLowerCase()
+                  : "Not checked yet"
           color: Util.alpha(Color.popups.text, 0.55)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
@@ -159,16 +268,25 @@ ColumnLayout {
       }
 
       ActionButton {
-        visible: page.flow.updateAttention
-        text: "Copy steps"
+        visible: page.flow.updateActionsAvailable
+        text: page.flow.updateFailed ? "Retry" : "Update"
         foreground: Color.popups.text
         background: Util.alpha(Color.accent, 0.22)
         bordered: true
-        onClicked: Quickshell.execDetached(["wl-copy", "omarchy plugin update entroit.omaflow\ncd " + page.flow.pluginDir + " && ./link-local"])
+        onClicked: page.flow.requestUpdate()
       }
 
       ActionButton {
-        visible: !page.flow.updateAttention
+        visible: page.flow.laterActionAvailable
+        text: "Later"
+        foreground: Color.popups.text
+        onClicked: page.flow.deferUpdate()
+      }
+
+      ActionButton {
+        visible: page.flow.updaterControlsEnabled
+          && (!page.flow.updateAvailable || Boolean(page.flow.updateOffer.error))
+          && !page.flow.updateRunning
         text: page.flow.updateChecking ? "Checking…" : "Check now"
         enabled: !page.flow.updateChecking
         foreground: Color.popups.text

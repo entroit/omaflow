@@ -7,14 +7,13 @@ Install OmaFlow from your own checkout; the desktop then points at it.
 ```bash
 git clone https://github.com/entroit/omaflow.git
 cd omaflow
-./install
+./link-local
 ```
 
-`./install` installs the packages, builds the binary, writes the hotkey,
-registers the Hyprland adapter and calls `link-local` itself. It downloads no
+`./link-local` builds the daemon from the contributor checkout, writes the hotkey,
+registers the Hyprland adapter and links that development build directly. It downloads no
 models: you pick a speech model in Settings → Speech afterwards, and the first
-one you download installs the NeMo-Speech runtime with it. `--dry-run` prints
-the plan without touching anything.
+one you download installs the NeMo-Speech runtime with it.
 
 `link-local` builds the daemon, links `~/.local/bin/omaflow`, the systemd
 units, the Hyprland adapter and the Omarchy plugin directory at your checkout,
@@ -35,7 +34,7 @@ exist.
 | `src/backend.rs` | Microphone capture, speech server client and the managed NeMo server. |
 | `src/catalog.rs` | The built-in model catalog, the downloader and what selecting an entry writes. |
 | `src/audio.rs` | Ducking the default output through `wpctl`, and recovering it after a crash. |
-| `src/update.rs` | Read-only version and remote update checks. |
+| `src/update.rs`, `src/update/` | Marketplace verification, durable update state, activation and recovery. |
 | `src/config.rs` | `config.toml` schema, defaults and atomic edits. |
 | `src/cli.rs` | Every `omaflow` command. |
 | `src/process.rs` | Bounded child processes, and the API key's owner-only curl config. |
@@ -43,7 +42,7 @@ exist.
 | `Settings*.qml` | One file per settings tab. |
 | `ModelCard.qml`, `LabeledField.qml`, `EndpointTester.qml` | The catalog card, the labelled and validated text field, and the Test connection probe. |
 | `scripts/` | Preflight, the NeMo-Speech runtime installer and the local check runner. |
-| `dist/` | The user units and the desktop entry. |
+| `dist/` | The bundled binary, release manifest, user units and desktop entry. |
 | `integrations/hyprland.lua` | Hotkey adapter; reads the generated shortcut file. |
 | `config/config.toml` | Bundled defaults and the cleanup prompt, embedded in the binary. |
 | `tools/` | Evaluation gates and regression tests. |
@@ -62,8 +61,9 @@ That runs `cargo fmt --check`, clippy with warnings denied, the Rust tests,
 a release build, the Python and Lua regression suites, shellcheck, `bash -n`
 and `git diff --check`. `scripts/check-local.sh --full` adds the model
 evaluation gates, the QML smoke test and `omarchy plugin validate .`; those
-need the cleanup model downloaded and an installed Omarchy shell. There is no
-hosted CI; the checks run on your machine.
+need the cleanup model downloaded and an installed Omarchy shell. The release
+workflow also rebuilds the committed binary in a pinned Arch image and dated
+package snapshot, then compares every byte.
 
 ## Changes that need extra care
 
@@ -74,6 +74,10 @@ hosted CI; the checks run on your machine.
   the panel refuses a mismatched daemon rather than rendering it wrong.
 - **Defaults.** They are embedded in the binary and only fill missing keys, so
   a changed default reaches new installs, not existing personal configs.
+- **Release binary.** Run `scripts/package-release` after the source and version
+  are final. Commit `dist/release.json` and the binary together. The script
+  records the size and SHA-256 digest that both the installer and updater
+  require.
 
 ## Model gates
 

@@ -13,19 +13,27 @@ use std::{
 pub trait CommandExt {
     fn bounded_output(&mut self) -> io::Result<Output>;
     fn bounded_status(&mut self) -> io::Result<ExitStatus>;
+    fn bounded_output_for(&mut self, timeout: Duration) -> io::Result<Output>;
+    fn bounded_status_for(&mut self, timeout: Duration) -> io::Result<ExitStatus>;
 }
 
 impl CommandExt for Command {
     fn bounded_output(&mut self) -> io::Result<Output> {
+        self.bounded_output_for(Duration::from_secs(5))
+    }
+    fn bounded_output_for(&mut self, timeout: Duration) -> io::Result<Output> {
         let child = self
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        wait(child, &AtomicBool::new(false), Duration::from_secs(5)).map_err(io::Error::other)
+        wait(child, &AtomicBool::new(false), timeout).map_err(io::Error::other)
     }
     fn bounded_status(&mut self) -> io::Result<ExitStatus> {
         self.bounded_output().map(|output| output.status)
+    }
+    fn bounded_status_for(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
+        self.bounded_output_for(timeout).map(|output| output.status)
     }
 }
 

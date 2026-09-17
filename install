@@ -132,8 +132,6 @@ fi
 declare -a packages=()
 want_package() { pacman -Qq "$1" >/dev/null 2>&1 || packages+=("$1"); }
 
-[[ -x "$HOME/.cargo/bin/cargo" ]] && PATH="$HOME/.cargo/bin:$PATH"
-command -v cargo >/dev/null 2>&1 || want_package rust
 want_package python
 want_package jq
 want_package pipewire-audio
@@ -153,8 +151,12 @@ say 'Plan'
 ((${#packages[@]})) && step "install packages: ${packages[*]}"
 ((need_hotkey)) && step "write the hotkey to $hotkey_file"
 ((need_bindings)) && step "add require(\"omaflow\") to $bindings"
-step 'build OmaFlow and link it (./link-local)'
-step 'download no models; choose a speech model afterwards in Settings -> Speech'
+step 'install the bundled OmaFlow binary and desktop integration'
+if ((first_install)); then
+  step 'download no models; choose a speech model afterwards in Settings -> Speech'
+else
+  step 'preserve the existing model configuration and download no models'
+fi
 
 if ((dry_run)); then
   printf '\nDry run, nothing changed.\n'
@@ -183,10 +185,8 @@ if ((${#packages[@]})); then
   run sudo pacman -S --needed --noconfirm "${packages[@]}"
 fi
 
-# Build once before the shortcut helper writes the complete TOML. link-local
-# reuses this build and performs the actual desktop integration.
-cargo build --locked --release --manifest-path "$repo_dir/Cargo.toml"
-"$repo_dir/target/release/omaflow" config-init
+"$repo_dir/scripts/install-release"
+"$HOME/.local/lib/omaflow/current/omaflow" config-init
 
 # --- 5. Hotkey --------------------------------------------------------------
 if ((need_hotkey)); then
@@ -211,11 +211,11 @@ if ((need_bindings)); then
 fi
 
 # --- 6. Build and link ------------------------------------------------------
-say 'Building and linking OmaFlow'
+say 'Linking OmaFlow'
 if ((first_install)); then
-  "$repo_dir/link-local" --no-models
+  "$repo_dir/link-local" --bundled --no-models
 else
-  "$repo_dir/link-local"
+  "$repo_dir/link-local" --bundled
 fi
 
 # --- 7. Tell the truth about the result -------------------------------------
@@ -240,17 +240,11 @@ else
   problems=1
 fi
 
-# The daily update check runs git in a stripped environment; prove it works now
-# rather than letting the panel report a fetch error tomorrow.
-if GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -oBatchMode=yes' \
-  git -C "$repo_dir" fetch --quiet origin 2>/dev/null; then
-  step 'updates can be fetched'
+if ((first_install)); then
+  step 'no model configured yet; choose one in Settings -> Speech'
 else
-  printf '  Updates cannot be fetched without a password. Set up gh or an SSH key,\n' >&2
-  printf '  otherwise the panel will show a fetch error instead of new releases.\n' >&2
+  step 'the existing model configuration is preserved'
 fi
-
-step 'no model configured yet; choose one in Settings -> Speech'
 
 if ((problems)); then
   printf '\nOmaFlow is installed but not healthy. Fix the failures above.\n' >&2
@@ -261,5 +255,9 @@ hotkey_display="$(sed -n 's/^local omaflow_hotkey = { //p' "$hotkey_file" 2>/dev
   tr -d '",' | sed 's/ }//' | sed 's/ / + /g')"
 say 'Done'
 printf 'OmaFlow is installed. Your hotkey is %s.\n' "${hotkey_display:-your hotkey}"
-printf 'Next step: open the OmaFlow panel and pick a speech model in Settings -> Speech.\n'
-printf 'It downloads there, with its size and hardware needs shown before you commit.\n'
+if ((first_install)); then
+  printf 'Next step: open the OmaFlow panel and pick a speech model in Settings -> Speech.\n'
+  printf 'It downloads there, with its size and hardware needs shown before you commit.\n'
+else
+  printf 'OmaFlow is ready with your existing settings.\n'
+fi
