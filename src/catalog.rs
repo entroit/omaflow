@@ -199,6 +199,7 @@ pub fn selection_settings(kind: Kind, entry: &CatalogEntry) -> Value {
             "speech_health_endpoint": "",
         }),
         Kind::Cleanup => json!({
+            "cleanup_engine": "ollama",
             "cleanup_model": entry.id,
             "cleanup_endpoint": CLEANUP_ENDPOINT,
         }),
@@ -776,6 +777,7 @@ mod tests {
                         "speech_model",
                         "speech_endpoint",
                         "speech_health_endpoint",
+                        "cleanup_engine",
                         "cleanup_model",
                         "cleanup_endpoint"
                     ]

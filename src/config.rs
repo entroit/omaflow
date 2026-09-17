@@ -112,6 +112,7 @@ pub struct SegmentTier {
 #[serde(default)]
 pub struct Cleanup {
     pub enabled: bool,
+    pub engine: String,
     pub endpoint: String,
     pub model: String,
     pub timeout_seconds: u64,
@@ -202,6 +203,7 @@ impl Default for Cleanup {
     fn default() -> Self {
         Self {
             enabled: false,
+            engine: "ollama".into(),
             endpoint: "http://127.0.0.1:11434/api/chat".into(),
             model: "gemma4:e4b".into(),
             timeout_seconds: 30,
@@ -311,6 +313,7 @@ impl Config {
             let mut updates = Vec::new();
             for (key, value) in fields {
                 let (section, field) = match key.as_str() {
+                    "cleanup_engine" => ("cleanup", "engine"),
                     "cleanup_model" => ("cleanup", "model"),
                     "cleanup_endpoint" => ("cleanup", "endpoint"),
                     "cleanup_api_key" => ("cleanup", "api_key"),
@@ -502,8 +505,17 @@ impl Config {
         {
             return Err("Speech health endpoint must be HTTP or HTTPS".into());
         }
-        if !self.cleanup.endpoint.ends_with("/api/chat") {
-            return Err("Ollama cleanup endpoint must end in /api/chat".into());
+        match self.cleanup.engine.as_str() {
+            "ollama" if !self.cleanup.endpoint.ends_with("/api/chat") => {
+                return Err("Ollama cleanup endpoint must end in /api/chat".into());
+            }
+            "openai" if !self.cleanup.endpoint.ends_with("/v1/chat/completions") => {
+                return Err(
+                    "OpenAI-compatible cleanup endpoint must end in /v1/chat/completions".into(),
+                );
+            }
+            "ollama" | "openai" => {}
+            _ => return Err("Cleanup engine must be ollama or openai".into()),
         }
         if self.backend.language.is_empty()
             || self.backend.language.len() > 32
@@ -667,6 +679,21 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_engine_defaults_to_ollama_and_requires_its_matching_path() {
+        let mut config = Config::default();
+        assert_eq!(config.cleanup.engine, "ollama");
+        assert!(config.validate().is_ok());
+
+        config.cleanup.engine = "openai".into();
+        assert!(config.validate().is_err());
+        config.cleanup.endpoint = "https://gateway.example/v1/chat/completions".into();
+        assert!(config.validate().is_ok());
+
+        config.cleanup.engine = "unknown".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn safely_replaces_multiline_vocabulary() {
         let source = "[cleanup] # comment\ncustom_vocabulary = [\n  \"Alice\",\n  \"Bob\",\n]\nsystem_prompt = '''\n[section-like prompt]\n'''\n";
         let updated =
@@ -770,6 +797,7 @@ mod tests {
         assert_eq!(config.cleanup.temperature, 0.0);
         assert_eq!(config.cleanup.num_ctx, 16_384);
         assert_eq!(config.cleanup.model, "gemma4:e4b");
+        assert_eq!(config.cleanup.engine, "ollama");
         assert!(!config.cleanup.enabled);
     }
 }

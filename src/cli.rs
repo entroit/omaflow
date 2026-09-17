@@ -237,6 +237,20 @@ pub fn run() -> ExitCode {
                 }
             }
         }
+        "test-cleanup" => {
+            let report = match Config::load() {
+                Ok(config) => crate::cleanup::test_connection(&config),
+                Err(_) => {
+                    serde_json::json!({"ok":false,"kind":"configuration","message":"Could not load saved configuration. Fix the configuration before testing."})
+                }
+            };
+            println!("{report}");
+            if report["ok"] == true {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         "cleanup" => {
             let mut input = String::new();
             let result = std::io::stdin()
@@ -281,7 +295,7 @@ Settings: vocabulary-add TERM, vocabulary-remove TERM, configure KEY JSON
 Models: model-catalog, model-select speech|cleanup ID,
         model-install speech|cleanup ID, configure models JSON
 Microphone: meter-gate DB, meter-preview-start, meter-preview-stop
-Evaluation: cleanup < text, evaluate < JSON, segment-file FILE.wav
+Evaluation: cleanup < text, evaluate < JSON, segment-file FILE.wav, test-cleanup
 Maintenance: daemon, launch, quit, reload-config, effective-config,
              version, check-update"
     );
@@ -308,10 +322,15 @@ fn resolve_entry(
 
 fn model_catalog() -> ExitCode {
     let result = Config::load().and_then(|config| {
+        let installed_cleanup = if config.cleanup.engine == "ollama" {
+            catalog::installed_cleanup_ids(&config.cleanup.endpoint)
+        } else {
+            Vec::new()
+        };
         serde_json::to_string(&catalog::to_json(
             &config,
             &catalog::installed_speech_ids(),
-            &catalog::installed_cleanup_ids(&config.cleanup.endpoint),
+            &installed_cleanup,
         ))
         .map_err(|error| error.to_string())
     });

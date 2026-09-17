@@ -144,10 +144,11 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
 
 
     def models(case, runtime, state, send):
-        update = {"speech_engine":"openai", "speech_model":"test-whisper", "speech_endpoint":"http://127.0.0.1:18765/v1/audio/transcriptions", "cleanup_model":"test-cleanup"}
+        update = {"speech_engine":"openai", "speech_model":"test-whisper", "speech_endpoint":"http://127.0.0.1:18765/v1/audio/transcriptions", "cleanup_engine":"openai", "cleanup_model":"test-cleanup", "cleanup_endpoint":"http://127.0.0.1:18765/v1/chat/completions"}
         send('configure:' + json.dumps({"key":"models","value":update}))
         wait_until(lambda: state()["model_settings"]["speech_model"] == "test-whisper")
         assert state()["cleanup_model"] == "test-cleanup"
+        assert state()["model_settings"]["cleanup_engine"] == "openai"
         before = (case/'config.toml').read_bytes()
         send('configure:' + json.dumps({"key":"models","value":{"speech_engine":"unsupported"}}))
         wait_until(lambda: state()["feedback_error"])

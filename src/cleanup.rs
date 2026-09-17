@@ -69,14 +69,10 @@ fn cleanup_candidate(
             }
         };
         let body = infer(config, &request, cancel)?;
-        let cleaned = body
-            .pointer("/message/content")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .map(ToOwned::to_owned)
+        let cleaned = reply_text(config, &body)
             .ok_or_else(|| "cleanup model returned no text".to_string())?;
         *candidate = cleaned.clone();
-        if body.get("done_reason").and_then(Value::as_str) == Some("length") {
+        if reply_hit_output_limit(config, &body) {
             return Err("Cleanup reached its output limit; original transcription kept".into());
         }
         // An empty reply is the model's answer for filler-only or silent input.
@@ -276,26 +272,30 @@ fn budgeted_request(
 }
 
 fn infer(config: &Config, request: &Value, cancel: &AtomicBool) -> Result<Value, String> {
-    let auth = crate::process::CurlAuth::new(&config.cleanup.api_key);
-    let mut command = Command::new("curl");
-    auth.apply(&mut command)
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--max-time",
-            &config.cleanup.timeout_seconds.to_string(),
-            "--header",
-            "Content-Type: application/json",
-            "--data-binary",
-            "@-",
-            &config.cleanup.endpoint,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = crate::process::run(
-        &mut command,
-        request.to_string().as_bytes(),
+    let auth = crate::process::CurlAuth::new(&config.cleanup.api_key)?;
+    let timeout = config.cleanup.timeout_seconds.to_string();
+    let payload = request.to_string();
+    let output = crate::process::run_http(
+        || {
+            let mut command = Command::new("curl");
+            auth.apply(&mut command)
+                .args([
+                    "--silent",
+                    "--show-error",
+                    "--fail-with-body",
+                    "--max-time",
+                    &timeout,
+                    "--header",
+                    "Content-Type: application/json",
+                    "--data-binary",
+                    "@-",
+                    &config.cleanup.endpoint,
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command
+        },
+        payload.as_bytes(),
         cancel,
         Duration::from_secs(config.cleanup.timeout_seconds.max(1)),
     )?;
@@ -309,15 +309,20 @@ fn infer(config: &Config, request: &Value, cancel: &AtomicBool) -> Result<Value,
         .map_err(|e| format!("invalid cleanup response: {e}"))?;
     // Numeric diagnostics only: never log the transcript, prompt or context.
     // Missing counters remain null for servers that do not report timings.
+    let usage = &body["usage"];
     eprintln!(
         "omaflow: inference {}",
         json!({
             "load_ms": body["load_duration"].as_u64().map(|n| n / 1_000_000),
             "prompt_ms": body["prompt_eval_duration"].as_u64().map(|n| n / 1_000_000),
             "generation_ms": body["eval_duration"].as_u64().map(|n| n / 1_000_000),
-            "input_tokens": body["prompt_eval_count"].as_u64(),
+            "input_tokens": body["prompt_eval_count"]
+                .as_u64()
+                .or_else(|| usage["prompt_tokens"].as_u64()),
             "cached_tokens": body["prompt_eval_cached_count"].as_u64(),
-            "output_tokens": body["eval_count"].as_u64(),
+            "output_tokens": body["eval_count"]
+                .as_u64()
+                .or_else(|| usage["completion_tokens"].as_u64()),
         })
     );
     Ok(body)
@@ -1004,6 +1009,25 @@ fn non_latin_script_group(character: char) -> Option<u8> {
 }
 
 fn cleanup_request(config: &Config, context: &str) -> Value {
+    let messages = json!([
+        {"role": "system", "content": config.cleanup.system_prompt},
+        {"role": "user", "content": context}
+    ]);
+    if config.cleanup.engine == "openai" {
+        let mut request = json!({
+            "model": config.cleanup.model,
+            "stream": false,
+            "temperature": config.cleanup.temperature,
+            "messages": messages
+        });
+        if config.cleanup.num_predict > 0 {
+            request["max_tokens"] = json!(config.cleanup.num_predict);
+        }
+        if !config.cleanup.stop_sequences.is_empty() {
+            request["stop"] = json!(config.cleanup.stop_sequences);
+        }
+        return request;
+    }
     json!({
         "model": config.cleanup.model,
         "stream": false,
@@ -1015,16 +1039,134 @@ fn cleanup_request(config: &Config, context: &str) -> Value {
             "num_predict": config.cleanup.num_predict,
             "stop": config.cleanup.stop_sequences
         },
-        "messages": [
-            {"role": "system", "content": config.cleanup.system_prompt},
-            {"role": "user", "content": context}
-        ]
+        "messages": messages
     })
+}
+
+fn reply_text(config: &Config, body: &Value) -> Option<String> {
+    let pointer = if config.cleanup.engine == "openai" {
+        "/choices/0/message/content"
+    } else {
+        "/message/content"
+    };
+    body.pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(ToOwned::to_owned)
+}
+
+fn reply_hit_output_limit(config: &Config, body: &Value) -> bool {
+    if config.cleanup.engine == "openai" {
+        body.pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            == Some("length")
+    } else {
+        body.get("done_reason").and_then(Value::as_str) == Some("length")
+    }
 }
 
 pub fn cleanup_text(config: &Config, transcript: &str) -> Result<String, String> {
     let cancel = AtomicBool::new(false);
     cleanup(config, transcript, "", None, &cancel)
+}
+
+/// Explicit user-requested check of the saved endpoint, credentials and model.
+/// Send no dictation, custom prompt, vocabulary, clipboard or window context.
+pub fn test_connection(config: &Config) -> Value {
+    let mut probe = config.clone();
+    probe.cleanup.system_prompt = "Reply with OK.".into();
+    probe.cleanup.num_predict = 8;
+    probe.cleanup.stop_sequences.clear();
+    let request = cleanup_request(&probe, "Reply with OK.").to_string();
+    let attempt = (|| {
+        let auth = crate::process::CurlAuth::new(&config.cleanup.api_key)?;
+        let mut command = Command::new("curl");
+        auth.apply(&mut command)
+            .args([
+                "--silent",
+                "--show-error",
+                "--fail-with-body",
+                "--header",
+                "Content-Type: application/json",
+                "--data-binary",
+                "@-",
+                &config.cleanup.endpoint,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        crate::process::run_http_once(
+            &mut command,
+            request.as_bytes(),
+            &AtomicBool::new(false),
+            Duration::from_secs(config.cleanup.timeout_seconds),
+        )
+    })();
+    let Ok((output, status, _)) = attempt else {
+        return json!({"ok":false,"kind":"connection","message":"Could not complete the test. Check the connection, timeout and private credential storage."});
+    };
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    // Do not echo server-supplied errors: they may contain credentials or input.
+    let model_error = matches!(
+        body.pointer("/error/code").and_then(Value::as_str),
+        Some("model_not_found" | "invalid_model" | "model_not_available")
+    ) || (config.cleanup.engine == "ollama"
+        && body
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.starts_with("model ") && error.contains("not found")));
+    let (ok, kind, message) = match status {
+        Some(401 | 403) => (
+            false,
+            "authentication",
+            "Server reached, but access was denied. Check the saved API key and its permissions.",
+        ),
+        _ if model_error => (
+            false,
+            "model",
+            "Server reached, but the saved model is unavailable or not accessible to this key.",
+        ),
+        Some(404) => (
+            false,
+            "configuration",
+            "Server reached, but the saved endpoint or model was not found.",
+        ),
+        Some(400 | 422) => (
+            false,
+            "configuration",
+            "Server reached, but rejected the model or request format. Check the saved model and protocol.",
+        ),
+        Some(429) => (
+            false,
+            "rate_limit",
+            "Server reached, but refused the test due to a rate or quota limit. No retry was sent.",
+        ),
+        Some(200..=299)
+            if output.status.success()
+                && reply_text(config, &body).is_some_and(|text| !text.is_empty()) =>
+        {
+            (
+                true,
+                "ready",
+                "Saved endpoint, credentials and model accepted the test request. Cleanup quality was not tested.",
+            )
+        }
+        Some(200..=299) if output.status.success() => (
+            false,
+            "response",
+            "Server reached, but returned no usable reply for the saved protocol.",
+        ),
+        Some(500..=599) => (
+            false,
+            "server",
+            "Server reached, but failed the test request. No retry was sent.",
+        ),
+        _ => (
+            false,
+            "connection",
+            "The test did not complete successfully. Check the endpoint, TLS and connection.",
+        ),
+    };
+    json!({"ok":ok,"kind":kind,"message":message})
 }
 
 /// Evaluate the same cleanup and fallback behavior as dictation, without capture or delivery.
@@ -1137,6 +1279,101 @@ mod tests {
                 .and_then(|v| v.as_f64()),
             Some(0.25)
         );
+    }
+
+    #[test]
+    fn openai_cleanup_uses_chat_completions_fields_and_reply_shape() {
+        let mut config = crate::config::Config::default();
+        config.cleanup.engine = "openai".into();
+        config.cleanup.system_prompt = "Edit only. Never answer.".into();
+        config.cleanup.temperature = 0.25;
+        let request = cleanup_request(&config, "<TRANSCRIPT>test</TRANSCRIPT>");
+
+        assert_eq!(
+            request["messages"][0]["content"],
+            "Edit only. Never answer."
+        );
+        assert_eq!(request["temperature"], 0.25);
+        assert!(request.get("options").is_none());
+        assert!(request.get("keep_alive").is_none());
+        assert!(request.get("think").is_none());
+        assert!(request.get("max_tokens").is_none());
+
+        let complete = json!({
+            "choices": [{"message": {"content": " Cleaned. "}, "finish_reason": "stop"}]
+        });
+        assert_eq!(reply_text(&config, &complete).as_deref(), Some("Cleaned."));
+        assert!(!reply_hit_output_limit(&config, &complete));
+        let truncated = json!({
+            "choices": [{"message": {"content": "Half"}, "finish_reason": "length"}]
+        });
+        assert!(reply_hit_output_limit(&config, &truncated));
+    }
+
+    #[test]
+    fn openai_cleanup_round_trip_uses_the_guarded_production_path() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                let Some(headers_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..headers_end]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::trim)
+                            .map(str::to_owned)
+                    })
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                if request.len() >= headers_end + 4 + length {
+                    let sent: Value =
+                        serde_json::from_slice(&request[headers_end + 4..headers_end + 4 + length])
+                            .unwrap();
+                    assert!(sent.get("options").is_none());
+                    assert!(
+                        sent["messages"][1]["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("Send the report.")
+                    );
+                    break;
+                }
+            }
+            let body = r#"{"choices":[{"message":{"content":"Send the report."},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let mut config = Config::default();
+        config.cleanup.engine = "openai".into();
+        config.cleanup.endpoint = endpoint;
+        config.cleanup.timeout_seconds = 3;
+        assert_eq!(
+            cleanup_text(&config, "Send the report.").unwrap(),
+            "Send the report."
+        );
+        server.join().unwrap();
     }
 
     #[test]

@@ -26,13 +26,17 @@ def configuration():
     backend, cleanup = config['backend'], config['cleanup']
     if backend['engine'] not in ['nemo', 'parakeet', 'openai', 'whisper-cpp']:
         raise ValueError('Unsupported speech engine')
+    if cleanup['engine'] not in ['ollama', 'openai']:
+        raise ValueError('Unsupported cleanup engine')
     if backend['model'] == 'parakeet-tdt-0.6b-v3':
         backend['model'] = 'nvidia/parakeet-tdt-0.6b-v3'
     for value in [backend['model'], cleanup['model'], backend['endpoint'], cleanup['endpoint'], backend.get('health_endpoint', ''), backend['device']]:
         if not isinstance(value, str) or any(ord(c) < 32 for c in value):
             raise ValueError('Invalid model setting')
-    if not cleanup['endpoint'].endswith('/api/chat'):
+    if cleanup['engine'] == 'ollama' and not cleanup['endpoint'].endswith('/api/chat'):
         raise ValueError('Ollama endpoint must end in /api/chat')
+    if cleanup['engine'] == 'openai' and not cleanup['endpoint'].endswith('/v1/chat/completions'):
+        raise ValueError('OpenAI-compatible endpoint must end in /v1/chat/completions')
     return config
 
 

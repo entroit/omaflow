@@ -952,6 +952,7 @@ impl Daemon {
                 "speech_health_endpoint": self.effective_config.backend.health_endpoint,
                 "speech_language": self.effective_config.backend.language,
                 "speech_device": self.effective_config.backend.device,
+                "cleanup_engine": self.effective_config.cleanup.engine,
                 "cleanup_model": self.effective_config.cleanup.model,
                 "cleanup_endpoint": self.effective_config.cleanup.endpoint,
                 // The keys themselves never leave the process: this file is a
@@ -1257,7 +1258,9 @@ fn start_status_worker(config: Config, messages: mpsc::Sender<Message>) {
                 current.cleanup.enabled && cleanup_server_available(&current.cleanup);
             // Asking Ollama about every catalog model spawns a process each,
             // so it runs far less often than the rest of this poll.
-            if current.cleanup.enabled
+            if current.cleanup.engine != "ollama" {
+                installed_cleanup = None;
+            } else if current.cleanup.enabled
                 && installed_cleanup
                     .as_ref()
                     .is_none_or(|(_, checked): &(Vec<String>, Instant)| {
@@ -1281,7 +1284,7 @@ fn start_status_worker(config: Config, messages: mpsc::Sender<Message>) {
                     current.cleanup.enabled,
                     endpoint_answers,
                     catalog::endpoint_is_local(&current.cleanup.endpoint),
-                    catalog::ollama_on_path(),
+                    current.cleanup.engine != "ollama" || catalog::ollama_on_path(),
                 ),
                 installed_speech: catalog::installed_speech_ids(),
                 installed_cleanup: installed_cleanup
@@ -1319,27 +1322,47 @@ fn cleanup_runtime(
 }
 
 fn cleanup_server_available(config: &crate::config::Cleanup) -> bool {
-    let Some((base, _)) = config.endpoint.split_once("/api/") else {
+    let endpoint = if config.engine == "openai" {
+        config.endpoint.clone()
+    } else {
+        let Some((base, _)) = config.endpoint.split_once("/api/") else {
+            return false;
+        };
+        format!("{base}/api/tags")
+    };
+    let Ok(auth) = crate::process::CurlAuth::new(&config.api_key) else {
         return false;
     };
-    let auth = crate::process::CurlAuth::new(&config.api_key);
     auth.apply(&mut Command::new("curl"))
         .args([
             "--silent",
-            "--fail",
             "--max-time",
             "1",
-            &format!("{base}/api/tags"),
+            "--output",
+            "/dev/null",
+            "--write-out",
+            "%{http_code}",
+            &endpoint,
         ])
-        .bounded_status()
-        .is_ok_and(|status| status.success())
+        .bounded_output()
+        .ok()
+        .is_some_and(|output| {
+            let code = String::from_utf8_lossy(&output.stdout);
+            output.status.success()
+                && (code.starts_with('2') || (config.engine == "openai" && code == "405"))
+        })
 }
 
 fn cleanup_model_loaded(config: &crate::config::Cleanup) -> bool {
+    if config.engine != "ollama" {
+        return false;
+    }
     let Some(base) = config.endpoint.strip_suffix("/api/chat") else {
         return false;
     };
-    let auth = crate::process::CurlAuth::new(&config.api_key);
+    let Ok(auth) = crate::process::CurlAuth::new(&config.api_key) else {
+        return false;
+    };
     auth.apply(&mut Command::new("curl"))
         .args([
             "--silent",

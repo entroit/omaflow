@@ -4,6 +4,7 @@ Does not run dictation, copy text, change settings, or replace the live shell.
 Layer-shell placement and physical keyboard/audio tests remain desktop checks.
 """
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -35,11 +36,11 @@ with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
     a=s.index('  BarIconButton {'); b=s.index('  component Waveform:',a); s=s[:a]+s[b:]
     s=s[:-2]+'''
       Component.onCompleted: {
-        root.stateVersion = 2; root.connected = true
+        root.stateVersion = 3; root.connected = true
         root.asrRunning = true; root.cleanupLoaded = true; root.cleanupAvailable = true
         root.trainingLogEnabled = true; root.gpuMemoryMib = 6300
         root.runningVersion = "0.14.0"; root.hotkeyDisplay = "AltGr + Menu"
-        root.modelSettings = {configured:true,speech_engine:"nemo",speech_model:"nvidia/parakeet-tdt-0.6b-v3",speech_endpoint:"http://127.0.0.1:18103/v1/audio/transcriptions",speech_device:"cuda",speech_language:"auto",cleanup_model:"gemma4:e4b",cleanup_endpoint:"http://127.0.0.1:11434/api/chat"}
+        root.modelSettings = {configured:true,speech_engine:"nemo",speech_model:"nvidia/parakeet-tdt-0.6b-v3",speech_endpoint:"http://127.0.0.1:18103/v1/audio/transcriptions",speech_device:"cuda",speech_language:"auto",cleanup_engine:"ollama",cleanup_model:"gemma4:e4b",cleanup_endpoint:"http://127.0.0.1:11434/api/chat"}
         root.cleanupEnabled = true; root.cleanupRuntime = "ready"; root.duckAudioPercent = 70
         root.modelCatalog = {
           speech: [
@@ -80,6 +81,9 @@ with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
           root.modelSettings = Object.assign({}, root.modelSettings, {speech_engine:"openai",
             speech_endpoint:"http://127.0.0.1:8000/v1/audio/transcriptions", speech_model:"my-whisper"}) }
         if (auditMode === "settings-cleanup-custom") { root.settingsTab="cleanup"; root.editCleanupModel=true }
+        if (auditMode === "settings-cleanup-openai") { root.settingsTab="cleanup"; root.editCleanupModel=true
+          root.modelSettings = Object.assign({}, root.modelSettings, {cleanup_engine:"openai",
+            cleanup_endpoint:"http://127.0.0.1:4000/v1/chat/completions", cleanup_model:"my-model"}) }
         if (auditMode === "settings-cleanup-off") { root.settingsTab="cleanup"; root.cleanupEnabled=false }
         if (auditMode === "settings-cleanup-no-ollama") { root.settingsTab="cleanup"; root.cleanupRuntime="missing" }
         if (auditMode === "hotkey") { root.phase="idle"; root.idlePage="settings"; root.settingsTab="general"; root.editShortcut=true }
@@ -141,11 +145,60 @@ with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
 
     for component in ROOT.glob("*.qml"):
         if component.name != "OmaFlow.qml": (p/component.name).write_text(component.read_text())
-    for mode in ["history","empty","first-run","detail","settings-cleanup","settings-cleanup-custom","settings-cleanup-off","settings-cleanup-no-ollama","settings-models","settings-models-custom","settings-models-server","settings-models-pending","settings-models-downloading","settings-audio","settings-vocabulary","settings-privacy","settings-general","settings-update","hotkey","recording","recording-held","processing","result","warning","success","notice","error"]:
+    for mode in ["history","empty","first-run","detail","settings-cleanup","settings-cleanup-custom","settings-cleanup-openai","settings-cleanup-off","settings-cleanup-no-ollama","settings-models","settings-models-custom","settings-models-server","settings-models-pending","settings-models-downloading","settings-audio","settings-vocabulary","settings-privacy","settings-general","settings-update","hotkey","recording","recording-held","processing","result","warning","success","notice","error"]:
         result = subprocess.run(["quickshell","-p",str(p)], env=dict(os.environ, QT_QPA_PLATFORM="offscreen", AUDIT_MODE=mode, OMAFLOW_UI_OUTPUT=str(output)), capture_output=True, text=True, timeout=10)
         log = result.stdout+result.stderr
         (output/(mode+".log")).write_text(log)
         if result.returncode or " ERROR:" in log or "Unable to assign" in log or "ReferenceError" in log or "Error:" in log or not (output/(mode+".png")).is_file():
             raise SystemExit(log)
         print("PASS render", mode, flush=True)
+
+    # Exercise the real EndpointTester process and result handling, not just
+    # its appearance. The CLI is stubbed so no network or saved settings are used.
+    commands = p / "bin"
+    commands.mkdir()
+    stub = commands / "omaflow"
+    stub.write_text('''#!/usr/bin/python3
+import os, sys
+assert sys.argv[1:] == ["test-cleanup"], sys.argv
+print(os.environ["AUDIT_PROBE_RESULT"])
+''')
+    stub.chmod(0o755)
+    (p / "shell.qml").write_text('''import QtQuick
+import QtQuick.Window
+import Quickshell
+ShellRoot {
+  Window {
+    width: 560; height: 200; visible: true
+    EndpointTester {
+      id: tester
+      anchors.fill: parent
+      cleanupTest: true
+      Component.onCompleted: Qt.callLater(function() { tester.check() })
+      onStatusChanged: if (status.length > 0) {
+        console.log("PROBE_RESULT " + JSON.stringify({failed: failed, status: status}))
+        Qt.quit()
+      }
+    }
+    Timer { interval: 3000; running: true; onTriggered: { console.error("Probe timed out"); Qt.quit() } }
+  }
+}
+''')
+    for payload, expected in [
+        (json.dumps({"ok": True, "message": "Saved model accepted"}), False),
+        (json.dumps({"ok": False, "message": "Credentials denied"}), True),
+        (json.dumps({"ok": False, "message": "Model unavailable"}), True),
+        ("not-json", True),
+    ]:
+        result = subprocess.run(["quickshell", "-p", str(p)],
+            env=dict(os.environ, QT_QPA_PLATFORM="offscreen", PATH=f"{commands}:" + os.environ["PATH"],
+                     AUDIT_PROBE_RESULT=payload), capture_output=True, text=True, timeout=6)
+        log = result.stdout + result.stderr
+        reports = [line.split("PROBE_RESULT ", 1)[1] for line in log.splitlines() if "PROBE_RESULT " in line]
+        assert result.returncode == 0 and reports, log
+        report = json.loads(reports[-1])
+        assert report["failed"] == expected, report
+        if payload != "not-json":
+            assert report["status"] == json.loads(payload)["message"], report
+        print("PASS saved-model test UI", payload, flush=True)
 print(output)

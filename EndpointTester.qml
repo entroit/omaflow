@@ -14,6 +14,7 @@ RowLayout {
   id: tester
 
   property string url: ""
+  property bool cleanupTest: false
   property string status: ""
   property bool failed: false
   property bool busy: probe.running
@@ -21,20 +22,21 @@ RowLayout {
   spacing: Style.space(8)
 
   function check() {
-    if (tester.url.trim().length === 0) {
+    if (!tester.cleanupTest && tester.url.trim().length === 0) {
       tester.failed = true
       tester.status = "Enter an address first."
       return
     }
     tester.status = ""
     tester.failed = false
-    probe.command = ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+    probe.command = tester.cleanupTest ? ["omaflow", "test-cleanup"]
+      : ["curl", "--disable", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
       "--max-time", "5", tester.url.trim()]
     probe.running = true
   }
 
   ActionButton {
-    text: tester.busy ? "Testing…" : "Test connection"
+    text: tester.busy ? "Testing…" : tester.cleanupTest ? "Test saved cleanup model" : "Test connection"
     enabled: !tester.busy
     foreground: Color.popups.text
     bordered: true
@@ -56,6 +58,17 @@ RowLayout {
     id: probe
     stdout: StdioCollector {
       onStreamFinished: {
+        if (tester.cleanupTest) {
+          try {
+            var report = JSON.parse(text)
+            tester.failed = report.ok !== true
+            tester.status = report.message || "The test returned no result."
+          } catch (_) {
+            tester.failed = true
+            tester.status = "Could not run the saved-model test. Check that OmaFlow is installed and up to date."
+          }
+          return
+        }
         var code = parseInt(text.trim(), 10)
         if (code >= 200 && code < 300) {
           tester.failed = false
@@ -63,6 +76,9 @@ RowLayout {
         } else if (code === 405) {
           tester.failed = false
           tester.status = "Answered 405, which is what a POST-only endpoint should say. Good."
+        } else if (code === 401 || code === 403) {
+          tester.failed = true
+          tester.status = "Server reached, but access was denied. This reachability check does not send an API key."
         } else if (code === 404) {
           // A transcription path that only accepts POST often answers 404 to a
           // GET. The daemon treats 404 as unreachable, so this really is a

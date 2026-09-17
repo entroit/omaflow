@@ -25,6 +25,7 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked --release
+python3 tools/http_test.py
 python3 tools/runtime_test.py
 python3 tools/platform_test.py
 python3 tools/installation_test.py

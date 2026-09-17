@@ -13,6 +13,7 @@ ColumnLayout {
 
   required property var flow
   readonly property bool on: page.flow.cleanupEnabled && page.flow.writingStyle !== "verbatim"
+  property string engine: page.flow.modelSettings.cleanup_engine || "ollama"
   readonly property string ollamaCommand:
     page.flow.cleanupRuntime === "missing"
       ? "sudo pacman -S --needed ollama-vulkan && sudo systemctl enable --now ollama"
@@ -26,7 +27,11 @@ ColumnLayout {
     if (url.length > 2048) return "At most 2048 characters."
     if (/\s/.test(url)) return "No spaces."
     if (url.indexOf("http://") !== 0 && url.indexOf("https://") !== 0) return "Must start with http:// or https://."
-    if (!/\/api\/chat$/.test(url)) return "The address has to end in /api/chat."
+    if (page.engine === "openai") {
+      if (!/\/v1\/chat\/completions$/.test(url)) return "The address has to end in /v1/chat/completions."
+    } else if (!/\/api\/chat$/.test(url)) {
+      return "The address has to end in /api/chat."
+    }
     return ""
   }
 
@@ -72,9 +77,11 @@ ColumnLayout {
           Layout.fillWidth: true
           textFormat: Text.PlainText
           wrapMode: Text.Wrap
-          text: page.flow.cleanupRuntime === "missing"
-            ? "Cleanup runs on Ollama, which is not installed."
-            : "Ollama is installed but not answering."
+          text: page.engine === "ollama"
+            ? (page.flow.cleanupRuntime === "missing"
+              ? "Cleanup runs on Ollama, which is not installed."
+              : "Ollama is installed but not answering.")
+            : "The cleanup server is not answering."
           color: Color.popups.text
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
@@ -82,6 +89,7 @@ ColumnLayout {
         }
 
         Text {
+          visible: page.engine === "ollama"
           Layout.fillWidth: true
           textFormat: Text.PlainText
           wrapMode: Text.Wrap
@@ -93,6 +101,7 @@ ColumnLayout {
       }
 
       ActionButton {
+        visible: page.engine === "ollama"
         text: "Copy command"
         foreground: Color.popups.text
         bordered: true
@@ -104,11 +113,43 @@ ColumnLayout {
   SettingsHeading {
     visible: page.on
     title: "Cleanup model"
-    note: "Bigger models follow spoken corrections and formatting commands more reliably. Downloads run in the background; you can keep dictating without cleanup while one finishes."
+    note: page.engine === "ollama"
+      ? "Bigger models follow spoken corrections and formatting commands more reliably. Downloads run in the background; you can keep dictating without cleanup while one finishes."
+      : "Choose the model name and full chat-completions address used by your server."
+  }
+
+  Text {
+    visible: page.on
+    Layout.fillWidth: true
+    text: "Cleanup server protocol"
+    color: Util.alpha(Color.popups.text, 0.72)
+    font.family: Style.font.family
+    font.pixelSize: Style.font.caption
+  }
+
+  RowLayout {
+    visible: page.on
+    spacing: Style.space(6)
+
+    ActionButton {
+      text: "Ollama"
+      foreground: Color.popups.text
+      selected: page.engine === "ollama"
+      onClicked: page.engine = "ollama"
+    }
+
+    ActionButton {
+      text: "OpenAI-compatible"
+      foreground: Color.popups.text
+      selected: page.engine === "openai"
+      onClicked: page.engine = "openai"
+    }
+
+    Item { Layout.fillWidth: true }
   }
 
   Repeater {
-    model: page.on ? page.flow.cleanupCatalog : []
+    model: page.on && page.engine === "ollama" ? page.flow.cleanupCatalog : []
 
     ModelCard {
       required property var modelData
@@ -121,7 +162,9 @@ ColumnLayout {
   ActionButton {
     id: customDisclosure
     visible: page.on
-    text: page.flow.editCleanupModel ? "Hide custom model" : "Use another Ollama model…"
+    text: page.flow.editCleanupModel
+      ? "Hide server settings"
+      : (page.engine === "openai" ? "Configure server…" : "Use another Ollama model…")
     foreground: Util.alpha(Color.popups.text, 0.8)
     onClicked: {
       page.flow.editCleanupModel = !page.flow.editCleanupModel
@@ -146,7 +189,9 @@ ColumnLayout {
       Layout.fillWidth: true
       textFormat: Text.PlainText
       wrapMode: Text.Wrap
-      text: "Any tag you have pulled yourself works. Point the endpoint at another machine's Ollama if you run one — the transcript and the window title are sent there, so only use a server you trust."
+      text: page.engine === "openai"
+        ? "The transcript and focused window title go to this server. Optional clipboard context goes too when enabled. Use a server you trust."
+        : "Any tag you have pulled yourself works. Point the endpoint at another machine's Ollama if you run one. The transcript and window title go to that server, so use one you trust."
       color: Util.alpha(Color.popups.text, 0.6)
       font.family: Style.font.family
       font.pixelSize: Style.font.caption
@@ -154,11 +199,13 @@ ColumnLayout {
 
     LabeledField {
       id: cleanupModel
-      label: "Ollama model tag"
+      label: page.engine === "openai" ? "Model" : "Ollama model tag"
       text: page.flow.modelSettings.cleanup_model || ""
-      placeholderText: "qwen3:8b"
+      placeholderText: page.engine === "openai" ? "model-name" : "qwen3:8b"
       maximumLength: 512
-      hint: "Any tag your server already has. Run `ollama list` to see them, `ollama pull` to add one."
+      hint: page.engine === "openai"
+        ? "The model name understood by your server."
+        : "Any tag your server already has. Run `ollama list` to see them, `ollama pull` to add one."
       problem: text.trim().length === 0 ? "A model tag is required."
         : text.length > 512 ? "At most 512 characters."
         : text.trim().indexOf("-") === 0 ? "It cannot start with a dash."
@@ -167,10 +214,14 @@ ColumnLayout {
 
     LabeledField {
       id: cleanupEndpoint
-      label: "Ollama address"
+      label: page.engine === "openai" ? "Server address" : "Ollama address"
       text: page.flow.modelSettings.cleanup_endpoint || ""
-      placeholderText: "http://127.0.0.1:11434/api/chat"
-      hint: "Include the port, and keep the /api/chat path. Another machine's Ollama works, with the port it listens on."
+      placeholderText: page.engine === "openai"
+        ? "http://127.0.0.1:4000/v1/chat/completions"
+        : "http://127.0.0.1:11434/api/chat"
+      hint: page.engine === "openai"
+        ? "Use the full /v1/chat/completions address."
+        : "Include the port and keep the /api/chat path."
       problem: page.endpointProblem(text)
     }
 
@@ -193,9 +244,16 @@ ColumnLayout {
 
     EndpointTester {
       Layout.fillWidth: true
-      // /api/chat only answers POST; the server's root always answers, so it
-      // is the honest question to ask about whether Ollama is there at all.
-      url: cleanupEndpoint.text.replace(/\/api\/chat\/?$/, "/")
+      cleanupTest: true
+    }
+
+    Text {
+      Layout.fillWidth: true
+      wrapMode: Text.Wrap
+      text: "Save changes before testing. The test uses the saved endpoint, model and key, not unsaved fields. It sends one short synthetic prompt and may incur a provider charge. No dictation or clipboard text is sent."
+      color: Util.alpha(Color.popups.text, 0.6)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
     }
 
     ActionButton {
@@ -207,6 +265,7 @@ ColumnLayout {
       tooltipText: page.cleanupReady ? "" : "Fix the fields marked in red first"
       onClicked: {
         var update = {
+          cleanup_engine: page.engine,
           cleanup_model: cleanupModel.text,
           cleanup_endpoint: cleanupEndpoint.text
         }
