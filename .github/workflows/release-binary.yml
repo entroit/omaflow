@@ -14,7 +14,7 @@ jobs:
       - name: Pin the Arch package repository snapshot
         run: printf 'Server = https://archive.archlinux.org/repos/2026/09/17/$repo/os/$arch\n' >/etc/pacman.d/mirrorlist
       - name: Install the recorded build tools
-        run: pacman -Syy --noconfirm base-devel rust jq
+        run: pacman -Syy --noconfirm base-devel git rust jq
       - name: Verify the bundled binary
         run: scripts/package-release --verify
       - name: Test the updater and daemon
