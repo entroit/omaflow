@@ -37,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
     a=s.index('  BarIconButton {'); b=s.index('  component Waveform:',a); s=s[:a]+s[b:]
     s=s[:-2]+'''
       Component.onCompleted: {
-        root.stateVersion = 5; root.connected = true
+        root.stateVersion = 4; root.connected = true
         root.asrRunning = true; root.cleanupLoaded = true; root.cleanupAvailable = true
         root.trainingLogEnabled = true; root.gpuMemoryMib = 6300
         root.runningVersion = "0.14.0"; root.hotkeyDisplay = "AltGr + Menu"
@@ -110,7 +110,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
         if (auditMode === "update-progress") root.updateTransaction={state:"waiting-for-idle",message:"Finishing your dictation first"}
         if (auditMode === "update-failed") root.updateTransaction={state:"rolled-back",message:"The update did not finish. Your previous version is still running."}
         if (auditMode === "update-daemon-down") root.connected=false
-        if (auditMode === "update-migration") root.stateVersion=4
+        if (auditMode === "update-migration") root.stateVersion=3
         if (auditMode === "update-later" && (!root.updateDeferred || !root.updateAttention
             || !root.updateActionsAvailable || !root.laterActionAvailable))
           throw new Error("Later must hide only the home card while preserving badge and Settings actions")

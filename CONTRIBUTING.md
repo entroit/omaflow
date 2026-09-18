@@ -69,9 +69,11 @@ package snapshot, then compares every byte.
 
 - **The cleanup prompt** in `config/config.toml`. Run the four gates below and
   include the numbers in the commit message.
-- **The state file contract** between daemon and panel. Bump `STATE_VERSION`
-  in `src/update.rs` and the `supportedState` check in `OmaFlow.qml` together;
-  the panel refuses a mismatched daemon rather than rendering it wrong.
+- **The state file contract** between daemon and panel. Additive fields must
+  have panel defaults and keep `STATE_VERSION`, so a cached panel and a newly
+  restarted daemon remain compatible while Omarchy reloads the shell. Bump the
+  version in `src/update.rs` and `OmaFlow.qml` together only for a genuinely
+  breaking change, and provide an explicit staged migration for that update.
 - **Defaults.** They are embedded in the binary and only fill missing keys, so
   a changed default reaches new installs, not existing personal configs.
 - **Release binary.** Run `scripts/package-release` after the source and version

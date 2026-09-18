@@ -31,7 +31,7 @@ use store::UpdateLock;
 use update_transaction::{TransactionIdentity, TransactionProgress, UpdateFailure, UpdateSuccess};
 use verified_snapshot::{CANONICAL_REPOSITORY, CATALOG_URL, full_sha, parse_catalog};
 
-pub const STATE_VERSION: u32 = 5;
+pub const STATE_VERSION: u32 = 4;
 pub const RUNNING_VERSION: &str = env!("CARGO_PKG_VERSION");
 const STATE_LIMIT: usize = 256 * 1024;
 const OMARCHY: &str = "/usr/share/omarchy/bin/omarchy";
