@@ -15,6 +15,8 @@ jobs:
       - name: Install the recorded build tools
         run: pacman -Syy --noconfirm base-devel git rust jq
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Trust the mounted checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Verify the bundled binary
         run: scripts/package-release --verify
       - name: Test the updater and daemon
