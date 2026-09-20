@@ -12,8 +12,8 @@ ColumnLayout {
   spacing: Style.space(12)
 
   SettingsHeading {
-    title: "Microphone sensitivity (" + page.flow.meterGateDb + " dB)"
-    note: "Below the marker OmaFlow treats the room as silent. Set it above your room noise and below your voice."
+    title: "Voice indicator (" + page.flow.meterGateDb + " dB)"
+    note: "The marker controls when the meter says Voice detected. All recorded audio still reaches transcription."
   }
 
   Rectangle {
@@ -110,7 +110,7 @@ ColumnLayout {
           value: page.flow.meterGateDb
           background: Rectangle { color: "transparent"; border.width: meterDrag.activeFocus ? 1 : 0; border.color: Color.accent }
           handle: Item {}
-          Accessible.name: "Microphone sensitivity"
+          Accessible.name: "Voice indicator threshold"
           onMoved: pressed ? page.flow.previewMeterGate(value) : page.flow.commitMeterGate(value)
           onPressedChanged: if (!pressed) page.flow.commitMeterGate(value)
         }

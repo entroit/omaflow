@@ -47,13 +47,6 @@ health_endpoint = ""
 api_key = ""
 device = "cuda"
 status_timeout_ms = 60000
-# Transcribe finished segments while recording, after a pause, once this many
-# seconds have accumulated. Only the tail is transcribed after stop. 0 disables.
-live_segment_seconds = 20
-# Experimental: let a longer segment close on a shorter pause, for example
-# [{ seconds = 35, pause_ms = 400 }, { seconds = 50, pause_ms = 250 }].
-# Off by default; judge a rule with tools/segment_compare.py before enabling.
-live_segment_tiers = []
 
 # Natural cleanup is opt-in: with this off OmaFlow transcribes and pastes, and
 # nothing else has to be installed. Turning it on needs Ollama or an

@@ -2,15 +2,20 @@ use crate::cleanup::cleanup;
 pub use crate::cleanup::{cleanup_text, evaluate_text};
 use crate::process::CommandExt;
 use crate::{
-    config::{Config, PasteDelivery, PasteMode, PasteModifier, PasteShortcut, SegmentTier},
+    config::{Config, PasteDelivery, PasteMode, PasteModifier, PasteShortcut},
     vocabulary,
 };
 use serde_json::Value;
 use std::{
-    env, fs,
+    env,
+    ffi::CString,
+    fs,
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::OpenOptionsExt,
+    },
+    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
         Arc,
@@ -113,89 +118,57 @@ struct AudioMeter {
 }
 
 struct CapturedAudio {
-    pcm: Vec<u8>,
-    voiced_frames: usize,
-    /// Segments transcribed while recording, covering `pcm[..prefix_len]`.
-    /// Empty when live transcription was off or any segment failed.
-    prefix: Vec<String>,
-    prefix_len: usize,
-    tail_voiced_frames: usize,
+    file: fs::File,
+    pcm_bytes: usize,
 }
 
-const SEGMENT_PAUSE_BYTES: usize = 32_000 * 7 / 10; // 700 ms of 16 kHz S16 mono
 const BYTES_PER_SECOND: usize = 32_000;
+const CAPTURE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const CAPTURE_KILL_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Decides where to cut finished speech during recording. Cuts happen only in
-/// the middle of a pause, once the pending audio is long enough, so the ASR
-/// never sees a clipped word; continuous speech simply waits for the stop.
-/// Tiers let a longer segment accept a shorter pause.
-struct Segmenter {
-    /// (segment bytes, pause bytes): the base rule first, tiers in rising order.
-    rules: Vec<(usize, usize)>,
-    total: usize,
-    segment_start: usize,
-    silence_run: usize,
-    voiced_frames: usize,
-}
-
-impl Segmenter {
-    fn new(min_segment_seconds: u64, tiers: &[SegmentTier]) -> Self {
-        let mut rules = Vec::with_capacity(tiers.len() + 1);
-        if min_segment_seconds > 0 {
-            rules.push((
-                (min_segment_seconds as usize).saturating_mul(BYTES_PER_SECOND),
-                SEGMENT_PAUSE_BYTES,
+impl CapturedAudio {
+    fn new() -> Result<Self, String> {
+        let name = CString::new("omaflow-recording").expect("static memfd name");
+        // SAFETY: memfd_create returns a new owned descriptor on success.
+        let descriptor = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        if descriptor < 0 {
+            return Err(format!(
+                "could not allocate private recording memory: {}",
+                std::io::Error::last_os_error()
             ));
-            rules.extend(tiers.iter().map(|tier| {
-                (
-                    (tier.seconds as usize).saturating_mul(BYTES_PER_SECOND),
-                    (tier.pause_ms as usize).saturating_mul(BYTES_PER_SECOND / 1000),
-                )
-            }));
         }
-        Self {
-            rules,
-            total: 0,
-            segment_start: 0,
-            silence_run: 0,
-            voiced_frames: 0,
-        }
+        // SAFETY: descriptor is valid and ownership moves into File exactly once.
+        let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+        file.write_all(&[0; 44])
+            .map_err(|error| format!("could not initialize recording memory: {error}"))?;
+        Ok(Self { file, pcm_bytes: 0 })
     }
 
-    /// The shortest pause that closes the current segment at its present
-    /// length, or `None` while it is too short for every rule.
-    fn pause_needed(&self) -> Option<usize> {
-        let age = self.total - self.segment_start;
-        self.rules
-            .iter()
-            .filter(|(bytes, _)| age >= *bytes)
-            .map(|(_, pause)| *pause)
-            .min()
+    fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.file
+            .write_all(bytes)
+            .map_err(|error| format!("could not retain microphone audio: {error}"))?;
+        self.pcm_bytes += bytes.len();
+        Ok(())
     }
 
-    /// Returns the byte range of a finished segment, or `None`. The returned
-    /// `voiced` count is the number of voiced frames inside that segment.
-    fn observe(&mut self, bytes: usize, voiced: bool) -> Option<(std::ops::Range<usize>, usize)> {
-        self.total += bytes;
-        if voiced {
-            self.silence_run = 0;
-            self.voiced_frames += 1;
-        } else {
-            self.silence_run += bytes;
-        }
-        if self.silence_run < self.pause_needed()? {
-            return None;
-        }
-        // Cut on a sample boundary in the middle of the pause; the second half
-        // of the silence leads the next segment.
-        let cut = (self.total - self.silence_run / 2) & !1;
-        if cut <= self.segment_start {
-            return None;
-        }
-        let range = self.segment_start..cut;
-        self.segment_start = cut;
-        self.silence_run = self.total - cut;
-        Some((range, std::mem::take(&mut self.voiced_frames)))
+    fn is_empty(&self) -> bool {
+        self.pcm_bytes == 0
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        let header = wav_header(self.pcm_bytes)?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.file.write_all(&header))
+            .map_err(|error| format!("could not finalize recording memory: {error}"))
+    }
+
+    fn curl_form(&self) -> String {
+        format!(
+            "file=@/proc/self/fd/{};filename=dictation.wav;type=audio/wav",
+            self.file.as_raw_fd()
+        )
     }
 }
 
@@ -648,6 +621,9 @@ fn start_recording(
 
     let worker = thread::spawn(move || {
         let result = capture_audio(&config, &worker_control, &ready_tx, meter_gate_db);
+        if let Err(error) = &result {
+            let _ = ready_tx.send(Err(error.clone()));
+        }
         let _ = result_tx.send(result);
     });
 
@@ -676,88 +652,65 @@ fn capture_audio(
     ready: &mpsc::SyncSender<Result<(), String>>,
     meter_gate_db: Arc<AtomicI32>,
 ) -> Result<CapturedAudio, String> {
-    let mut capture = match start_audio_capture() {
-        Ok(capture) => capture,
-        Err(error) => {
-            let _ = ready.send(Err(error.clone()));
-            return Err(error);
-        }
-    };
+    let mut capture = start_audio_capture()?;
     let mut audio = match capture.stdout.take() {
         Some(audio) => audio,
         None => {
             stop_audio_capture(&mut capture);
-            let error = "PipeWire recorder did not expose audio".to_string();
-            let _ = ready.send(Err(error.clone()));
-            return Err(error);
+            return Err("PipeWire recorder did not expose audio".into());
         }
     };
     if let Err(error) = crate::process::nonblocking(&audio) {
         stop_audio_capture(&mut capture);
-        let message = format!("could not configure microphone capture: {error}");
-        let _ = ready.send(Err(message.clone()));
-        return Err(message);
+        return Err(format!("could not configure microphone capture: {error}"));
     }
     let mut meter = match AudioMeter::open(meter_gate_db) {
         Ok(meter) => meter,
         Err(error) => {
             stop_audio_capture(&mut capture);
-            let error = format!("could not initialize microphone meter: {error}");
-            let _ = ready.send(Err(error.clone()));
-            return Err(error);
+            return Err(format!("could not initialize microphone meter: {error}"));
         }
     };
     let _ = ready.send(Ok(()));
 
-    // One minute of mono 16 kHz S16 audio is only 1.92 MB. Keeping PCM in
-    // memory avoids filesystem latency and lets curl stream a WAV directly to
-    // the already-warm local CUDA server when recording stops.
-    let mut pcm = Vec::with_capacity(1_920_000);
-    let mut voiced_frames = 0;
+    let recording_bytes = usize::try_from(config.behavior.max_recording_seconds)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(BYTES_PER_SECOND);
+    // The extra second holds samples already buffered by PipeWire while a stop
+    // request reaches pw-cat. It is a hard bound, not a target duration.
+    let maximum_bytes = recording_bytes.saturating_add(BYTES_PER_SECOND);
+    let mut captured = CapturedAudio::new()?;
     let mut buffer = [0_u8; 1024];
-    // Finished segments go to one sequential worker so their order is kept
-    // and the speech server sees at most one live request at a time.
-    let live = config.behavior.models_configured && config.backend.live_segment_seconds > 0;
-    let mut segmenter = Segmenter::new(
-        if live {
-            config.backend.live_segment_seconds
-        } else {
-            0
-        },
-        &config.backend.live_segment_tiers,
-    );
-    let live_cancel = Arc::new(AtomicBool::new(false));
-    let (segment_tx, segment_rx) = mpsc::channel::<Option<Vec<u8>>>();
-    let live_worker = live.then(|| {
-        let config = config.clone();
-        let cancel = Arc::clone(&live_cancel);
-        thread::spawn(move || {
-            let mut texts = Vec::new();
-            for segment in segment_rx {
-                let result = match segment {
-                    None => Ok(String::new()),
-                    Some(pcm) => ensure_speech_server(&config)
-                        .and_then(|_| transcribe_pcm(&config, &pcm, &cancel)),
-                };
-                let failed = result.is_err();
-                texts.push(result);
-                if failed {
-                    break;
-                }
+    let mut stopping_at: Option<Instant> = None;
+    loop {
+        let requested = control.load(Ordering::Acquire);
+        if requested == 2 {
+            stop_audio_capture(&mut capture);
+            return Err("recording cancelled".into());
+        }
+        if stopping_at.is_some_and(|started| started.elapsed() >= CAPTURE_DRAIN_TIMEOUT) {
+            stop_audio_capture(&mut capture);
+            return Err("timed out draining microphone audio after stop".into());
+        }
+        if (requested == 1 || captured.pcm_bytes >= recording_bytes) && stopping_at.is_none() {
+            if let Err(error) = signal_audio_capture(&capture, libc::SIGINT) {
+                stop_audio_capture(&mut capture);
+                return Err(error);
             }
-            texts
-        })
-    });
-    let mut segment_count = 0_usize;
-    while control.load(Ordering::Acquire) == 0 {
+            stopping_at = Some(Instant::now());
+        }
         let count = match audio.read(&mut buffer) {
             Ok(0) => {
-                stop_audio_capture(&mut capture);
-                return Err("PipeWire microphone stream ended".into());
+                let Some(stopped) = stopping_at else {
+                    stop_audio_capture(&mut capture);
+                    return Err("PipeWire microphone stream ended".into());
+                };
+                wait_for_audio_capture(&mut capture, stopped + CAPTURE_DRAIN_TIMEOUT, control)?;
+                break;
             }
             Ok(count) => count,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(8));
+                thread::sleep(Duration::from_millis(2));
                 continue;
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
@@ -766,50 +719,19 @@ fn capture_audio(
                 return Err(format!("could not read microphone audio: {error}"));
             }
         };
-        let voiced = meter.update(&buffer[..count]);
-        if voiced {
-            voiced_frames += 1;
+        meter.update(&buffer[..count]);
+        if captured.pcm_bytes.saturating_add(count) > maximum_bytes {
+            stop_audio_capture(&mut capture);
+            return Err("microphone recording exceeded its configured size limit".into());
         }
-        pcm.extend_from_slice(&buffer[..count]);
-        if let Some((range, segment_voiced)) = segmenter.observe(count, voiced) {
-            // Silence-only segments never reach the ASR; they cannot hold words.
-            let payload = (segment_voiced >= 2).then(|| pcm[range].to_vec());
-            if segment_tx.send(payload).is_ok() {
-                segment_count += 1;
-            }
-        }
+        captured.push(&buffer[..count])?;
     }
 
-    stop_audio_capture(&mut capture);
-    drop(segment_tx);
-    if control.load(Ordering::Acquire) == 2 {
-        live_cancel.store(true, Ordering::Release);
-        if let Some(worker) = live_worker {
-            let _ = worker.join();
-        }
-        return Err("recording cancelled".into());
+    if !captured.pcm_bytes.is_multiple_of(2) {
+        return Err("microphone recording ended with an incomplete audio sample".into());
     }
-    let mut prefix = Vec::new();
-    let mut prefix_len = 0;
-    if let Some(worker) = live_worker {
-        let texts = worker.join().unwrap_or_default();
-        if texts.len() == segment_count && texts.iter().all(Result::is_ok) {
-            prefix = texts
-                .into_iter()
-                .map(|text| text.unwrap_or_default())
-                .collect();
-            prefix_len = segmenter.segment_start;
-        } else if let Some(Err(error)) = texts.iter().find(|text| text.is_err()) {
-            eprintln!("omaflow: live transcription unavailable, transcribing after stop: {error}");
-        }
-    }
-    Ok(CapturedAudio {
-        pcm,
-        voiced_frames,
-        prefix,
-        prefix_len,
-        tail_voiced_frames: segmenter.voiced_frames,
-    })
+    captured.finish()?;
+    Ok(captured)
 }
 
 fn start_meter_preview(meter_gate_db: Arc<AtomicI32>) -> Result<MeterPreviewSession, String> {
@@ -1011,7 +933,52 @@ fn start_audio_capture() -> Result<Child, String> {
 
 fn stop_audio_capture(capture: &mut Child) {
     let _ = capture.kill();
-    let _ = capture.wait();
+    let deadline = Instant::now() + CAPTURE_KILL_TIMEOUT;
+    while Instant::now() < deadline {
+        match capture.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(2)),
+        }
+    }
+}
+
+fn wait_for_audio_capture(
+    capture: &mut Child,
+    deadline: Instant,
+    control: &AtomicU8,
+) -> Result<(), String> {
+    loop {
+        if control.load(Ordering::Acquire) == 2 {
+            stop_audio_capture(capture);
+            return Err("recording cancelled".into());
+        }
+        match capture.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
+            Ok(None) => {
+                stop_audio_capture(capture);
+                return Err("timed out waiting for microphone capture to stop".into());
+            }
+            Err(error) => {
+                stop_audio_capture(capture);
+                return Err(format!("could not finish microphone capture: {error}"));
+            }
+        }
+    }
+}
+
+fn signal_audio_capture(capture: &Child, signal: libc::c_int) -> Result<(), String> {
+    // SAFETY: `capture.id()` names the live child owned by this session. Sending
+    // SIGINT asks pw-cat to close its PipeWire stream and stdout cleanly.
+    let result = unsafe { libc::kill(capture.id() as libc::pid_t, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "could not stop PipeWire microphone capture: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
 }
 
 fn stop_recording(
@@ -1020,7 +987,12 @@ fn stop_recording(
     cancel: &AtomicBool,
 ) -> Result<StopOutcome, String> {
     let total_started = Instant::now();
-    session.control.store(1, Ordering::Release);
+    let CaptureSession {
+        control,
+        result,
+        worker,
+    } = session;
+    control.store(1, Ordering::Release);
     let window = active_window();
     let backend_started = Instant::now();
     let previous = if config.cleanup.use_clipboard_context {
@@ -1029,46 +1001,49 @@ fn stop_recording(
         ClipboardSnapshot::Empty
     };
 
-    let captured = session
-        .result
-        .recv_timeout(Duration::from_millis(config.backend.status_timeout_ms))
-        .map_err(|_| "timed out finalizing microphone capture".to_string())??;
-    let _ = session.worker.join();
-    // Two 32 ms frames are enough for short words such as "yes", while taps,
-    // room noise and key clicks never reach the ASR or cleanup model.
-    if captured.voiced_frames < 2 {
+    let deadline = Instant::now() + Duration::from_millis(config.backend.status_timeout_ms);
+    let captured = loop {
+        if cancel.load(Ordering::Acquire) {
+            control.store(2, Ordering::Release);
+            if result
+                .recv_timeout(CAPTURE_DRAIN_TIMEOUT + CAPTURE_KILL_TIMEOUT)
+                .is_ok()
+            {
+                let _ = worker.join();
+            }
+            return Err("dictation cancelled".into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            control.store(2, Ordering::Release);
+            if result
+                .recv_timeout(CAPTURE_DRAIN_TIMEOUT + CAPTURE_KILL_TIMEOUT)
+                .is_ok()
+            {
+                let _ = worker.join();
+            }
+            return Err("timed out finalizing microphone capture".into());
+        }
+        match result.recv_timeout(remaining.min(Duration::from_millis(20))) {
+            Ok(captured) => {
+                let _ = worker.join();
+                break captured?;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = worker.join();
+                return Err("microphone capture worker stopped".into());
+            }
+        }
+    };
+    if captured.is_empty() {
         return Ok(StopOutcome::NoSpeech);
     }
     if cancel.load(Ordering::Acquire) {
         return Err("dictation cancelled".into());
     }
     ensure_speech_server(config)?;
-    let raw_text = if captured.prefix_len > 0 && captured.prefix_len <= captured.pcm.len() {
-        let tail = &captured.pcm[captured.prefix_len..];
-        let mut parts: Vec<String> = captured
-            .prefix
-            .iter()
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
-            .collect();
-        if !tail.is_empty() && captured.tail_voiced_frames >= 2 {
-            let text = transcribe_pcm(config, tail, cancel)?;
-            if !text.trim().is_empty() {
-                parts.push(text.trim().to_string());
-            }
-        }
-        eprintln!(
-            "omaflow: live segments={} tail={}ms",
-            captured.prefix.len(),
-            tail.len() / (BYTES_PER_SECOND / 1000)
-        );
-        if parts.is_empty() {
-            return Err("speech server returned an empty transcript".into());
-        }
-        parts.join(" ")
-    } else {
-        transcribe_speech(config, &captured.pcm, cancel)?
-    };
+    let raw_text = transcribe_audio(config, &captured, cancel)?;
     let backend_elapsed = backend_started.elapsed();
 
     finish_transcript(
@@ -1081,99 +1056,46 @@ fn stop_recording(
     )
 }
 
-/// Runs a WAV file through the live segmenter exactly as the microphone path
-/// would, transcribes the whole file and every segment, and returns both so a
-/// segmentation rule can be judged against a checked transcript.
-pub(crate) fn segment_file(config: &Config, path: &Path) -> Result<Value, String> {
-    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return Err("expected a RIFF WAVE file".into());
-    }
-    let channels = u16::from_le_bytes([bytes[22], bytes[23]]);
-    let rate = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
-    let bits = u16::from_le_bytes([bytes[34], bytes[35]]);
-    if channels != 1 || rate != 16_000 || bits != 16 {
-        return Err(format!(
-            "expected 16 kHz mono 16-bit PCM, got {rate} Hz, {channels} channel(s), {bits} bit"
-        ));
-    }
-    let data_at = bytes
-        .windows(4)
-        .position(|window| window == b"data")
-        .ok_or("WAV has no data chunk")?
-        + 8;
-    let pcm = &bytes[data_at..];
-    let mut meter = AudioMeter::open(Arc::new(AtomicI32::new(config.behavior.meter_gate_db)))?;
-    let mut segmenter = Segmenter::new(
-        config.backend.live_segment_seconds,
-        &config.backend.live_segment_tiers,
-    );
-    let cancel = AtomicBool::new(false);
-    ensure_speech_server(config)?;
-    let seconds = |bytes: usize| bytes as f64 / BYTES_PER_SECOND as f64;
-    let mut segments = Vec::new();
-    for chunk in pcm.chunks(1024) {
-        let voiced = meter.update(chunk);
-        if let Some((range, voiced_frames)) = segmenter.observe(chunk.len(), voiced) {
-            let text = if voiced_frames >= 2 {
-                transcribe_pcm(config, &pcm[range.clone()], &cancel)?
-            } else {
-                String::new()
-            };
-            segments.push(serde_json::json!({
-                "start": seconds(range.start),
-                "end": seconds(range.end),
-                "text": text,
-            }));
-        }
-    }
-    let tail_start = segmenter.segment_start;
-    let tail = if tail_start < pcm.len() {
-        transcribe_pcm(config, &pcm[tail_start..], &cancel)?
-    } else {
-        String::new()
-    };
-    segments.push(serde_json::json!({
-        "start": seconds(tail_start),
-        "end": seconds(pcm.len()),
-        "text": tail,
-    }));
-    let whole = transcribe_pcm(config, pcm, &cancel)?;
-    Ok(serde_json::json!({
-        "seconds": seconds(pcm.len()),
-        "live_segment_seconds": config.backend.live_segment_seconds,
-        "live_segment_tiers": config.backend.live_segment_tiers,
-        "whole": whole,
-        "segments": segments,
-    }))
-}
-
-pub(crate) fn transcribe_speech(
-    config: &Config,
-    pcm: &[u8],
-    cancel: &AtomicBool,
-) -> Result<String, String> {
-    let text = transcribe_pcm(config, pcm, cancel)?;
-    if text.trim().is_empty() {
-        return Err("speech server returned an empty transcript".into());
-    }
-    Ok(text)
-}
-
-/// One transcription request; an empty transcript is a valid answer here.
-fn transcribe_pcm(config: &Config, pcm: &[u8], cancel: &AtomicBool) -> Result<String, String> {
+#[cfg(test)]
+fn transcribe_speech(config: &Config, pcm: &[u8], cancel: &AtomicBool) -> Result<String, String> {
     if pcm.is_empty() {
         return Err("recording contained no microphone audio".into());
     }
-    let header = wav_header(pcm.len())?;
+    let mut captured = CapturedAudio::new()?;
+    captured.push(pcm)?;
+    captured.finish()?;
+    transcribe_audio(config, &captured, cancel)
+}
+
+fn transcribe_audio(
+    config: &Config,
+    captured: &CapturedAudio,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    if captured.is_empty() {
+        return Err("recording contained no microphone audio".into());
+    }
+    transcribe_request(
+        config,
+        &captured.curl_form(),
+        Some(captured.file.as_raw_fd()),
+        b"",
+        cancel,
+    )
+}
+
+fn transcribe_request(
+    config: &Config,
+    file_form: &str,
+    inherited_fd: Option<libc::c_int>,
+    input: &[u8],
+    cancel: &AtomicBool,
+) -> Result<String, String> {
     let timeout_seconds = config.backend.status_timeout_ms.div_ceil(1_000).max(1);
     let timeout = timeout_seconds.to_string();
     let model = format!("model={}", config.backend.model);
     let language = format!("language={}", config.backend.language);
     let auth = crate::process::CurlAuth::new(&config.backend.api_key)?;
-    let mut wav = Vec::with_capacity(header.len() + pcm.len());
-    wav.extend_from_slice(&header);
-    wav.extend_from_slice(pcm);
     let output = crate::process::run_http(
         || {
             let mut command = Command::new("curl");
@@ -1185,7 +1107,7 @@ fn transcribe_pcm(config: &Config, pcm: &[u8], cancel: &AtomicBool) -> Result<St
                     "--max-time",
                     &timeout,
                     "--form",
-                    "file=@-;filename=dictation.wav;type=audio/wav",
+                    file_form,
                     "--form-string",
                     "response_format=json",
                     &config.backend.endpoint,
@@ -1199,9 +1121,12 @@ fn transcribe_pcm(config: &Config, pcm: &[u8], cancel: &AtomicBool) -> Result<St
             if config.backend.language != "auto" || config.backend.engine != "openai" {
                 command.args(["--form-string", &language]);
             }
+            if let Some(descriptor) = inherited_fd {
+                inherit_recording_fd(&mut command, descriptor);
+            }
             command
         },
-        &wav,
+        input,
         cancel,
         Duration::from_secs(timeout_seconds),
     )
@@ -1214,11 +1139,111 @@ fn transcribe_pcm(config: &Config, pcm: &[u8], cancel: &AtomicBool) -> Result<St
     }
     let body: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("invalid speech server response: {error}"))?;
-    body.get("text")
+    let text = body
+        .get("text")
         .and_then(Value::as_str)
         .map(str::trim)
         .map(ToOwned::to_owned)
-        .ok_or_else(|| "invalid speech server response: missing text".into())
+        .ok_or_else(|| "invalid speech server response: missing text".to_string())?;
+    if text.is_empty() {
+        Err("speech server returned an empty transcript".into())
+    } else {
+        Ok(text)
+    }
+}
+
+fn inherit_recording_fd(command: &mut Command, descriptor: libc::c_int) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: pre_exec runs after fork and before exec. fcntl is async-signal-
+    // safe, and it changes only this child's copy of the descriptor flags.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(descriptor, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn captured_audio_from_wav(path: &std::path::Path) -> Result<CapturedAudio, String> {
+    let mut source =
+        fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut riff = [0_u8; 12];
+    source
+        .read_exact(&mut riff)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if &riff[..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
+        return Err("expected a RIFF WAVE file".into());
+    }
+    let mut pcm_format = None;
+    let data_bytes = loop {
+        let mut chunk = [0_u8; 8];
+        source
+            .read_exact(&mut chunk)
+            .map_err(|_| "WAVE file has no complete audio data chunk".to_string())?;
+        let size = u32::from_le_bytes(chunk[4..8].try_into().unwrap()) as u64;
+        match &chunk[..4] {
+            b"fmt " => {
+                if size < 16 {
+                    return Err("WAVE format chunk is too short".into());
+                }
+                let mut format = [0_u8; 16];
+                source
+                    .read_exact(&mut format)
+                    .map_err(|_| "WAVE format chunk is truncated".to_string())?;
+                pcm_format = Some((
+                    u16::from_le_bytes(format[0..2].try_into().unwrap()),
+                    u16::from_le_bytes(format[2..4].try_into().unwrap()),
+                    u32::from_le_bytes(format[4..8].try_into().unwrap()),
+                    u16::from_le_bytes(format[14..16].try_into().unwrap()),
+                ));
+                source
+                    .seek(SeekFrom::Current((size - 16 + size % 2) as i64))
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+            }
+            b"data" => break size,
+            _ => {
+                source
+                    .seek(SeekFrom::Current((size + size % 2) as i64))
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+            }
+        }
+    };
+    let Some((format, channels, rate, bits)) = pcm_format else {
+        return Err("WAVE audio data appeared before its format".into());
+    };
+    if format != 1 || channels != 1 || rate != 16_000 || bits != 16 {
+        return Err(format!(
+            "expected 16 kHz mono 16-bit PCM, got {rate} Hz, {channels} channel(s), {bits} bit"
+        ));
+    }
+    if !data_bytes.is_multiple_of(2) {
+        return Err("WAVE data ends with an incomplete audio sample".into());
+    }
+    let mut captured = CapturedAudio::new()?;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut remaining = data_bytes;
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        let count = source
+            .read(&mut buffer[..wanted])
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if count == 0 {
+            return Err("WAVE audio data is truncated".into());
+        }
+        captured.push(&buffer[..count])?;
+        remaining -= count as u64;
+    }
+    captured.finish()?;
+    Ok(captured)
+}
+
+pub(crate) fn transcribe_file(config: &Config, path: &std::path::Path) -> Result<String, String> {
+    let captured = captured_audio_from_wav(path)?;
+    ensure_speech_server(config)?;
+    transcribe_audio(config, &captured, &AtomicBool::new(false))
 }
 
 fn wav_header(pcm_bytes: usize) -> Result<[u8; 44], String> {
@@ -1636,8 +1661,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ClipboardSnapshot, meter_level, paste_shortcut, preferred_clipboard_type, rms_dbfs,
-        voice_above_threshold, wav_header,
+        CapturedAudio, ClipboardSnapshot, captured_audio_from_wav, meter_level, paste_shortcut,
+        preferred_clipboard_type, rms_dbfs, voice_above_threshold, wav_header,
     };
 
     fn rms_at(dbfs: f32) -> f32 {
@@ -1645,78 +1670,56 @@ mod tests {
     }
 
     #[test]
-    fn segmenter_cuts_only_in_a_pause_after_enough_audio() {
-        use super::{BYTES_PER_SECOND, Segmenter};
-        let mut segmenter = Segmenter::new(5, &[]);
-        let frame = 1024;
-        // Ten seconds of continuous speech never cuts.
-        for _ in 0..(10 * BYTES_PER_SECOND / frame) {
-            assert!(segmenter.observe(frame, true).is_none());
+    fn private_recording_memory_preserves_every_byte() {
+        use std::io::{Read, Seek};
+        let input: Vec<u8> = (0..128 * 1024 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let mut recording = CapturedAudio::new().unwrap();
+        for part in input.chunks(997) {
+            recording.push(part).unwrap();
         }
-        // A 600 ms pause is too short; at 700 ms the segment closes mid-pause.
-        let mut cut = None;
-        for _ in 0..40 {
-            cut = segmenter.observe(frame, false);
-            if cut.is_some() {
-                break;
-            }
-        }
-        let (range, voiced) = cut.expect("cut after a pause");
-        assert_eq!(range.start, 0);
-        assert!(range.end % 2 == 0);
-        assert!(range.end > 10 * BYTES_PER_SECOND);
-        assert!(range.end < segmenter.total);
-        assert!(voiced > 300);
-        // The next segment starts at the cut and needs its own five seconds.
-        assert_eq!(segmenter.segment_start, range.end);
-        for _ in 0..40 {
-            assert!(segmenter.observe(frame, false).is_none());
-        }
-        assert!(Segmenter::new(0, &[]).observe(frame, false).is_none());
+        recording.finish().unwrap();
+        assert_eq!(recording.pcm_bytes, input.len());
+        recording.file.rewind().unwrap();
+        let mut wav = Vec::new();
+        recording.file.read_to_end(&mut wav).unwrap();
+        assert_eq!(&wav[44..], input);
+        assert_eq!(
+            u32::from_le_bytes(wav[40..44].try_into().unwrap()) as usize,
+            input.len()
+        );
     }
 
     #[test]
-    fn segmenter_tiers_accept_shorter_pauses_as_a_segment_grows() {
-        use super::{BYTES_PER_SECOND, Segmenter};
-        use crate::config::SegmentTier;
-        let tiers = [
-            SegmentTier {
-                seconds: 8,
-                pause_ms: 400,
-            },
-            SegmentTier {
-                seconds: 12,
-                pause_ms: 250,
-            },
-        ];
-        let frame = 1024;
-        let speak = |segmenter: &mut Segmenter, seconds: usize| {
-            for _ in 0..(seconds * BYTES_PER_SECOND / frame) {
-                assert!(segmenter.observe(frame, true).is_none());
-            }
-        };
-        let pause = |segmenter: &mut Segmenter, ms: usize| {
-            let mut cut = None;
-            for _ in 0..(ms * BYTES_PER_SECOND / 1000 / frame) {
-                cut = segmenter.observe(frame, false);
-                if cut.is_some() {
-                    break;
-                }
-            }
-            cut
-        };
-        let mut segmenter = Segmenter::new(5, &tiers);
-        // Six seconds in, a 450 ms pause is short of the 700 ms base rule.
-        speak(&mut segmenter, 6);
-        assert!(pause(&mut segmenter, 450).is_none());
-        // Past the 8 s tier the same pause closes the segment.
-        speak(&mut segmenter, 3);
-        assert!(pause(&mut segmenter, 450).is_some());
-        // A fresh segment past 12 s needs only 250 ms: 200 ms leaves it open,
-        // another 100 ms closes it.
-        speak(&mut segmenter, 13);
-        assert!(pause(&mut segmenter, 200).is_none());
-        assert!(pause(&mut segmenter, 100).is_some());
+    fn wav_reader_accepts_metadata_before_audio() {
+        use std::io::{Read, Seek};
+        let pcm = [1_u8, 2, 3, 4];
+        let canonical = wav_header(pcm.len()).unwrap();
+        let mut wav = Vec::new();
+        wav.extend_from_slice(&canonical[..12]);
+        wav.extend_from_slice(&canonical[12..36]);
+        wav.extend_from_slice(b"LIST");
+        wav.extend_from_slice(&3_u32.to_le_bytes());
+        wav.extend_from_slice(b"abc\0");
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&pcm);
+        let riff_size = (wav.len() as u32 - 8).to_le_bytes();
+        wav[4..8].copy_from_slice(&riff_size);
+
+        let path = std::env::temp_dir().join(format!(
+            "omaflow-wav-metadata-test-{}.wav",
+            std::process::id()
+        ));
+        std::fs::write(&path, wav).unwrap();
+        let mut recording = captured_audio_from_wav(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        recording.file.rewind().unwrap();
+        let mut loaded = Vec::new();
+        recording.file.read_to_end(&mut loaded).unwrap();
+        assert_eq!(&loaded[..44], canonical.as_slice());
+        assert_eq!(&loaded[44..], pcm.as_slice());
     }
 
     /// A one-shot HTTP server answering `status` to the first request, so the
@@ -1862,6 +1865,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn speech_adapter_rejects_an_empty_successful_response() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicBool;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            let body = r#"{"text":""}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let mut config = crate::config::Config::default();
+        config.backend.engine = "openai".into();
+        config.backend.endpoint = format!("http://127.0.0.1:{port}/transcribe");
+        config.backend.status_timeout_ms = 3_000;
+        let error =
+            super::transcribe_speech(&config, &[0; 3_200], &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(error, "speech server returned an empty transcript");
+        server.join().unwrap();
     }
 
     #[test]

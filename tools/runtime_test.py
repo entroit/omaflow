@@ -41,8 +41,34 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         "systemctl": "import os; from pathlib import Path; (Path(os.environ[\"XDG_RUNTIME_DIR\"])/\"model-command\").touch()",
         "ollama": "print('NAME ID SIZE')",
         "nvidia-smi": "pass",
-        "curl": "import os; from pathlib import Path; (Path(os.environ[\"XDG_RUNTIME_DIR\"])/\"model-command\").touch(); print('{}')",
-        "pw-cat": "import time; time.sleep(120)",
+        "curl": (
+            "import os, sys; from pathlib import Path\n"
+            "runtime = Path(os.environ['XDG_RUNTIME_DIR'])\n"
+            "(runtime / 'model-command').touch()\n"
+            "if (runtime / 'capture-fixture').exists():\n"
+            "    form = next((sys.argv[index + 1] for index, value in enumerate(sys.argv[:-1]) if value == '--form' and sys.argv[index + 1].startswith('file=@')), 'file=@-')\n"
+            "    source = form.split('@', 1)[1].split(';', 1)[0]\n"
+            "    audio = sys.stdin.buffer.read() if source == '-' else Path(source).read_bytes()\n"
+            "    (runtime / 'asr-request').write_bytes(audio)\n"
+            "    print('{\"text\":\"Complete fixture transcript.\"}')\n"
+            "else:\n"
+            "    print('{}')\n"
+        ),
+        "pw-cat": (
+            "import os, signal, sys, time; from pathlib import Path\n"
+            "runtime = Path(os.environ['XDG_RUNTIME_DIR'])\n"
+            "if not (runtime / 'capture-fixture').exists():\n"
+            "    time.sleep(120)\n"
+            "else:\n"
+            "    sys.stdout.buffer.write(b'\\x01\\x00' * 1600)\n"
+            "    sys.stdout.buffer.flush()\n"
+            "    def finish(_signal, _frame):\n"
+            "        sys.stdout.buffer.write(b'\\x02\\x00' * 320)\n"
+            "        sys.stdout.buffer.flush()\n"
+            "        sys.exit(1)\n"
+            "    signal.signal(signal.SIGINT, finish)\n"
+            "    while True: time.sleep(.02)\n"
+        ),
         "wpctl": (
             "import os, sys; from pathlib import Path\n"
             "runtime = Path(os.environ['XDG_RUNTIME_DIR'])\n"
@@ -56,7 +82,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         path.write_text("#!/usr/bin/python3\n" + source + "\n")
         path.chmod(0o755)
 
-    def run_case(name, fake, test, pending=False):
+    def run_case(name, fake, test, pending=False, backend=""):
         case = base / str(len(list(base.iterdir())))
         case.mkdir()
         runtime = case / "runtime"
@@ -66,7 +92,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         # false, waiting on the background weights download, and every case but
         # the pending one is about a machine that is past that point.
         configured = "false" if pending else "true"
-        config.write_text(f'[cleanup]\nenabled=false\n[behavior]\nmodels_configured={configured}\nhistory_limit=30\ndouble_tap_ms=30\n[backend]\nstatus_timeout_ms=300\n')
+        config.write_text(f'[cleanup]\nenabled=false\n[behavior]\nmodels_configured={configured}\nhistory_limit=30\ndouble_tap_ms=30\n[backend]\nstatus_timeout_ms=300\n{backend}')
         env = dict(os.environ, PATH=f"{commands}:/usr/bin", XDG_RUNTIME_DIR=str(runtime),
                    XDG_STATE_HOME=str(case / "state"), OMAFLOW_CONFIG=str(config))
         env.pop("OMAFLOW_FAKE_TRANSCRIPT", None)
@@ -130,6 +156,22 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         time.sleep(.15)
         send("release")
         wait_until(lambda: state()["phase"] == "notice")
+
+    def drained_capture(case, runtime, state, send):
+        (runtime / "capture-fixture").touch()
+        send("press")
+        wait_until(lambda: state()["phase"] == "recording")
+        time.sleep(.08)
+        send("release")
+        wait_until(lambda: state()["phase"] == "result")
+        assert state()["text"] == "Complete fixture transcript."
+        request = (runtime / "asr-request").read_bytes()
+        assert request.startswith(b"RIFF")
+        pcm_bytes = int.from_bytes(request[40:44], "little")
+        assert pcm_bytes == 3840
+        assert request[44:44 + pcm_bytes] == (
+            b"\x01\x00" * 1600 + b"\x02\x00" * 320
+        )
 
     def settings(case, runtime, state, send):
         send('configure:{"key":"style","value":"verbatim"}')
@@ -284,6 +326,12 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
     run_case("clipboard failure retains text; clear undo; copy errors", True, delivery)
     run_case("incomplete IPC client cannot block controls", True, ipc)
     run_case("cancel stalled capture then record again", False, stalled_capture)
+    run_case(
+        "stop drains final recorder bytes into the transcription request",
+        False,
+        drained_capture,
+        backend='engine="openai"\nendpoint="http://fixture.invalid/transcribe"\n',
+    )
     run_case("validated dictation preferences; unknown settings and commands rejected", True, settings)
 
     run_case("atomic model switching and busy-session rejection", True, models)

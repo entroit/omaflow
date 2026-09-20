@@ -192,16 +192,6 @@ pub struct Backend {
     /// are both read by other processes, and a bearer token belongs in neither.
     #[serde(skip_serializing)]
     pub api_key: String,
-    pub live_segment_seconds: u64,
-    pub live_segment_tiers: Vec<SegmentTier>,
-}
-
-/// An extra live-segment rule: once a segment has grown to `seconds`, a pause
-/// of only `pause_ms` is enough to cut it. Empty means the single base rule.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct SegmentTier {
-    pub seconds: u64,
-    pub pause_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -263,8 +253,6 @@ impl Default for Backend {
             health_endpoint: String::new(),
             device: "cuda".into(),
             api_key: String::new(),
-            live_segment_seconds: 20,
-            live_segment_tiers: Vec::new(),
         }
     }
 }
@@ -580,21 +568,6 @@ impl Config {
                     "An API key must be one line of at most 4096 characters, without quotes".into(),
                 );
             }
-        }
-        if self.backend.live_segment_seconds != 0
-            && !(5..=600).contains(&self.backend.live_segment_seconds)
-        {
-            return Err("Live transcription segments must be 0 (off) or 5–600 seconds".into());
-        }
-        let mut previous = (self.backend.live_segment_seconds, 700_u64);
-        for tier in &self.backend.live_segment_tiers {
-            if tier.seconds <= previous.0 || tier.pause_ms >= previous.1 || tier.pause_ms < 100 {
-                return Err(format!(
-                    "backend.live_segment_tiers must rise in seconds and fall in pause_ms (at least 100) after ({} s, {} ms); got ({} s, {} ms)",
-                    previous.0, previous.1, tier.seconds, tier.pause_ms
-                ));
-            }
-            previous = (tier.seconds, tier.pause_ms);
         }
         if !["cpu", "cuda", "auto", "vulkan", "metal"].contains(&self.backend.device.as_str()) {
             return Err("Speech device must be auto, cpu, cuda, vulkan or metal".into());

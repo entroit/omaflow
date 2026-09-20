@@ -101,24 +101,6 @@ raw fallback is counted separately from a successful cleanup. Set
 gates measure and the current results are in
 [why these models](docs/why-these-models.md).
 
-## Live segment rules
-
-`[backend] live_segment_tiers` changes where a recording is cut for live
-transcription. Before enabling a rule by default, record continuous fast
-speech, quiet speech, a list of numbers and names, and a self-correction that
-spans a cut, each 60 to 90 s, as 16 kHz mono WAV under `tools/data/local/`
-(ignored by git) with a checked transcript next to each, then run:
-
-```bash
-tools/segment_compare.py tools/data/local/fast.wav tools/data/local/fast.txt
-```
-
-It reports the word error rate of the whole-file and segmented transcripts
-against the reference, the words either side of each cut, peak speech-server
-VRAM and wall time. A rule is a candidate for the default only if its WER
-matches the whole-file result on every recording; passing them supports more
-testing, not a guarantee.
-
 ## Desktop checks
 
 ```bash

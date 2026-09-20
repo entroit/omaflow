@@ -108,19 +108,21 @@ pub fn nonblocking(file: &impl AsRawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn drain(pipe: &mut Option<impl Read>, bytes: &mut Vec<u8>) -> io::Result<()> {
-    let Some(pipe) = pipe else { return Ok(()) };
+fn drain(pipe: &mut Option<impl Read>, bytes: &mut Vec<u8>) -> io::Result<usize> {
+    let Some(pipe) = pipe else { return Ok(0) };
     let mut buffer = [0; 8192];
+    let mut read = 0;
     loop {
         match pipe.read(&mut buffer) {
-            Ok(0) => return Ok(()),
+            Ok(0) => return Ok(read),
             Ok(count) => {
                 if bytes.len() + count > 4 * 1024 * 1024 {
                     return Err(io::Error::other("subprocess response exceeds 4 MiB"));
                 }
                 bytes.extend_from_slice(&buffer[..count]);
+                read += count;
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(read),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
@@ -284,25 +286,26 @@ fn communicate(
             if started.elapsed() >= timeout {
                 return Err("operation timed out".into());
             }
-            drain(&mut child.stdout, &mut stdout).map_err(|e| e.to_string())?;
-            drain(&mut child.stderr, &mut stderr).map_err(|e| e.to_string())?;
+            let mut progressed =
+                drain(&mut child.stdout, &mut stdout).map_err(|e| e.to_string())? > 0;
+            progressed |= drain(&mut child.stderr, &mut stderr).map_err(|e| e.to_string())? > 0;
             if let Some(input) = input {
-                if written < input.len()
-                    && let Some(pipe) = &mut child.stdin
-                {
+                while written < input.len() && child.stdin.is_some() {
+                    let pipe = child.stdin.as_mut().expect("stdin checked above");
                     match pipe.write(&input[written..]) {
-                        Ok(count) => written += count,
-                        Err(e)
-                            if matches!(
-                                e.kind(),
-                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                            ) => {}
+                        Ok(0) => return Err("subprocess stdin stopped accepting input".into()),
+                        Ok(count) => {
+                            written += count;
+                            progressed = true;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                         // Curl can reject a request before consuming stdin.
                         // Still collect its exit status and HTTP diagnostics.
-                        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
                             child.stdin.take();
                         }
-                        Err(e) => return Err(e.to_string()),
+                        Err(error) => return Err(error.to_string()),
                     }
                 }
                 if written == input.len() {
@@ -318,12 +321,20 @@ fn communicate(
                     stderr,
                 });
             }
-            thread::sleep(Duration::from_millis(8));
+            if !progressed {
+                thread::sleep(Duration::from_millis(2));
+            }
         }
     })();
     if result.is_err() {
         let _ = child.kill();
-        let _ = child.wait();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => thread::sleep(Duration::from_millis(2)),
+            }
+        }
     }
     result
 }
@@ -360,6 +371,7 @@ mod tests {
         .unwrap();
         assert_eq!(output.stdout, data);
     }
+
     #[test]
     fn blocked_input_obeys_the_deadline() {
         let mut command = Command::new("sleep");

@@ -2,6 +2,7 @@
 use crate::{config::Config, vocabulary};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     process::{Command, Stdio},
     sync::atomic::AtomicBool,
     time::Duration,
@@ -26,6 +27,7 @@ pub(crate) fn cleanup(
 
 const NUMERIC_GUARD: &str = "cleanup model changed or invented a numeric value";
 const LANGUAGE_GUARD: &str = "cleanup model changed the transcript language";
+const CONTENT_GUARD: &str = "cleanup model omitted a recognized sentence";
 const STRICT_RETRY: &str = "\n\nSTRICT MODE for this transcript: a previous edit changed a number or the language and was rejected. Keep every number exactly as it appears in the transcript: the same number words or digits, in the same order and count. Do not repair, complete, merge, split, convert or reorder any number, even if it looks like a recognition error. Keep every word in the language it was spoken. Only fix punctuation, capitalization, sentence boundaries, fillers and self-corrections.";
 
 fn cleanup_candidate(
@@ -75,14 +77,17 @@ fn cleanup_candidate(
         if reply_hit_output_limit(config, &body) {
             return Err("Cleanup reached its output limit; original transcription kept".into());
         }
-        // An empty reply is the model's answer for filler-only or silent input.
-        // Returning it lets the caller show "Nothing heard" instead of pasting
-        // the raw fillers.
+        // Recognition already decided that this recording contains text. Only
+        // a source made entirely of known fillers can safely become empty.
         if cleaned.is_empty() {
-            return Ok(cleaned);
+            if filler_only(transcript) {
+                return Ok(cleaned);
+            }
+            return Err("cleanup model returned empty text; original transcription kept".into());
         }
         match cleanup_guard(transcript, &cleaned) {
             Ok(()) => return Ok(cleaned),
+            Err(error) if error.starts_with(CONTENT_GUARD) => return Err(error),
             Err(error) => rejection = error,
         }
     }
@@ -94,6 +99,38 @@ fn cleanup_candidate(
         return Ok(safe);
     }
     Err(rejection)
+}
+
+fn filler_only(text: &str) -> bool {
+    let words = word_spans(text);
+    if words.is_empty() {
+        return false;
+    }
+    let words: Vec<String> = words
+        .iter()
+        .map(|word| word.normalized.to_lowercase())
+        .collect();
+    let mut has_unambiguous_filler = false;
+    let mut index = 0;
+    while index < words.len() {
+        if matches!(
+            words[index].as_str(),
+            "um" | "uh" | "hmm" | "äh" | "ähm" | "euh" | "eh" | "ehm"
+        ) {
+            has_unambiguous_filler = true;
+            index += 1;
+        } else if words[index] == "you" && words.get(index + 1).is_some_and(|word| word == "know") {
+            index += 2;
+        } else if matches!(
+            words[index].as_str(),
+            "like" | "basically" | "actually" | "so" | "okay"
+        ) {
+            index += 1;
+        } else {
+            return false;
+        }
+    }
+    has_unambiguous_filler
 }
 
 #[derive(Clone, Copy)]
@@ -209,17 +246,135 @@ fn punctuation_only_candidate(source: &str, candidate: &str) -> Option<String> {
     Some(output.trim().to_string())
 }
 
-/// Safety guards over a model candidate. The error names the first value that
-/// the guard could not trace back to the transcript.
+/// Safety guards over a model candidate.
 fn cleanup_guard(transcript: &str, cleaned: &str) -> Result<(), String> {
     if !cleanup_preserves_language(transcript, cleaned) {
         return Err(LANGUAGE_GUARD.into());
     }
     match unsupported_number(transcript, cleaned) {
-        None => Ok(()),
         Some(value) if value.is_empty() => Err(NUMERIC_GUARD.into()),
         Some(value) => Err(format!("{NUMERIC_GUARD} (\"{value}\")")),
+        None if cleanup_omits_sentence(transcript, cleaned) => Err(CONTENT_GUARD.into()),
+        None => Ok(()),
     }
+}
+
+fn cleanup_omits_sentence(source: &str, cleaned: &str) -> bool {
+    let cleaned_words: Vec<String> = word_spans(cleaned)
+        .into_iter()
+        .map(|word| word.normalized.to_lowercase())
+        .collect();
+    let mut positions: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, word) in cleaned_words.iter().enumerate() {
+        positions.entry(word).or_default().push(index);
+    }
+    let mut cleaned_cursor = 0;
+    for sentence in source.split_inclusive(['.', '?', '!', '\n']) {
+        let source_words: Vec<String> = word_spans(sentence)
+            .into_iter()
+            .map(|word| word.normalized.to_lowercase())
+            .collect();
+        let mut words = Vec::with_capacity(source_words.len());
+        let mut index = 0;
+        while index < source_words.len() {
+            let command_words = if words_at(
+                &source_words,
+                index,
+                &["put", "together", "a", "list", "out", "of"],
+            ) {
+                6
+            } else if words_at(
+                &source_words,
+                index,
+                &["put", "together", "a", "list", "of"],
+            ) || words_at(&source_words, index, &["make", "a", "list", "out", "of"])
+            {
+                5
+            } else if words_at(&source_words, index, &["make", "a", "list", "of"]) {
+                4
+            } else {
+                0
+            };
+            if command_words > 0 {
+                index += command_words;
+                continue;
+            }
+            let word = source_words[index].as_str();
+            let pair = source_words.get(index + 1).map(String::as_str);
+            if matches!(
+                word,
+                "um" | "uh"
+                    | "hmm"
+                    | "äh"
+                    | "ähm"
+                    | "euh"
+                    | "eh"
+                    | "ehm"
+                    | "colon"
+                    | "doppelpunkt"
+                    | "aufzählungspunkt"
+            ) || number_word(word).is_some()
+                || ordinal_word(word).is_some()
+            {
+                index += 1;
+            } else if matches!(
+                (word, pair),
+                ("bullet", Some("point")) | ("shopping", Some("list"))
+            ) {
+                index += 2;
+            } else if words.last().is_some_and(|previous| previous == word) {
+                index += 1;
+            } else {
+                words.push(source_words[index].clone());
+                index += 1;
+            }
+        }
+        if words.is_empty() {
+            continue;
+        }
+        let required = if has_explicit_correction_marker(sentence) {
+            (words.len().div_ceil(4)).max(2)
+        } else {
+            match words.len() {
+                1..=4 => words.len(),
+                5..=8 => (words.len() * 3).div_ceil(5),
+                _ => (words.len() * 2).div_ceil(5),
+            }
+        }
+        .min(words.len());
+        let mut search_from = cleaned_cursor;
+        let mut matched = 0;
+        let mut last_match = None;
+        for word in &words {
+            let Some(candidates) = positions.get(word.as_str()) else {
+                continue;
+            };
+            let index = candidates.partition_point(|position| *position < search_from);
+            if let Some(position) = candidates.get(index).copied() {
+                matched += 1;
+                search_from = position + 1;
+                last_match = Some(position);
+            }
+        }
+        if matched < required {
+            return true;
+        }
+        if let Some(position) = last_match {
+            cleaned_cursor = position + 1;
+        }
+    }
+    false
+}
+
+fn words_at(words: &[String], index: usize, expected: &[&str]) -> bool {
+    words
+        .get(index..index + expected.len())
+        .is_some_and(|actual| {
+            actual
+                .iter()
+                .map(String::as_str)
+                .eq(expected.iter().copied())
+        })
 }
 
 /// A user-facing explanation for a cleanup failure, kept short for the result card.
@@ -235,6 +390,9 @@ pub fn cleanup_warning_text(error: &str) -> String {
         }
     } else if error.starts_with(LANGUAGE_GUARD) {
         "Cleanup was rejected because it changed the language. Original transcription kept.".into()
+    } else if error.starts_with(CONTENT_GUARD) {
+        "Cleanup was rejected because it omitted a recognized sentence. Original transcription kept."
+            .into()
     } else if error.starts_with("Cleanup reached") || error.starts_with("Text exceeds") {
         format!("{}.", error.trim_end_matches('.'))
     } else {
@@ -485,6 +643,7 @@ fn has_explicit_correction_marker(text: &str) -> bool {
         "i meant",
         "no wait",
         "scratch that",
+        "scratch ",
         "actually",
         "sorry",
         "or no",
@@ -1383,6 +1542,18 @@ mod tests {
     }
 
     #[test]
+    fn only_known_fillers_may_be_cleaned_to_nothing() {
+        assert!(super::filler_only("uh, um, basically"));
+        assert!(super::filler_only("äh ähm"));
+        assert!(!super::filler_only("you know"));
+        assert!(!super::filler_only("okay okay"));
+        assert!(!super::filler_only("uh send the report"));
+        assert!(!super::filler_only("you"));
+        assert!(!super::filler_only("okay"));
+        assert!(!super::filler_only(""));
+    }
+
+    #[test]
     fn cleanup_context_matches_training_order_and_escapes_untrusted_context() {
         let mut config = crate::config::Config::default();
         config.cleanup.custom_vocabulary = vec!["OmaFlow".into(), "A<B".into()];
@@ -1538,6 +1709,72 @@ mod tests {
         assert!(warning.contains("changed a number (\"Forty\")"));
         assert!(cleanup_warning_text("local cleanup failed: curl").contains("unavailable"));
         assert!(cleanup_warning_text(LANGUAGE_GUARD).contains("language"));
+    }
+
+    #[test]
+    fn cleanup_guard_rejects_a_missing_substantive_sentence() {
+        let source = "The launch starts on Thursday morning. Customers receive the migration guide by email.";
+        let cleaned = "The launch starts on Thursday morning.";
+        let error = cleanup_guard(source, cleaned).unwrap_err();
+        assert!(error.starts_with(CONTENT_GUARD));
+        assert!(cleanup_warning_text(&error).contains("omitted a recognized sentence"));
+
+        assert!(
+            cleanup_guard(
+                "Ship on Tuesday, no wait, scratch that, on Thursday and tell the team.",
+                "Ship on Thursday and tell the team."
+            )
+            .is_ok()
+        );
+
+        assert!(cleanup_guard("Do not ship.", "").is_err());
+        assert!(cleanup_guard("Do not ship.", "Do ship.").is_err());
+        assert!(
+            cleanup_guard("open localhost colon eight thousand", "open localhost:8000").is_ok()
+        );
+        assert!(
+            cleanup_guard(
+                "shopping list bullet point apples bullet point pears bullet point strawberries",
+                "- Apples\n- Pears\n- Strawberries"
+            )
+            .is_ok()
+        );
+        assert!(
+            cleanup_guard(
+                "um so I think we should uh ship the the release on Tuesday no wait scratch that on Thursday and then um tell the team",
+                "I think we should ship the release on Thursday and then tell the team."
+            )
+            .is_ok()
+        );
+        assert!(
+            cleanup_guard(
+                "Einkauf Doppelpunkt Aufzählungspunkt Äpfel Aufzählungspunkt Birnen",
+                "Einkauf:\n- Äpfel\n- Birnen"
+            )
+            .is_ok()
+        );
+        assert!(
+            cleanup_guard(
+                "the price is nine euros sorry I meant nineteen euros",
+                "The price is nineteen euros."
+            )
+            .is_ok()
+        );
+        assert!(cleanup_guard("on se voit lundi non plutôt mardi", "On se voit mardi.").is_ok());
+        assert!(
+            cleanup_guard(
+                "put together a list out of tomatoes onions and garlic hmm scratch the garlic use ginger instead",
+                "- Tomatoes\n- Onions\n- Ginger"
+            )
+            .is_ok()
+        );
+        assert!(
+            cleanup_guard(
+                "The service is ready. The service must remain stopped.",
+                "The service is ready."
+            )
+            .is_err()
+        );
     }
 
     #[test]

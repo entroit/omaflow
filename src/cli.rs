@@ -239,18 +239,18 @@ pub fn run() -> ExitCode {
                 }
             }
         }
-        "segment-file" => {
+        "transcribe-file" => {
             let result = args
                 .next()
-                .ok_or_else(|| "usage: omaflow segment-file FILE.wav".to_string())
+                .ok_or_else(|| "usage: omaflow transcribe-file FILE.wav".to_string())
                 .and_then(|path| {
                     Config::load().and_then(|config| {
-                        backend::segment_file(&config, std::path::Path::new(&path))
+                        backend::transcribe_file(&config, std::path::Path::new(&path))
                     })
                 });
             match result {
-                Ok(report) => {
-                    println!("{report}");
+                Ok(text) => {
+                    println!("{text}");
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
@@ -317,7 +317,7 @@ Settings: vocabulary-add TERM, vocabulary-remove TERM, configure KEY JSON
 Models: model-catalog, model-select speech|cleanup ID,
         model-install speech|cleanup ID, configure models JSON
 Microphone: meter-gate DB, meter-preview-start, meter-preview-stop
-Evaluation: cleanup < text, evaluate < JSON, segment-file FILE.wav, test-cleanup
+Evaluation: cleanup < text, evaluate < JSON, transcribe-file FILE.wav, test-cleanup
 Maintenance: daemon, launch, quit, reload-config, effective-config,
              version [--json], check-update, update check|request|later|run|reconcile"
     );

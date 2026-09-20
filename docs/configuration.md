@@ -43,7 +43,7 @@ settable in the TOML.
 | `[behavior] keep_models_loaded` | `true` | Keep the models loaded between dictations. `false` unloads the cleanup model and stops the managed speech server after five minutes without dictation; the next dictation loads them first. External servers are not touched. Settings → General. |
 | `[behavior] history_limit` | `30` | Entries kept, up to 1000; `0` saves nothing. Settings → Privacy. |
 | `[behavior] training_log_enabled` | `false` | Append raw ASR and cleaned output to an owner-only JSONL file under `~/.local/state/omaflow/`. Settings → Privacy. |
-| `[behavior] meter_gate_db` | `-60` | Voice threshold in dBFS. Below it the room counts as silence. Settings → Audio. |
+| `[behavior] meter_gate_db` | `-60` | Display threshold in dBFS for the meter's Voice detected indicator. It never removes recorded audio. Settings → Audio. |
 | `[behavior] paste_mode` | `"auto"` | `auto`, `ctrl-v`, `shift-insert`, `clipboard` or `custom`. Auto uses Shift+Insert in terminal-tagged windows and Ctrl+V elsewhere. Settings → General. |
 | `[behavior] paste_shortcut` | `{ modifiers = ["ctrl"], key = "V" }` | Chord used by `custom`. Choose one to four distinct `ctrl`, `shift`, `alt` or `super` modifiers and one XKB key name. Settings → General validates and saves the mode and chord together. |
 | `[behavior] max_recording_seconds` | `1200` | A recording stops itself here. |
@@ -53,8 +53,6 @@ settable in the TOML.
 | `[cleanup] use_window_context` | `true` | Put the focused window's class and title into the cleanup prompt so tone follows the app. |
 | `[cleanup] use_clipboard_context` | `false` | Put clipboard text into the cleanup prompt so copied names are spelled the same way. Off because clipboards hold passwords. |
 | `[cleanup] num_ctx` | `16384` | Context window for cleanup. Prompt, transcript, spelling context and answer must fit. OmaFlow estimates token usage for each request, including retries, and removes clipboard then window context before rejecting it. Capacity and memory use depend on content, model and runtime; there is no fixed duration guarantee. |
-| `[backend] live_segment_seconds` | `20` | Minimum audio before a pause can close a live transcription segment; `0` disables. |
-| `[backend] live_segment_tiers` | `[]` | Experimental. Extra rules such as `[{ seconds = 35, pause_ms = 400 }]`: once a segment is that long, that shorter pause closes it. Judge a rule with `tools/segment_compare.py` first. |
 
 Changing defaults never erases files already written; use Settings → Privacy →
 Erase saved dictations to delete history and training data. Audio is processed

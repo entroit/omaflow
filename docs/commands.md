@@ -52,7 +52,7 @@ History is empty unless `history_limit` is above zero.
 
 | Command | Effect |
 |---|---|
-| `meter-gate DB` | Set the voice threshold in dBFS. Below it, the recording is treated as silence. |
+| `meter-gate DB` | Set the dBFS threshold for the meter's Voice detected indicator. It does not filter recorded audio. |
 | `meter-gate-preview DB` | Try a threshold without saving it. |
 
 ## Models
@@ -75,7 +75,7 @@ goes in through `configure models` instead. See
 |---|---|
 | `cleanup < text` | Run the cleanup model over stdin and print the result. |
 | `evaluate < JSON` | Run cleanup and the safety guards over one JSON case (`transcript`, optional `clipboard`, `window`, `prompt`, `model`, `vocabulary`) and print the scored result. |
-| `segment-file FILE.wav` | Transcribe a 16 kHz mono WAV whole and through the live segmenter with the installed rules; print both as JSON. Used by `tools/segment_compare.py`. |
+| `transcribe-file FILE.wav` | Transcribe one complete 16 kHz mono 16-bit WAV with the configured speech backend. Used for regression checks and benchmarks. |
 
 ## Lifecycle and updates
 
