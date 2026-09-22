@@ -61,9 +61,9 @@ That runs `cargo fmt --check`, clippy with warnings denied, the Rust tests,
 a release build, the Python and Lua regression suites, shellcheck, `bash -n`
 and `git diff --check`. `scripts/check-local.sh --full` adds the model
 evaluation gates, the QML smoke test and `omarchy plugin validate .`; those
-need the cleanup model downloaded and an installed Omarchy shell. The release
-workflow also rebuilds the committed binary in a pinned Arch image and dated
-package snapshot, then compares every byte.
+need the cleanup model downloaded and an installed Omarchy shell. Release
+verification runs on the maintainer machine; this repository does not use
+GitHub Actions.
 
 ## Changes that need extra care
 
@@ -77,9 +77,9 @@ package snapshot, then compares every byte.
 - **Defaults.** They are embedded in the binary and only fill missing keys, so
   a changed default reaches new installs, not existing personal configs.
 - **Release binary.** Run `scripts/package-release` after the source and version
-  are final. Commit `dist/release.json` and the binary together. The script
-  records the size and SHA-256 digest that both the installer and updater
-  require.
+  are final, then run `scripts/package-release --verify`. Commit
+  `dist/release.json` and the binary together. The script records the size and
+  SHA-256 digest that both the installer and updater require.
 
 ## Model gates
 
