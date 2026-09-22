@@ -41,6 +41,6 @@ jq -n \
   --arg version "$version" \
   --arg sha "$sha" \
   --argjson bytes "$bytes" \
-  '{schemaVersion:1,pluginId:"entroit.omaflow",version:$version,summary:"Keep every sentence and install verified updates.",changes:["Transcribe each recording with its complete audio and context","Keep the raw transcript when cleanup drops a sentence or changes a number","See and install approved releases without a terminal","Set a custom paste shortcut in Settings","Restore the previous release when a health check fails"],binary:{target:"x86_64-unknown-linux-gnu",path:"dist/bin/x86_64-unknown-linux-gnu/omaflow",bytes:$bytes,sha256:$sha},stateSchemaVersion:4}' \
+  '{schemaVersion:1,pluginId:"entroit.omaflow",version:$version,summary:"Keep every sentence and install verified updates.",changes:["Retain recordings that finish just before the stop command","Keep the raw transcript when a cleanup response is incomplete","Let the cleanup model apply context-dependent corrections","See and install approved releases without a terminal","Restore the previous release when a health check fails"],binary:{target:"x86_64-unknown-linux-gnu",path:"dist/bin/x86_64-unknown-linux-gnu/omaflow",bytes:$bytes,sha256:$sha},stateSchemaVersion:4}' \
   >"$repo_dir/dist/release.json"
 printf 'Wrote %s (%s bytes, %s).\n' "$destination" "$bytes" "$sha"

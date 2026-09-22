@@ -29,7 +29,7 @@ exist.
 |---|---|
 | `src/main.rs` | The daemon: socket, session handling, delivery, history, published state. |
 | `src/state.rs` | The recording state machine (hold, double-tap lock, limits). |
-| `src/cleanup.rs` | Cleanup model requests and the output safety guards. |
+| `src/cleanup.rs` | Cleanup model requests and transport-completeness checks. |
 | `src/vocabulary.rs` | Exact custom-vocabulary normalization. |
 | `src/backend.rs` | Microphone capture, speech server client and the managed NeMo server. |
 | `src/catalog.rs` | The built-in model catalog, the downloader and what selecting an entry writes. |
@@ -67,8 +67,8 @@ GitHub Actions.
 
 ## Changes that need extra care
 
-- **The cleanup prompt** in `config/config.toml`. Run the four gates below and
-  include the numbers in the commit message.
+- **The cleanup prompt** in `config/config.toml`. Run the model gates below
+  locally. Keep research results and model comparisons out of the repository.
 - **The state file contract** between daemon and panel. Additive fields must
   have panel defaults and keep `STATE_VERSION`, so a cached panel and a newly
   restarted daemon remain compatible while Omarchy reloads the shell. Bump the
@@ -95,11 +95,11 @@ tools/dictation_modes_gate.py   # natural, verbatim, vocabulary, obsolete keys
 
 The first four take an optional prompt file (`-` keeps the installed one) and
 honor `OMAFLOW_BINARY`; the modes gate always uses `target/release/omaflow`.
-All exit nonzero on failure. They go through `omaflow evaluate`, so a guarded
-raw fallback is counted separately from a successful cleanup. Set
+All exit nonzero on failure. They go through `omaflow evaluate`, so a raw
+fallback is counted separately from a successful cleanup. Set
 `OMAFLOW_EVAL_JSONL=path` to keep every input, candidate and output. What the
-gates measure and the current results are in
-[why these models](docs/why-these-models.md).
+gates measure is documented in each script. Store result files outside the
+repository.
 
 ## Desktop checks
 

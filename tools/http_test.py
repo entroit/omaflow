@@ -74,7 +74,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-http-test-") as directory:
         config.write_text(
             f'[cleanup]\nenabled=true\nengine="{engine}"\n'
             f'endpoint="{origin}{path}"\nmodel="review-model"\n'
-            f'timeout_seconds={timeout}\nguard_retry=false\n'
+            f'timeout_seconds={timeout}\n'
             f'api_key={json.dumps(key)}\n'
             'system_prompt="PRIVATE_CUSTOM_PROMPT"\n'
             'custom_vocabulary=["PRIVATE_VOCABULARY"]\n'
@@ -104,6 +104,31 @@ with tempfile.TemporaryDirectory(prefix="omaflow-http-test-") as directory:
             assert report["fallback"] and report["text"] == TEXT
             assert len(requests) == 1, requests
     print("PASS permanent errors are not retried and preserve the raw transcript")
+
+    source = "The budget is fifty thousand, I mean sixty thousand euros"
+    cleaned = "The budget is sixty thousand euros."
+    for engine in ["openai", "ollama"]:
+        reply = ({"choices": [{"message": {"content": cleaned},
+                               "finish_reason": "stop"}]} if engine == "openai"
+                 else {"message": {"content": cleaned}, "done_reason": "stop"})
+        with server([{"body": reply}]) as (origin, requests):
+            configure(origin, engine)
+            result = run("evaluate", json.dumps({"transcript": source}))
+            report = json.loads(result.stdout)
+            assert not report["fallback"] and report["text"] == cleaned, report
+            assert report["candidate"] == cleaned
+            assert len(requests) == 1
+    print("PASS both cleanup protocols accept contextual corrections from the model")
+
+    filtered = {"choices": [{"message": {"content": "Send"},
+                              "finish_reason": "content_filter"}]}
+    with server([{"body": filtered}]) as (origin, requests):
+        configure(origin)
+        result = run("evaluate", json.dumps({"transcript": TEXT}))
+        report = json.loads(result.stdout)
+        assert report["fallback"] and report["text"] == TEXT, report
+        assert len(requests) == 1
+    print("PASS incomplete cleanup completion preserves the raw transcript")
 
     with server([{"status": 503}]) as (origin, requests):
         configure(origin)

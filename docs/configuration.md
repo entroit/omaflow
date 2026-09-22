@@ -49,10 +49,9 @@ settable in the TOML.
 | `[behavior] max_recording_seconds` | `1200` | A recording stops itself here. |
 | `[behavior] reduced_motion` | `false` | Disable panel animation. |
 | `[backend] api_key`, `[cleanup] api_key` | empty | Sent as an `Authorization: Bearer` header to a speech or cleanup server that wants one, and only when set. Never published to the panel or `effective-config`. Settings → Speech and Settings → Cleanup, as **API key (optional)**. See [running your own model](custom-models.md#if-your-server-needs-a-key). |
-| `[cleanup] guard_retry` | `true` | Retry once with numbers locked when a safety guard rejects the cleanup. |
 | `[cleanup] use_window_context` | `true` | Put the focused window's class and title into the cleanup prompt so tone follows the app. |
 | `[cleanup] use_clipboard_context` | `false` | Put clipboard text into the cleanup prompt so copied names are spelled the same way. Off because clipboards hold passwords. |
-| `[cleanup] num_ctx` | `16384` | Context window for cleanup. Prompt, transcript, spelling context and answer must fit. OmaFlow estimates token usage for each request, including retries, and removes clipboard then window context before rejecting it. Capacity and memory use depend on content, model and runtime; there is no fixed duration guarantee. |
+| `[cleanup] num_ctx` | `16384` | Context window for cleanup. Prompt, transcript, spelling context and answer must fit. OmaFlow estimates token usage for each request and removes clipboard then window context before rejecting it. Capacity and memory use depend on content, model and runtime; there is no fixed duration guarantee. |
 
 Changing defaults never erases files already written; use Settings → Privacy →
 Erase saved dictations to delete history and training data. Audio is processed

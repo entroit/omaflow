@@ -74,7 +74,7 @@ goes in through `configure models` instead. See
 | Command | Effect |
 |---|---|
 | `cleanup < text` | Run the cleanup model over stdin and print the result. |
-| `evaluate < JSON` | Run cleanup and the safety guards over one JSON case (`transcript`, optional `clipboard`, `window`, `prompt`, `model`, `vocabulary`) and print the scored result. |
+| `evaluate < JSON` | Run the production cleanup path over one JSON case (`transcript`, optional `clipboard`, `window`, `prompt`, `model`, `vocabulary`) and print the result. |
 | `transcribe-file FILE.wav` | Transcribe one complete 16 kHz mono 16-bit WAV with the configured speech backend. Used for regression checks and benchmarks. |
 
 ## Lifecycle and updates

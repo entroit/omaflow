@@ -4,17 +4,17 @@
   "version": "0.18.0",
   "summary": "Keep every sentence and install verified updates.",
   "changes": [
-    "Transcribe each recording with its complete audio and context",
-    "Keep the raw transcript when cleanup drops a sentence or changes a number",
+    "Retain recordings that finish just before the stop command",
+    "Keep the raw transcript when a cleanup response is incomplete",
+    "Let the cleanup model apply context-dependent corrections",
     "See and install approved releases without a terminal",
-    "Set a custom paste shortcut in Settings",
     "Restore the previous release when a health check fails"
   ],
   "binary": {
     "target": "x86_64-unknown-linux-gnu",
     "path": "dist/bin/x86_64-unknown-linux-gnu/omaflow",
-    "bytes": 2075192,
-    "sha256": "d25d5e6c71f2297c90a4c3e268e6bd862656a742909e21a00ade7e10223d995e"
+    "bytes": 2007008,
+    "sha256": "08746cd7bf5be09bb73bcda342dfd881079dc3833a62add2d446648e174e5fbd"
   },
   "stateSchemaVersion": 4
 }

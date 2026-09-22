@@ -212,7 +212,6 @@ pub struct Cleanup {
     pub use_window_context: bool,
     pub use_clipboard_context: bool,
     pub custom_vocabulary: Vec<String>,
-    pub guard_retry: bool,
     #[serde(skip_serializing)]
     pub api_key: String,
     pub system_prompt: String,
@@ -298,11 +297,10 @@ impl Default for Cleanup {
             context_max_chars: 4_000,
             num_ctx: 16_384,
             num_predict: -1,
-            stop_sequences: vec!["</think>".into()],
+            stop_sequences: Vec::new(),
             use_window_context: true,
             use_clipboard_context: false,
             custom_vocabulary: Vec::new(),
-            guard_retry: true,
             api_key: String::new(),
             system_prompt: DEFAULT_CLEANUP_PROMPT.into(),
             style: "natural".into(),
@@ -334,9 +332,15 @@ impl Config {
                 toml::from_str(&text).map_err(|e| format!("invalid {}: {e}", path.display()))?;
             merge_toml(&mut merged, overrides);
         }
-        let config: Self = merged
+        let mut config: Self = merged
             .try_into()
             .map_err(|error| format!("invalid effective OmaFlow configuration: {error}"))?;
+        if config.cleanup.engine == "ollama"
+            && config.cleanup.model.trim_end_matches(":latest") == "gemma4:e4b"
+            && config.cleanup.stop_sequences == ["</think>"]
+        {
+            config.cleanup.stop_sequences.clear();
+        }
         config.validate()?;
         Ok(config)
     }
@@ -702,6 +706,26 @@ fn complete_config(text: &str) -> Result<String, String> {
             cleanup["enabled"] = toml_edit::value(false);
         }
         cleanup.remove("style");
+        let uses_default_engine = cleanup
+            .get("engine")
+            .and_then(toml_edit::Item::as_str)
+            .is_none_or(|engine| engine == "ollama");
+        let uses_gemma = cleanup
+            .get("model")
+            .and_then(toml_edit::Item::as_str)
+            .is_none_or(|model| model.trim_end_matches(":latest") == "gemma4:e4b");
+        let obsolete_stop = uses_default_engine
+            && uses_gemma
+            && cleanup
+                .get("stop_sequences")
+                .and_then(toml_edit::Item::as_array)
+                .is_some_and(|values| {
+                    values.len() == 1
+                        && values.get(0).and_then(toml_edit::Value::as_str) == Some("</think>")
+                });
+        if obsolete_stop {
+            cleanup.remove("stop_sequences");
+        }
     }
     let defaults = include_str!("../config/config.toml")
         .parse::<toml_edit::DocumentMut>()
@@ -743,7 +767,7 @@ fn replace_toml_key(text: &str, section: &str, key: &str, value: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, PasteModifier, PasteShortcut, replace_toml_key};
+    use super::{Config, PasteModifier, PasteShortcut, complete_config, replace_toml_key};
 
     #[test]
     fn custom_paste_shortcut_rejects_unsafe_or_ambiguous_values() {
@@ -815,6 +839,25 @@ mod tests {
 
         config.cleanup.engine = "unknown".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn obsolete_gemma_think_stop_is_removed_from_saved_overrides() {
+        let completed =
+            complete_config("[cleanup]\nmodel = 'gemma4:e4b'\nstop_sequences = ['</think>']\n")
+                .unwrap();
+        let config: Config = toml::from_str(&completed).unwrap();
+        assert!(config.cleanup.stop_sequences.is_empty());
+        assert!(!completed.contains("</think>"));
+    }
+
+    #[test]
+    fn custom_model_think_stop_is_preserved() {
+        let completed =
+            complete_config("[cleanup]\nmodel = 'custom:model'\nstop_sequences = ['</think>']\n")
+                .unwrap();
+        let config: Config = toml::from_str(&completed).unwrap();
+        assert_eq!(config.cleanup.stop_sequences, ["</think>"]);
     }
 
     #[test]

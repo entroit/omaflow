@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Production safety gate on 180 real spoken-to-written pairs.
+"""Model-quality regression gate on 180 real spoken-to-written pairs.
 
-Fail on any changed ordered numeric sequence, or loss of more than one distinct
-content word. The word score tolerates one inflection/spelling difference and
-is reported separately; it is not an exact semantic-accuracy measurement.
-The original spoken numeric sequence is also accepted unchanged.
-Raw fallbacks are safe preservation, counted explicitly, not successful edits.
+Measure ordered numeric preservation and content-word retention. The scorer is
+deliberately approximate: it accepts the reference normalization or the original
+spoken sequence, and it tolerates one inflection or spelling difference. This
+gate catches large model regressions; it is not a semantic oracle for individual
+cleanup decisions. Transport fallbacks remain a hard failure.
 """
 import collections
 import json
@@ -53,5 +53,22 @@ print(f"{'TOTAL':10} {total[0]:3} {total[1]/total[0]:11.0%} {total[2]/total[0]:1
 print(f"\n{len(bad)} problem cases:")
 for case, output, changed, dropped in bad[:12]:
     print(f"\n[{case['class']}] numeric-change={changed} dropped={dropped}\n S: {case['spoken']}\n W: {case['written']}\n O: {output}")
-if bad:
+requirements = [
+    ("number-safe", total[1], 90),
+    ("no-dropped", total[2], 95),
+    ("both", total[3], 85),
+]
+failed = [
+    name
+    for name, count, minimum in requirements
+    if count * 100 < total[0] * minimum
+]
+if total[4]:
+    failed.append("raw fallback")
+if failed:
+    print(f"\nFAILED quality floors: {', '.join(failed)}")
     raise SystemExit(1)
+print(
+    "\nPASS quality floors: number-safe >= 90%, no-dropped >= 95%, "
+    "both >= 85%, no raw fallbacks"
+)

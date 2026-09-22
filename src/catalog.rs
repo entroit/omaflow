@@ -109,7 +109,7 @@ const CLEANUP: &[CatalogEntry] = &[
     CatalogEntry {
         id: "gemma4:e4b",
         label: "Gemma 4 E4B",
-        detail: "Passed 29 of 32 cases in OmaFlow's own multilingual cleanup benchmark, more than anything else tested. By far the largest download.",
+        detail: "The recommended multilingual cleanup model. It balances reliable editing with low cleanup latency on a 16 GB GPU.",
         size_mb: 9163,
         hardware: "About 10 GB of GPU memory",
         license: "Gemma Terms of Use",
@@ -136,7 +136,7 @@ const CLEANUP: &[CatalogEntry] = &[
     CatalogEntry {
         id: "qwen3:4b",
         label: "Qwen3 4B",
-        detail: "A quarter of Gemma 4 E4B's download and Apache licensed. Qwen models translated text in OmaFlow's cleanup benchmark rather than editing it, so check your own languages before relying on it.",
+        detail: "A compact Apache-licensed option. It is capable of punctuation and filler removal, but mixed-language cleanup is less reliable.",
         size_mb: 2382,
         hardware: "About 5 GB of GPU memory",
         license: "Apache-2.0",

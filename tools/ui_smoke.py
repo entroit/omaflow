@@ -51,9 +51,9 @@ with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
             {id:"nvidia/nemotron-speech-streaming-en-0.6b",label:"Nemotron Streaming English 0.6B",detail:"English only, built for streaming. The smallest download here, and the one to try on a machine without a usable GPU.",size_mb:700,hardware:"The lightest of these. Runs on CPU.",license:"NVIDIA Open Model License",tier:"light",installed:false,selected:false}
           ],
           cleanup: [
-            {id:"gemma4:e4b",label:"Gemma 4 E4B",detail:"Passed 29 of 32 cases in OmaFlow's own multilingual cleanup benchmark, more than anything else tested. By far the largest download.",size_mb:9163,hardware:"About 10 GB of GPU memory",license:"Gemma Terms of Use",tier:"recommended",installed:true,selected:true},
+            {id:"gemma4:e4b",label:"Gemma 4 E4B",detail:"The recommended multilingual cleanup model. It balances reliable editing with low cleanup latency on a 16 GB GPU.",size_mb:9163,hardware:"About 10 GB of GPU memory",license:"Gemma Terms of Use",tier:"recommended",installed:true,selected:true},
             {id:"nemotron-3-nano:4b",label:"Nemotron 3 Nano 4B",detail:"NVIDIA's small reasoning model, with a 256K context. English is well covered; its support for other languages is not documented.",size_mb:2706,hardware:"About 5 GB of GPU memory",license:"NVIDIA Open Model License",tier:"quality",installed:false,selected:false},
-            {id:"qwen3:4b",label:"Qwen3 4B",detail:"A quarter of Gemma 4 E4B's download and Apache licensed. Qwen models translated text in OmaFlow's cleanup benchmark rather than editing it, so check your own languages before relying on it.",size_mb:2382,hardware:"About 5 GB of GPU memory",license:"Apache-2.0",tier:"light",installed:false,selected:false}
+            {id:"qwen3:4b",label:"Qwen3 4B",detail:"A compact Apache-licensed option. It is capable of punctuation and filler removal, but mixed-language cleanup is less reliable.",size_mb:2382,hardware:"About 5 GB of GPU memory",license:"Apache-2.0",tier:"light",installed:false,selected:false}
           ]
         }
         root.shortcutSettings = {keys:["ISO_Level3_Shift","Menu"],consumed:["Menu"]}

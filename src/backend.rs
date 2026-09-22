@@ -90,6 +90,7 @@ pub struct Runtime {
     config: Config,
     meter_gate_db: Arc<AtomicI32>,
     recording: Option<CaptureSession>,
+    completed_recording: Option<CapturedAudio>,
     preview: Option<MeterPreviewSession>,
     /// Last dictation activity, for releasing models after an idle spell.
     last_activity: Instant,
@@ -332,6 +333,11 @@ struct CaptureSession {
     worker: thread::JoinHandle<()>,
 }
 
+enum Recording {
+    Active(CaptureSession),
+    Complete(CapturedAudio),
+}
+
 struct MeterPreviewSession {
     control: Arc<AtomicU8>,
     worker: thread::JoinHandle<()>,
@@ -343,6 +349,7 @@ impl Runtime {
             config,
             meter_gate_db: Arc::new(AtomicI32::new(meter_gate_db.clamp(-70, -35))),
             recording: None,
+            completed_recording: None,
             preview: None,
             last_activity: Instant::now(),
             idle_released: false,
@@ -456,6 +463,12 @@ impl Runtime {
     pub fn capture_error(&mut self) -> Option<String> {
         let session = self.recording.as_ref()?;
         match session.result.try_recv() {
+            Ok(Ok(captured)) => {
+                let session = self.recording.take().unwrap();
+                let _ = session.worker.join();
+                self.completed_recording = Some(captured);
+                None
+            }
             Ok(Err(error)) => {
                 let session = self.recording.take().unwrap();
                 let _ = session.worker.join();
@@ -504,6 +517,7 @@ impl Runtime {
             &self.config,
             Arc::clone(&self.meter_gate_db),
         )?);
+        self.completed_recording = None;
         Ok(())
     }
 
@@ -511,12 +525,12 @@ impl Runtime {
         let fake = fake_transcript_override();
         let recording = if fake.is_some() {
             None
+        } else if let Some(captured) = self.completed_recording.take() {
+            Some(Recording::Complete(captured))
         } else {
-            Some(
-                self.recording
-                    .take()
-                    .ok_or_else(|| "microphone recording is not active".to_string())?,
-            )
+            Some(Recording::Active(self.recording.take().ok_or_else(
+                || "microphone recording is not active".to_string(),
+            )?))
         };
         let config = self.config.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -561,6 +575,7 @@ impl Runtime {
     }
 
     pub fn cancel(&mut self) {
+        self.completed_recording = None;
         if let Some(session) = self.recording.take() {
             session.control.store(2, Ordering::Release);
             let _ = session.result.recv_timeout(Duration::from_millis(750));
@@ -983,16 +998,10 @@ fn signal_audio_capture(capture: &Child, signal: libc::c_int) -> Result<(), Stri
 
 fn stop_recording(
     config: &Config,
-    session: CaptureSession,
+    recording: Recording,
     cancel: &AtomicBool,
 ) -> Result<StopOutcome, String> {
     let total_started = Instant::now();
-    let CaptureSession {
-        control,
-        result,
-        worker,
-    } = session;
-    control.store(1, Ordering::Release);
     let window = active_window();
     let backend_started = Instant::now();
     let previous = if config.cleanup.use_clipboard_context {
@@ -1001,38 +1010,48 @@ fn stop_recording(
         ClipboardSnapshot::Empty
     };
 
-    let deadline = Instant::now() + Duration::from_millis(config.backend.status_timeout_ms);
-    let captured = loop {
-        if cancel.load(Ordering::Acquire) {
-            control.store(2, Ordering::Release);
-            if result
-                .recv_timeout(CAPTURE_DRAIN_TIMEOUT + CAPTURE_KILL_TIMEOUT)
-                .is_ok()
-            {
-                let _ = worker.join();
-            }
-            return Err("dictation cancelled".into());
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            control.store(2, Ordering::Release);
-            if result
-                .recv_timeout(CAPTURE_DRAIN_TIMEOUT + CAPTURE_KILL_TIMEOUT)
-                .is_ok()
-            {
-                let _ = worker.join();
-            }
-            return Err("timed out finalizing microphone capture".into());
-        }
-        match result.recv_timeout(remaining.min(Duration::from_millis(20))) {
-            Ok(captured) => {
-                let _ = worker.join();
-                break captured?;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = worker.join();
-                return Err("microphone capture worker stopped".into());
+    let captured = match recording {
+        Recording::Complete(captured) => captured,
+        Recording::Active(CaptureSession {
+            control,
+            result,
+            worker,
+        }) => {
+            control.store(1, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_millis(config.backend.status_timeout_ms);
+            loop {
+                if cancel.load(Ordering::Acquire) {
+                    control.store(2, Ordering::Release);
+                    if result
+                        .recv_timeout(CAPTURE_DRAIN_TIMEOUT + CAPTURE_KILL_TIMEOUT)
+                        .is_ok()
+                    {
+                        let _ = worker.join();
+                    }
+                    return Err("dictation cancelled".into());
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    control.store(2, Ordering::Release);
+                    if result
+                        .recv_timeout(CAPTURE_DRAIN_TIMEOUT + CAPTURE_KILL_TIMEOUT)
+                        .is_ok()
+                    {
+                        let _ = worker.join();
+                    }
+                    return Err("timed out finalizing microphone capture".into());
+                }
+                match result.recv_timeout(remaining.min(Duration::from_millis(20))) {
+                    Ok(captured) => {
+                        let _ = worker.join();
+                        break captured?;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        let _ = worker.join();
+                        return Err("microphone capture worker stopped".into());
+                    }
+                }
             }
         }
     };
@@ -1689,6 +1708,28 @@ mod tests {
             u32::from_le_bytes(wav[40..44].try_into().unwrap()) as usize,
             input.len()
         );
+    }
+
+    #[test]
+    fn capture_poll_retains_a_recording_that_finished_before_stop() {
+        use super::{CaptureSession, Runtime};
+        use std::sync::{Arc, atomic::AtomicU8, mpsc};
+
+        let mut captured = CapturedAudio::new().unwrap();
+        captured.push(&[1, 0, 2, 0]).unwrap();
+        captured.finish().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(Ok(captured)).unwrap();
+        let worker = std::thread::spawn(|| {});
+        let mut runtime = Runtime::new(crate::config::Config::default(), -60);
+        runtime.recording = Some(CaptureSession {
+            control: Arc::new(AtomicU8::new(0)),
+            result: receiver,
+            worker,
+        });
+        assert!(runtime.capture_error().is_none());
+        assert!(runtime.recording.is_none());
+        assert_eq!(runtime.completed_recording.as_ref().unwrap().pcm_bytes, 4);
     }
 
     #[test]
