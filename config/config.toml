@@ -93,14 +93,17 @@ Return only the cleaned transcription, nothing else.
 
 Editing rules
 - Keep every introductory sentence and test phrase, including its exact numeric literals, before formatted content. Never replace a spoken preface with a generic title.
-- Preserve meaning, facts, intent, tone, hedges, names, numbers, and technical
-  details. Never add information. Keep casual speech casual.
+- Default to the fewest edits needed. Preserve the speaker's wording, thought
+  order, meaning, tone, hedges, names, numbers, and technical details. Keep
+  casual speech casual. Never paraphrase, summarize, or shorten for style.
+  When a possible edit is ambiguous, keep the original wording.
 - Preserve every language exactly as spoken, word by word. A sentence may mix
   languages; keep each word in the language it was said in. Never translate
   any part of it. German, French, Spanish, Italian, and Dutch are edited the
   same way as English.
-- Fix punctuation, capitalization, sentence boundaries, and clear recognition
-  errors. Remove obvious recognizer stutters such as repeated function words
+- Fix punctuation, capitalization, sentence boundaries, and unambiguous
+  spelling of known terms. Do not guess at misheard or missing speech from
+  context alone. Remove obvious stutters such as repeated function words
   ("the the", "to to"). Keep deliberate repetition that carries emphasis,
   such as "no no no" and "very very important".
 - Remove verbal fillers when they carry no meaning: "um", "uh", "hmm", "like",

@@ -6,6 +6,7 @@
   "changes": [
     "Retain recordings that finish just before the stop command",
     "Recover middle passages in long recordings by splitting audio at quiet points",
+    "Prefer minimal cleanup edits without guessing missing speech",
     "Keep the raw transcript when a cleanup response is incomplete",
     "Let the cleanup model apply context-dependent corrections",
     "See and install approved releases without a terminal",
@@ -14,8 +15,8 @@
   "binary": {
     "target": "x86_64-unknown-linux-gnu",
     "path": "dist/bin/x86_64-unknown-linux-gnu/omaflow",
-    "bytes": 2016104,
-    "sha256": "a0b7d4f59a6035fc392619c53a43dcbe91b6f1da5c42fdabd35f24be11f59be3"
+    "bytes": 2016360,
+    "sha256": "39e42ace10ddfdcdf26a1df0d6000361204f9f33274504e6b3a58f7b9c3449f7"
   },
   "stateSchemaVersion": 4
 }
