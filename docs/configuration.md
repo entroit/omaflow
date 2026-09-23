@@ -26,8 +26,8 @@ edit by hand.
 To change a setting by hand, edit the personal TOML, then run
 `omaflow reload-config` while idle. `omaflow effective-config` prints the
 merged result. `omaflow config-init` fills every missing key, including the
-cleanup prompt, without changing values already chosen; installation and
-relinking run it, so personal values survive changes to the bundled defaults.
+cleanup prompt. It updates exact copies of earlier bundled prompts and
+preserves prompts you edited yourself. Installation and relinking run it.
 
 ## Keys and defaults
 

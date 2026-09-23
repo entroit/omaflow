@@ -3,6 +3,18 @@ use std::{env, fs, os::unix::fs::PermissionsExt, path::PathBuf, str::FromStr};
 
 const DEFAULT_CLEANUP_PROMPT: &str = "Transform the transcript into clean dictated text. Preserve its meaning and language, never answer it, and return only the final text.";
 
+fn is_previous_bundled_cleanup_prompt(prompt: &str) -> bool {
+    // Only replace exact shipped defaults. Personal edits must survive updates.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in prompt.bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    matches!(
+        (prompt.len(), hash),
+        (8299, 0x09e10e155a9758e1) | (8508, 0x2c8e89044ee0a1c9)
+    )
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -325,6 +337,10 @@ impl Config {
         let path = Self::path();
         let mut merged: toml::Value = toml::from_str(include_str!("../config/config.toml"))
             .map_err(|error| format!("invalid bundled OmaFlow defaults: {error}"))?;
+        let bundled_prompt = merged["cleanup"]["system_prompt"]
+            .as_str()
+            .unwrap()
+            .to_string();
         if path.exists() {
             let text = fs::read_to_string(&path)
                 .map_err(|e| format!("could not read {}: {e}", path.display()))?;
@@ -335,6 +351,9 @@ impl Config {
         let mut config: Self = merged
             .try_into()
             .map_err(|error| format!("invalid effective OmaFlow configuration: {error}"))?;
+        if is_previous_bundled_cleanup_prompt(&config.cleanup.system_prompt) {
+            config.cleanup.system_prompt = bundled_prompt;
+        }
         if config.cleanup.engine == "ollama"
             && config.cleanup.model.trim_end_matches(":latest") == "gemma4:e4b"
             && config.cleanup.stop_sequences == ["</think>"]
@@ -669,6 +688,9 @@ fn complete_config(text: &str) -> Result<String, String> {
     let mut document = text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| e.to_string())?;
+    let defaults = include_str!("../config/config.toml")
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| e.to_string())?;
     // A hand-written shortcut Lua file seeds [shortcut] before defaults fill the table.
     if document.get("shortcut").is_none() {
         let base = env::var_os("XDG_CONFIG_HOME")
@@ -726,10 +748,14 @@ fn complete_config(text: &str) -> Result<String, String> {
         if obsolete_stop {
             cleanup.remove("stop_sequences");
         }
+        if cleanup
+            .get("system_prompt")
+            .and_then(toml_edit::Item::as_str)
+            .is_some_and(is_previous_bundled_cleanup_prompt)
+        {
+            cleanup["system_prompt"] = defaults["cleanup"]["system_prompt"].clone();
+        }
     }
-    let defaults = include_str!("../config/config.toml")
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| e.to_string())?;
     for (section, item) in defaults.iter() {
         if document.get(section).is_none() {
             document[section] = item.clone();
