@@ -124,6 +124,11 @@ struct CapturedAudio {
 }
 
 const BYTES_PER_SECOND: usize = 32_000;
+const NEMO_SEGMENT_AFTER_SECONDS: usize = 45;
+const SEGMENT_TARGET_SECONDS: usize = 30;
+const SEGMENT_MIN_SECONDS: usize = 25;
+const SEGMENT_MAX_SECONDS: usize = 35;
+const ENERGY_FRAME_BYTES: usize = BYTES_PER_SECOND / 10;
 const CAPTURE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const CAPTURE_KILL_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -1094,13 +1099,110 @@ fn transcribe_audio(
     if captured.is_empty() {
         return Err("recording contained no microphone audio".into());
     }
-    transcribe_request(
-        config,
-        &captured.curl_form(),
-        Some(captured.file.as_raw_fd()),
-        b"",
-        cancel,
-    )
+    let text = if config.backend.engine == "nemo"
+        && captured.pcm_bytes > NEMO_SEGMENT_AFTER_SECONDS * BYTES_PER_SECOND
+    {
+        let boundaries = quiet_segment_boundaries(captured)?;
+        let mut source = captured
+            .file
+            .try_clone()
+            .map_err(|error| format!("could not read recording: {error}"))?;
+        let mut parts = Vec::with_capacity(boundaries.len() - 1);
+        for pair in boundaries.windows(2) {
+            if cancel.load(Ordering::Acquire) {
+                return Err("dictation cancelled".into());
+            }
+            source
+                .seek(SeekFrom::Start(44 + pair[0] as u64))
+                .map_err(|error| format!("could not read recording: {error}"))?;
+            let mut segment = CapturedAudio::new()?;
+            let mut remaining = pair[1] - pair[0];
+            let mut buffer = [0_u8; 64 * 1024];
+            while remaining > 0 {
+                let count = remaining.min(buffer.len());
+                source
+                    .read_exact(&mut buffer[..count])
+                    .map_err(|error| format!("could not read recording: {error}"))?;
+                segment.push(&buffer[..count])?;
+                remaining -= count;
+            }
+            segment.finish()?;
+            let part = transcribe_request(
+                config,
+                &segment.curl_form(),
+                Some(segment.file.as_raw_fd()),
+                b"",
+                cancel,
+            )?;
+            if !part.is_empty() {
+                parts.push(part);
+            }
+        }
+        parts.join(" ")
+    } else {
+        transcribe_request(
+            config,
+            &captured.curl_form(),
+            Some(captured.file.as_raw_fd()),
+            b"",
+            cancel,
+        )?
+    };
+    if text.is_empty() {
+        Err("speech server returned an empty transcript".into())
+    } else {
+        Ok(text)
+    }
+}
+
+fn quiet_segment_boundaries(captured: &CapturedAudio) -> Result<Vec<usize>, String> {
+    let mut source = captured
+        .file
+        .try_clone()
+        .map_err(|error| format!("could not read recording: {error}"))?;
+    source
+        .seek(SeekFrom::Start(44))
+        .map_err(|error| format!("could not read recording: {error}"))?;
+    let mut energy = Vec::with_capacity(captured.pcm_bytes.div_ceil(ENERGY_FRAME_BYTES));
+    let mut frame = [0_u8; ENERGY_FRAME_BYTES];
+    let mut remaining = captured.pcm_bytes;
+    while remaining > 0 {
+        let count = remaining.min(frame.len());
+        source
+            .read_exact(&mut frame[..count])
+            .map_err(|error| format!("could not read recording: {error}"))?;
+        let (samples, _) = frame[..count].as_chunks::<2>();
+        energy.push(
+            samples
+                .iter()
+                .map(|sample| {
+                    let value = i64::from(i16::from_le_bytes(*sample));
+                    (value * value) as u64
+                })
+                .sum::<u64>(),
+        );
+        remaining -= count;
+    }
+
+    let mut boundaries = vec![0];
+    let mut start = 0;
+    while captured.pcm_bytes - start > SEGMENT_MAX_SECONDS * BYTES_PER_SECOND {
+        let first = (start + SEGMENT_MIN_SECONDS * BYTES_PER_SECOND) / ENERGY_FRAME_BYTES;
+        let last = ((start + SEGMENT_MAX_SECONDS * BYTES_PER_SECOND)
+            .min(captured.pcm_bytes - 5 * BYTES_PER_SECOND))
+            / ENERGY_FRAME_BYTES;
+        let target = (start + SEGMENT_TARGET_SECONDS * BYTES_PER_SECOND) / ENERGY_FRAME_BYTES;
+        let quietest = (first..last)
+            .min_by_key(|&index| {
+                let energy = energy[index - 1] + energy[index] + energy[index + 1];
+                (energy, index.abs_diff(target))
+            })
+            .expect("long recording has a segment boundary");
+        start = quietest * ENERGY_FRAME_BYTES;
+        boundaries.push(start);
+    }
+    boundaries.push(captured.pcm_bytes);
+    Ok(boundaries)
 }
 
 fn transcribe_request(
@@ -1164,11 +1266,7 @@ fn transcribe_request(
         .map(str::trim)
         .map(ToOwned::to_owned)
         .ok_or_else(|| "invalid speech server response: missing text".to_string())?;
-    if text.is_empty() {
-        Err("speech server returned an empty transcript".into())
-    } else {
-        Ok(text)
-    }
+    Ok(text)
 }
 
 fn inherit_recording_fd(command: &mut Command, descriptor: libc::c_int) {
@@ -1906,6 +2004,86 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn long_nemo_recording_sends_every_sample_in_order() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let mut pcm = vec![0_u8; 72 * super::BYTES_PER_SECOND];
+        for second in 0..72 {
+            let value = (second as i16 + 1).to_le_bytes();
+            pcm[second * super::BYTES_PER_SECOND..][..2].copy_from_slice(&value);
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut audio = Vec::new();
+            for part in 1..=3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 64 * 1024];
+                let mut header_end = None;
+                let mut content_length = None;
+                loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if header_end.is_none()
+                        && let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        content_length = Some(
+                            headers
+                                .lines()
+                                .find_map(|line| line.strip_prefix("content-length:"))
+                                .unwrap()
+                                .trim()
+                                .parse::<usize>()
+                                .unwrap(),
+                        );
+                        header_end = Some(end + 4);
+                        if headers.contains("expect: 100-continue") {
+                            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+                        }
+                    }
+                    if let (Some(end), Some(length)) = (header_end, content_length)
+                        && request.len() >= end + length
+                    {
+                        break;
+                    }
+                }
+                let wav_start = request
+                    .windows(4)
+                    .position(|bytes| bytes == b"RIFF")
+                    .unwrap();
+                let wav_bytes =
+                    u32::from_le_bytes(request[wav_start + 40..wav_start + 44].try_into().unwrap())
+                        as usize;
+                assert!(wav_bytes <= 35 * super::BYTES_PER_SECOND);
+                audio.extend_from_slice(&request[wav_start + 44..wav_start + 44 + wav_bytes]);
+                let body = format!(r#"{{"text":"part {part}"}}"#);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            audio
+        });
+        let mut config = crate::config::Config::default();
+        config.backend.engine = "nemo".into();
+        config.backend.endpoint = format!("http://127.0.0.1:{port}/transcribe");
+        let text = super::transcribe_speech(&config, &pcm, &AtomicBool::new(false)).unwrap();
+        assert_eq!(text, "part 1 part 2 part 3");
+        assert_eq!(server.join().unwrap(), pcm);
     }
 
     #[test]
