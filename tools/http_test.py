@@ -17,7 +17,7 @@ BINARY = ROOT / "target/release/omaflow"
 TEXT = "Send the report."
 KEY = "review-secret\\credential"
 OPENAI = {"choices": [{"message": {"content": TEXT}, "finish_reason": "stop"}]}
-OLLAMA = {"message": {"content": TEXT}, "done_reason": "stop"}
+OLLAMA = {"message": {"content": TEXT}, "done": True, "done_reason": "stop"}
 
 
 @contextmanager
@@ -110,7 +110,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-http-test-") as directory:
     for engine in ["openai", "ollama"]:
         reply = ({"choices": [{"message": {"content": cleaned},
                                "finish_reason": "stop"}]} if engine == "openai"
-                 else {"message": {"content": cleaned}, "done_reason": "stop"})
+                 else {"message": {"content": cleaned}, "done": True, "done_reason": "stop"})
         with server([{"body": reply}]) as (origin, requests):
             configure(origin, engine)
             result = run("evaluate", json.dumps({"transcript": source}))
@@ -120,14 +120,20 @@ with tempfile.TemporaryDirectory(prefix="omaflow-http-test-") as directory:
             assert len(requests) == 1
     print("PASS both cleanup protocols accept contextual corrections from the model")
 
-    filtered = {"choices": [{"message": {"content": "Send"},
-                              "finish_reason": "content_filter"}]}
-    with server([{"body": filtered}]) as (origin, requests):
-        configure(origin)
-        result = run("evaluate", json.dumps({"transcript": TEXT}))
-        report = json.loads(result.stdout)
-        assert report["fallback"] and report["text"] == TEXT, report
-        assert len(requests) == 1
+    incomplete = [
+        ("openai", {"choices": [{"message": {"content": "Send"},
+                                 "finish_reason": "content_filter"}]}),
+        ("openai", {"choices": [{"message": {"content": "Send"}}]}),
+        ("ollama", {"message": {"content": "Send"}, "done": False}),
+        ("ollama", {"message": {"content": "Send"}, "done_reason": "stop"}),
+    ]
+    for engine, reply in incomplete:
+        with server([{"body": reply}]) as (origin, requests):
+            configure(origin, engine)
+            result = run("evaluate", json.dumps({"transcript": TEXT}))
+            report = json.loads(result.stdout)
+            assert report["fallback"] and report["text"] == TEXT, report
+            assert len(requests) == 1
     print("PASS incomplete cleanup completion preserves the raw transcript")
 
     with server([{"status": 503}]) as (origin, requests):

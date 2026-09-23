@@ -280,13 +280,23 @@ fn reply_hit_output_limit(config: &Config, body: &Value) -> bool {
 }
 
 fn reply_incomplete(config: &Config, body: &Value) -> Option<String> {
-    let reason = if config.cleanup.engine == "openai" {
-        body.pointer("/choices/0/finish_reason")
+    if config.cleanup.engine == "openai" {
+        return match body
+            .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)
-    } else {
-        body.get("done_reason").and_then(Value::as_str)
-    }?;
-    (!matches!(reason, "stop" | "length")).then(|| reason.to_string())
+        {
+            Some("stop" | "length") => None,
+            Some(reason) => Some(reason.to_string()),
+            None => Some("missing finish reason".into()),
+        };
+    }
+    if body.get("done").and_then(Value::as_bool) != Some(true) {
+        return Some("Ollama did not finish".into());
+    }
+    match body.get("done_reason").and_then(Value::as_str) {
+        Some("stop" | "length") | None => None,
+        Some(reason) => Some(reason.to_string()),
+    }
 }
 
 pub fn cleanup_text(config: &Config, transcript: &str) -> Result<String, String> {
@@ -624,5 +634,19 @@ mod tests {
             "choices": [{"message": {"content": "Complete"}, "finish_reason": "stop"}]
         });
         assert_eq!(reply_incomplete(&config, &stopped), None);
+        let unmarked = json!({"choices": [{"message": {"content": "Partial"}}]});
+        assert_eq!(
+            reply_incomplete(&config, &unmarked).as_deref(),
+            Some("missing finish reason")
+        );
+
+        config.cleanup.engine = "ollama".into();
+        let unfinished = json!({"message": {"content": "Partial"}, "done": false});
+        assert_eq!(
+            reply_incomplete(&config, &unfinished).as_deref(),
+            Some("Ollama did not finish")
+        );
+        let finished = json!({"message": {"content": "Complete"}, "done": true});
+        assert_eq!(reply_incomplete(&config, &finished), None);
     }
 }

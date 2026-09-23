@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Model-quality regression gate on 180 real spoken-to-written pairs.
+"""Regression gate on 180 spoken-to-written text pairs of undocumented provenance.
 
 Measure ordered numeric preservation and content-word retention. The scorer is
 deliberately approximate: it accepts the reference normalization or the original
 spoken sequence, and it tolerates one inflection or spelling difference. This
-gate catches large model regressions; it is not a semantic oracle for individual
-cleanup decisions. Transport fallbacks remain a hard failure.
+gate catches some large model regressions; it is not evidence of overall cleanup
+quality or a semantic oracle for individual decisions. Transport fallbacks remain
+a hard failure.
 """
 import collections
 import json

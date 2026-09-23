@@ -51,8 +51,8 @@ status_timeout_ms = 60000
 # Natural cleanup is opt-in: with this off OmaFlow transcribes and pastes, and
 # nothing else has to be installed. Turning it on needs Ollama or an
 # OpenAI-compatible chat server and a cleanup model.
-# Gemma 4 E4B is the best balance of multilingual cleanup quality and latency
-# among the local models tested on OmaFlow's target hardware.
+# Gemma 4 E4B is the current local default. Its multilingual quality still
+# needs evaluation on real OmaFlow dictations.
 [cleanup]
 enabled = false
 engine = "ollama"
@@ -69,7 +69,7 @@ num_ctx = 16384
 num_predict = -1
 stop_sequences = []
 # Window class and title of the focused app go into the cleanup prompt. Not in
-# the panel: it is a title, not content, and it is what makes tone follow the app.
+# the panel: it is a title, not content, and can help spell app-specific terms.
 use_window_context = true
 # Clipboard text goes into the prompt so copied names are spelled the same way.
 # Off by default because clipboards hold passwords. Not in the panel either.
