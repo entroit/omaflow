@@ -5,7 +5,7 @@
 # It deliberately installs no models. Weights and the ASR runtime are about
 # 10 GB and used to stand between a fresh clone and the first screen. Which
 # speech model to fetch, and whether this machine can run it, is the user's
-# decision: Settings -> Speech lists size, hardware need and licence, and the
+# decision: Settings -> Advanced -> Models lists size, hardware need and licence, and the
 # runtime is installed with the first model actually downloaded.
 #
 # Safe to re-run. Every step checks before it acts, so a run that failed
@@ -153,7 +153,7 @@ say 'Plan'
 ((need_bindings)) && step "add require(\"omaflow\") to $bindings"
 step 'install the bundled OmaFlow binary and desktop integration'
 if ((first_install)); then
-  step 'download no models; choose a speech model afterwards in Settings -> Speech'
+  step 'download no models; choose a speech model afterwards in Settings -> Advanced -> Models'
 else
   step 'preserve the existing model configuration and download no models'
 fi
@@ -241,7 +241,7 @@ else
 fi
 
 if ((first_install)); then
-  step 'no model configured yet; choose one in Settings -> Speech'
+  step 'no model configured yet; choose one in Settings -> Advanced -> Models'
 else
   step 'the existing model configuration is preserved'
 fi
@@ -256,7 +256,7 @@ hotkey_display="$(sed -n 's/^local omaflow_hotkey = { //p' "$hotkey_file" 2>/dev
 say 'Done'
 printf 'OmaFlow is installed. Your hotkey is %s.\n' "${hotkey_display:-your hotkey}"
 if ((first_install)); then
-  printf 'Next step: open the OmaFlow panel and pick a speech model in Settings -> Speech.\n'
+  printf 'Next step: open the OmaFlow window and pick a speech model in Settings -> Advanced -> Models.\n'
   printf 'It downloads there, with its size and hardware needs shown before you commit.\n'
 else
   printf 'OmaFlow is ready with your existing settings.\n'

@@ -2,18 +2,20 @@
   "schemaVersion": 1,
   "id": "entroit.omaflow",
   "name": "OmaFlow",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "author": "Entroit",
   "license": "MIT",
   "description": "Fast, private local dictation for Omarchy.",
-  "kinds": ["bar-widget"],
+  "kinds": [
+    "bar-widget"
+  ],
   "keepLoaded": true,
   "entryPoints": {
-    "barWidget": "OmaFlow.qml"
+    "barWidget": "hosts/omarchy/OmaFlow.qml"
   },
   "barWidget": {
     "displayName": "OmaFlow",
-    "description": "Local dictation status, history, and settings",
+    "description": "Dictation, history, a spoken journal, and settings",
     "category": "Utilities",
     "allowMultiple": false,
     "defaultSection": "right"

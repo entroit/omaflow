@@ -80,6 +80,7 @@ fi
 backup_and_link "$repo_dir" "$config_home/omarchy/plugins/entroit.omaflow" "entroit.omaflow"
 "$binary" config-init
 python3 "$repo_dir/tools/set_hotkey.py" --sync --write-only
+python3 "$repo_dir/tools/journal_folder.py" --write-only
 backup_and_link "$config_home/omaflow/shortcut.lua" "$config_home/hypr/omaflow-hotkey.lua" "omaflow-hotkey.lua"
 mkdir -p "$HOME/.local/state/omaflow"
 chmod 700 "$HOME/.local/state/omaflow"

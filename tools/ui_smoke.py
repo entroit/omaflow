@@ -1,251 +1,152 @@
 #!/usr/bin/env python3
-"""Render actual QML views with synthetic data and installed Omarchy components.
-Does not run dictation, copy text, change settings, or replace the live shell.
-Layer-shell placement and physical keyboard/audio tests remain desktop checks.
+"""Render and load the real UI without touching the desktop.
+
+1. Renders every screen of the shared UI (ui/) with sample data on plain Qt,
+   no Quickshell, and saves PNGs.
+2. Loads the Omarchy host (hosts/omarchy) in an offscreen Quickshell with a
+   fake daemon state, and fails on any QML warning.
+3. Runs the connection tester's result handling against stubbed replies.
+
+Layer-shell placement, the real keyboard and audio remain desktop checks.
 """
 import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
+
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--output", type=Path)
 args = parser.parse_args()
-output = args.output or Path(tempfile.mkdtemp(prefix="omaflow-ui-images-"))
+output = (args.output or Path(tempfile.mkdtemp(prefix="omaflow-ui-images-"))).resolve()
 output.mkdir(parents=True, exist_ok=True)
-output = output.resolve()
-shell = Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"))/"shell"
-if not shell.is_dir(): raise SystemExit("UI smoke tests require an installed Omarchy shell")
-with tempfile.TemporaryDirectory(prefix="omaflow-ui-smoke-") as staging:
-    p=Path(staging)
-    for d in shell.iterdir():
-        if d.is_dir() and not (p/d.name).exists(): (p/d.name).symlink_to(d,target_is_directory=True)
-    s=(ROOT/'OmaFlow.qml').read_text()
-    s=s.replace('import QtQuick\n','import QtQuick\nimport QtQuick.Window\n',1).replace('Panel {','Item {',1)
-    s=s.replace('  moduleName: "entroit.omaflow"\n  ipcTarget: "entroit.omaflow"','''  property bool opened: true
-      property var bar: null
-      property QtObject controller: QtObject { function hide() {} function show() {} }
-      property var auditCalls: []
-      function auditExec(args) { auditCalls.push(args) }
-      property string auditMode: Quickshell.env("AUDIT_MODE") || "history"
-    ''',1)
-    s=s.replace('implicitWidth: barButton.implicitWidth','implicitWidth: 520').replace('implicitHeight: barButton.implicitHeight','implicitHeight: 610')
-    s=s.replace('Quickshell.execDetached','root.auditExec')
-    a=s.index('  onMeterPreviewActiveChanged:'); b=s.index('  Component {\n    id: pillBarsIcon',a); s=s[:a]+s[b:]
-    a=s.index('  BarIconButton {'); b=s.index('  component Waveform:',a); s=s[:a]+s[b:]
-    s=s[:-2]+'''
-      Component.onCompleted: {
-        root.stateVersion = 4; root.connected = true
-        root.asrRunning = true; root.cleanupLoaded = true; root.cleanupAvailable = true
-        root.trainingLogEnabled = true; root.gpuMemoryMib = 6300
-        root.runningVersion = "0.14.0"; root.hotkeyDisplay = "AltGr + Menu"
-        root.modelSettings = {configured:true,speech_engine:"nemo",speech_model:"nvidia/parakeet-tdt-0.6b-v3",speech_endpoint:"http://127.0.0.1:18103/v1/audio/transcriptions",speech_device:"cuda",speech_language:"auto",cleanup_engine:"ollama",cleanup_model:"gemma4:e4b",cleanup_endpoint:"http://127.0.0.1:11434/api/chat"}
-        root.cleanupEnabled = true; root.cleanupRuntime = "ready"; root.duckAudioPercent = 70
-        root.modelCatalog = {
-          speech: [
-            {id:"nvidia/parakeet-tdt-0.6b-v3",label:"Parakeet TDT 0.6B v3",detail:"25 European languages, detected automatically. The most accurate of these on English and by far the fastest, which is why it is the default.",size_mb:714,hardware:"Under 1 GB of GPU memory idle, about 2 GB after a long recording. Runs on CPU.",license:"CC-BY-4.0",tier:"recommended",installed:true,selected:true},
-            {id:"nvidia/nemotron-3.5-asr-streaming-0.6b",label:"Nemotron 3.5 Streaming 0.6B",detail:"35 languages, including Japanese, Korean, Chinese, Arabic, Hindi and Turkish. Choose it for a language Parakeet does not cover; its English error rate is materially worse.",size_mb:742,hardware:"About the same as Parakeet. Runs on CPU.",license:"OpenMDW-1.1",tier:"quality",installed:false,selected:false},
-            {id:"nvidia/parakeet-ctc-1.1b",label:"Parakeet CTC 1.1B",detail:"English only, and the largest model here at nearly twice the parameters. Worth trying if English accuracy matters more to you than speed or memory.",size_mb:1178,hardware:"Roughly twice Parakeet TDT. Runs on CPU, slowly.",license:"CC-BY-4.0",tier:"quality",installed:false,selected:false},
-            {id:"nvidia/nemotron-speech-streaming-en-0.6b",label:"Nemotron Streaming English 0.6B",detail:"English only, built for streaming. The smallest download here, and the one to try on a machine without a usable GPU.",size_mb:700,hardware:"The lightest of these. Runs on CPU.",license:"NVIDIA Open Model License",tier:"light",installed:false,selected:false}
-          ],
-          cleanup: [
-            {id:"gemma4:e4b",label:"Gemma 4 E4B",detail:"The recommended multilingual cleanup model. It balances reliable editing with low cleanup latency on a 16 GB GPU.",size_mb:9163,hardware:"About 10 GB of GPU memory",license:"Gemma Terms of Use",tier:"recommended",installed:true,selected:true},
-            {id:"nemotron-3-nano:4b",label:"Nemotron 3 Nano 4B",detail:"NVIDIA's small reasoning model, with a 256K context. English is well covered; its support for other languages is not documented.",size_mb:2706,hardware:"About 5 GB of GPU memory",license:"NVIDIA Open Model License",tier:"quality",installed:false,selected:false},
-            {id:"qwen3:4b",label:"Qwen3 4B",detail:"A compact Apache-licensed option. It is capable of punctuation and filler removal, but mixed-language cleanup is less reliable.",size_mb:2382,hardware:"About 5 GB of GPU memory",license:"Apache-2.0",tier:"light",installed:false,selected:false}
-          ]
-        }
-        root.shortcutSettings = {keys:["ISO_Level3_Shift","Menu"],consumed:["Menu"]}
-        root.pasteShortcut = {modifiers:["ctrl","shift"],key:"F8"}
-        root.customVocabulary = ["OmaFlow", "Omarchy", "Hyprland", "Parakeet", "Gemma", "Quickshell"]
-        root.transcript = "The completed transcript is safely on your clipboard. This is a synthetic audit sample."
-        root.errorText = "OmaFlow could not reach the microphone. Check the input device in your sound settings."
-        if (auditMode.indexOf("settings") === 0 || auditMode === "hotkey") root.idlePage = "settings"
-        else if (auditMode !== "history" && auditMode !== "empty" && auditMode !== "first-run") root.phase = auditMode
-        if (auditMode === "recording") { root.latched=true; root.micDetected=true; root.micLevel=0.5; root.micBars=[0.1,0.3,0.2,0.6,0.4,0.2,0.1,0.3,0.5,0.2,0.3,0.4,0.1]; root.waveHistory=[0.1,0.35,0.6,0.75,0.55,0.3,0.15,0.4,0.7,0.65,0.45,0.25] }
-        if (auditMode === "recording-held") { root.phase="recording"; root.latched=false; root.micDetected=true; root.micLevel=0.5 }
-        if (auditMode === "detail") { root.phase="idle"; root.selectedEntryId="2" }
-        if (auditMode === "warning") { root.phase="result"; root.errorText=""; root.pasteSent=true; root.feedbackError=true; root.feedback="Cleanup changed a number. The original transcript was preserved." }
-        if (auditMode === "first-run") { root.idlePage="history"
-          root.modelSettings = Object.assign({}, root.modelSettings, {configured:false})
-          root.modelCatalog = Object.assign({}, root.modelCatalog, {speech: root.modelCatalog.speech.map(function(e) {
-            return Object.assign({}, e, {installed:false, selected:false}) })})
-          root.history = [] }
-        if (auditMode.indexOf("settings-") === 0) root.settingsTab = auditMode.substring("settings-".length)
-        if (auditMode === "settings-models-custom") { root.settingsTab="models"; root.editModels=true }
-        if (auditMode === "settings-models-pending") { root.settingsTab="models"; root.modelSettings = Object.assign({}, root.modelSettings, {configured:false}) }
-        // Proves the reveal signal and its coordinate mapping run without error.
-        if (auditMode === "settings-models-pending") revealProbe.restart()
-        if (auditMode === "settings-models-downloading") { root.settingsTab="models"
-          root.modelDownloads = {"nvidia/nemotron-3.5-asr-streaming-0.6b":{state:"downloading",percent:42,message:"Downloading Nemotron 3.5 Streaming — 310 of 742 MB"}} }
-        if (auditMode === "settings-models-server") { root.settingsTab="models"; root.editModels=true
-          root.modelSettings = Object.assign({}, root.modelSettings, {speech_engine:"openai",
-            speech_endpoint:"http://127.0.0.1:8000/v1/audio/transcriptions", speech_model:"my-whisper"}) }
-        if (auditMode === "settings-cleanup-custom") { root.settingsTab="cleanup"; root.editCleanupModel=true }
-        if (auditMode === "settings-cleanup-openai") { root.settingsTab="cleanup"; root.editCleanupModel=true
-          root.modelSettings = Object.assign({}, root.modelSettings, {cleanup_engine:"openai",
-            cleanup_endpoint:"http://127.0.0.1:4000/v1/chat/completions", cleanup_model:"my-model"}) }
-        if (auditMode === "settings-cleanup-off") { root.settingsTab="cleanup"; root.cleanupEnabled=false }
-        if (auditMode === "settings-cleanup-no-ollama") { root.settingsTab="cleanup"; root.cleanupRuntime="missing" }
-        if (auditMode === "hotkey") { root.phase="idle"; root.idlePage="settings"; root.settingsTab="general"; root.editShortcut=true }
-        if (auditMode === "settings-general-custom") {
-          root.phase="idle"; root.idlePage="settings"; root.settingsTab="general"; root.pasteMode="custom"
-          root.savePasteShortcut(["ctrl","shift"], "F8")
-          if (root.auditCalls.length !== 1
-              || JSON.stringify(root.auditCalls[0].slice(0, 3)) !== JSON.stringify(["omaflow","configure","paste_delivery"]))
-            throw new Error("Custom paste must use the atomic paste_delivery setting")
-          var savedPaste = JSON.parse(root.auditCalls[0][3])
-          if (savedPaste.mode !== "custom" || savedPaste.shortcut.key !== "F8"
-              || savedPaste.shortcut.modifiers.join("+") !== "ctrl+shift")
-            throw new Error("Custom paste must save one structured chord")
-        }
-        if (auditMode === "settings-update") { root.idlePage="settings"; root.settingsTab="general";
-          root.updateOffer={schemaVersion:1,checkedAtMs:Date.now(),target:{commit:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",version:"0.18.0",summary:"A smoother update is ready.",changes:["Update inside OmaFlow","Keep the previous release for recovery"]}} }
-        if (["update","update-later","update-progress","update-failed","update-daemon-down","update-migration"].indexOf(auditMode) >= 0) {
-          root.phase="idle"; root.idlePage="history"
-          root.updateOffer={schemaVersion:1,checkedAtMs:Date.now(),target:{commit:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",version:"0.18.0",summary:"A smoother update is ready.",changes:["Update inside OmaFlow","Keep the previous release for recovery"]}}
-        }
-        if (auditMode === "update-later") root.updateDeferral={schemaVersion:1,commit:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",untilMs:Date.now()+86400000}
-        if (auditMode === "update-progress") root.updateTransaction={state:"waiting-for-idle",message:"Finishing your dictation first"}
-        if (auditMode === "update-failed") root.updateTransaction={state:"rolled-back",message:"The update did not finish. Your previous version is still running."}
-        if (auditMode === "update-daemon-down") root.connected=false
-        if (auditMode === "update-migration") root.stateVersion=3
-        if (auditMode === "update-later" && (!root.updateDeferred || !root.updateAttention
-            || !root.updateActionsAvailable || !root.laterActionAvailable))
-          throw new Error("Later must hide only the home card while preserving badge and Settings actions")
-        if (auditMode === "update-migration" && (root.supportedState || root.updaterControlsEnabled
-            || root.updateActionsAvailable || root.laterActionAvailable || !root.updateAttention))
-          throw new Error("Migration mode must preserve attention without enabling updater controls")
-        if (auditMode === "update") {
-          root.requestUpdate()
-          if (JSON.stringify(root.auditCalls[0]) !== JSON.stringify([root.trustedRunner,"update","request"]))
-            throw new Error("Update must invoke the trusted runner with fixed arguments")
-        }
-        if (auditMode === "update-later") {
-          root.deferUpdate()
-          if (JSON.stringify(root.auditCalls[0]) !== JSON.stringify([root.trustedRunner,"update","later"]))
-            throw new Error("Later must invoke the trusted runner with fixed arguments")
-        }
-        if (auditMode === "update-migration") {
-          root.copyMigrationSteps()
-          if (root.auditCalls.length !== 1 || root.auditCalls[0][0] !== "wl-copy"
-              || root.auditCalls[0].length !== 2
-              || root.auditCalls[0][1].indexOf("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") < 0
-              || root.auditCalls[0][1].indexOf(" main") >= 0)
-            throw new Error("Migration must only copy exact-commit bridge steps")
-        }
-        if (auditMode !== "empty") root.history = [
-          {id:1, created_at_ms:Date.now(), text:"Please send the updated proposal to the team before Thursday's meeting. I've added the revised timeline and the notes from our last review."},
-          {id:2, created_at_ms:Date.now()-300000, text:"The client approved the new layout. Let's finish the mobile version this week and schedule a final review for Monday. Please check the contact form, update the pricing page, and make sure the links in the footer work before we send it over. I'll prepare the handover notes and share them with the team."},
-          {id:3, created_at_ms:Date.now()-3600000, text:"I've uploaded the meeting notes to the shared folder. Let me know if I missed anything."}
-        ]
-      }
-      Window {
-        width: root.phase === "idle" ? 560 : root.overlayWidth
-        height: root.auditMode === "settings-models-server" ? 1000
-          : root.phase === "idle" ? 650 : root.overlayHeight
-        visible: true
-        color: Color.popups.background
-        Item {
-          id: captureFrame
-          anchors.fill: parent
-          Rectangle { anchors.fill:parent; color:Color.popups.background }
-          FocusReveal { scope:captureFrame }
-          Loader {
-            id: auditLoader
-            anchors.fill: parent
-            anchors.margins: 12
-            sourceComponent: root.phase === "idle" ? idleView
-              : root.phase === "recording" ? recordingView
-              : root.phase === "processing" ? processingView
-              : root.phase === "success" ? successView
-              : root.phase === "notice" ? noticeView
-              : root.phase === "result" ? resultView : errorView
-          }
-        }
-        // The custom-model form sits under the catalog cards, so a screenshot
-        // of it has to scroll there first.
-        Timer {
-          interval: 500; running: root.auditMode.indexOf("-custom") > 0 || root.auditMode === "settings-models-server"
-          onTriggered: if (auditLoader.item) auditLoader.item.moveCursor(root.auditMode === "settings-models-server" ? 7 : 24)
-        }
-        Timer {
-          id: revealProbe
-          interval: 300
-          onTriggered: {
-            root.revealInSettings(null)
-            if (auditLoader.item) root.revealInSettings(auditLoader.item)
-          }
-        }
-        Timer {
-          interval: 1000; running:true
-          onTriggered: captureFrame.grabToImage(function(result) {
-            result.saveToFile(Quickshell.env("OMAFLOW_UI_OUTPUT")+"/"+root.auditMode+".png")
-            Qt.quit()
-          })
-        }
-      }
-    }
-    '''
-    (p/'shell.qml').write_text(s)
 
-    for component in ROOT.glob("*.qml"):
-        if component.name != "OmaFlow.qml": (p/component.name).write_text(component.read_text())
-    for mode in ["history","empty","first-run","detail","update","update-later","update-progress","update-failed","update-daemon-down","update-migration","settings-cleanup","settings-cleanup-custom","settings-cleanup-openai","settings-cleanup-off","settings-cleanup-no-ollama","settings-models","settings-models-custom","settings-models-server","settings-models-pending","settings-models-downloading","settings-audio","settings-vocabulary","settings-privacy","settings-general","settings-general-custom","settings-update","hotkey","recording","recording-held","processing","result","warning","success","notice","error"]:
-        result = subprocess.run(["quickshell","-p",str(p)], env=dict(os.environ, QT_QPA_PLATFORM="offscreen", AUDIT_MODE=mode, OMAFLOW_UI_OUTPUT=str(output)), capture_output=True, text=True, timeout=10)
-        log = result.stdout+result.stderr
-        (output/(mode+".log")).write_text(log)
-        if result.returncode or " ERROR:" in log or "Unable to assign" in log or "ReferenceError" in log or "Error:" in log or not (output/(mode+".png")).is_file():
-            raise SystemExit(log)
-        print("PASS render", mode, flush=True)
+# 0. Quickshell only sees shared components listed in ui/qmldir.
+listed = {line.split()[-1] for line in (ROOT / "ui/qmldir").read_text().splitlines() if line.endswith(".qml")}
+missing = sorted(path.name for path in (ROOT / "ui").glob("*.qml") if path.name not in listed)
+if missing:
+    raise SystemExit("Add these to ui/qmldir: " + ", ".join(missing))
 
-    # Exercise the real EndpointTester process and result handling, not just
-    # its appearance. The CLI is stubbed so no network or saved settings are used.
-    commands = p / "bin"
-    commands.mkdir()
-    stub = commands / "omaflow"
-    stub.write_text('''#!/usr/bin/python3
-import os, sys
-assert sys.argv[1:] == ["test-cleanup"], sys.argv
-print(os.environ["AUDIT_PROBE_RESULT"])
-''')
-    stub.chmod(0o755)
-    (p / "shell.qml").write_text('''import QtQuick
-import QtQuick.Window
+# 1. Every screen, rendered.
+result = subprocess.run([str(ROOT / "tools/preview/render.sh"), str(output)], text=True)
+if result.returncode:
+    raise SystemExit("A preview failed to render cleanly; see the logs in " + str(output))
+
+# 2. The Omarchy host, loaded the way the shell loads it.
+shell = Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy")) / "shell"
+if not shell.is_dir():
+    raise SystemExit("The host check needs an installed Omarchy shell")
+with tempfile.TemporaryDirectory(prefix="omaflow-host-") as staging:
+    stage = Path(staging)
+    for directory in shell.iterdir():
+        if directory.is_dir():
+            (stage / directory.name).symlink_to(directory, target_is_directory=True)
+    (stage / "ui").symlink_to(ROOT / "ui", target_is_directory=True)
+    host = stage / "hosts/omarchy"
+    host.mkdir(parents=True)
+    shutil.copy(ROOT / "hosts/omarchy/Job.qml", host)
+    # Offscreen Qt has no layer shell, so the overlay window becomes an Item;
+    # everything inside it is still created and bound.
+    source = (ROOT / "hosts/omarchy/OmaFlow.qml").read_text()
+    start = source.index("  PanelWindow {")
+    card = source.index("    OverlayCard {", start)
+    source = source[:start] + "  Item {\n    id: overlayWindow\n" + source[card:]
+    source = source.replace("    mask: Region { item: card; Region { item: card.menuArea } }\n", "")
+    (host / "OmaFlow.qml").write_text(source)
+    (stage / "shell.qml").write_text('''import QtQuick
 import Quickshell
+import "hosts/omarchy" as Host
 ShellRoot {
-  Window {
-    width: 560; height: 200; visible: true
-    EndpointTester {
-      id: tester
-      anchors.fill: parent
-      cleanupTest: true
-      Component.onCompleted: Qt.callLater(function() { tester.check() })
-      onStatusChanged: if (status.length > 0) {
-        console.log("PROBE_RESULT " + JSON.stringify({failed: failed, status: status}))
-        Qt.quit()
-      }
-    }
-    Timer { interval: 3000; running: true; onTriggered: { console.error("Probe timed out"); Qt.quit() } }
-  }
+  Host.OmaFlow { id: plugin }
+  Timer { interval: 900; running: true; onTriggered: plugin.showWindow("journal") }
+  Timer { interval: 1200; running: true; onTriggered: plugin.showWindow("todos") }
+  Timer { interval: 1500; running: true; onTriggered: plugin.showWindow("settings/models") }
+  Timer { interval: 2100; running: true; onTriggered: { plugin.showWindow("history"); console.log("OMAFLOW_HOST_OK") } }
+  Timer { interval: 2600; running: true; onTriggered: Qt.quit() }
+  // A secret goes to the command on stdin, not in its arguments.
+  Host.Job { command: ["omaflow", "configure", "models", "-"]; input: '{"cleanup_api_key":"sk-host"}\\n'; running: true }
 }
 ''')
-    for payload, expected in [
-        (json.dumps({"ok": True, "message": "Saved model accepted"}), False),
-        (json.dumps({"ok": False, "message": "Credentials denied"}), True),
-        (json.dumps({"ok": False, "message": "Model unavailable"}), True),
-        ("not-json", True),
-    ]:
-        result = subprocess.run(["quickshell", "-p", str(p)],
-            env=dict(os.environ, QT_QPA_PLATFORM="offscreen", PATH=f"{commands}:" + os.environ["PATH"],
-                     AUDIT_PROBE_RESULT=payload), capture_output=True, text=True, timeout=6)
-        log = result.stdout + result.stderr
-        reports = [line.split("PROBE_RESULT ", 1)[1] for line in log.splitlines() if "PROBE_RESULT " in line]
-        assert result.returncode == 0 and reports, log
-        report = json.loads(reports[-1])
-        assert report["failed"] == expected, report
-        if payload != "not-json":
-            assert report["status"] == json.loads(payload)["message"], report
-        print("PASS saved-model test UI", payload, flush=True)
+    runtime = stage / "runtime"
+    runtime.mkdir()
+    fixture = json.loads(subprocess.run(
+        ["qml6", "-platform", "offscreen", str(ROOT / "tools/preview/State.qml")],
+        env=dict(os.environ, QT_FORCE_STDERR_LOGGING="1"), capture_output=True, text=True, timeout=20
+    ).stderr.split("STATE ", 1)[1].splitlines()[0])
+    import time
+    fixture["published_at_ms"] = int(time.time() * 1000) + 60000
+    (runtime / "omaflow-state.json").write_text(json.dumps(fixture))
+    (runtime / "omaflow-level").write_text("0.4 -30 1" + " 0.3" * 13 + "\n")
+    bin_dir = stage / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "omaflow"
+    stub.write_text("#!/bin/sh\ncase \"$1 $2\" in\n  'journal day') echo '{\"date\":\"'$3'\",\"title\":\"\",\"file\":\"\",\"exists\":false,\"entries\":[]}';;\n  'journal month') echo '{\"month\":\"'$3'\",\"days\":[]}';;\n  'journal stats') echo '{\"days\":0}';;\n  'journal year-ago') echo null;;\n  'configure models') read -r line; echo \"$* $line\" > \"$XDG_RUNTIME_DIR/configure-stdin\";;\n  'todos list') echo '{\"path\":\"\",\"todos\":[{\"index\":0,\"text\":\"Buy milk\",\"done\":false}]}';;\n  *) true;;\nesac\n")
+    stub.chmod(0o755)
+    headless = {key: value for key, value in os.environ.items() if key not in ("WAYLAND_DISPLAY", "DISPLAY")}
+    run = subprocess.run(
+        ["quickshell", "-p", str(stage)],
+        env=dict(headless, QT_QPA_PLATFORM="offscreen", QT_QPA_PLATFORMTHEME="", XDG_RUNTIME_DIR=str(runtime),
+                 PATH=f"{bin_dir}:" + os.environ["PATH"]),
+        capture_output=True, text=True, timeout=20,
+    )
+    log = run.stdout + run.stderr
+    (output / "host.log").write_text(log)
+    problems = [line for line in log.splitlines()
+                if ("WARN" in line or "ERROR" in line)
+                and "--- WARNING ---" not in line and "setting window masks" not in line]
+    if "OMAFLOW_HOST_OK" not in log or problems:
+        raise SystemExit("The Omarchy host did not load cleanly:\n" + "\n".join(problems or [log]))
+    received = (runtime / "configure-stdin").read_text().strip() if (runtime / "configure-stdin").exists() else ""
+    if received != 'configure models - {"cleanup_api_key":"sk-host"}':
+        raise SystemExit("A secret did not reach the command on stdin: " + repr(received))
+    print("PASS Omarchy host loads, shows each place, no QML warnings, and sends secrets on stdin", flush=True)
+
+# 3. The shortcut recorder, driven by synthetic key presses.
+recorder = subprocess.run(["/usr/lib/qt6/bin/qmltestrunner", "-input", str(ROOT / "tools/key_recorder_test.qml")],
+                          env=dict(os.environ, QT_QPA_PLATFORM="offscreen"), capture_output=True, text=True, timeout=30)
+if recorder.returncode != 0:
+    raise SystemExit("The shortcut recorder test failed:\n" + recorder.stdout + recorder.stderr)
+print("PASS the shortcut recorder records Super Shift J and F13, and refuses a bare J", flush=True)
+table = subprocess.run(["/usr/lib/qt6/bin/qmltestrunner", "-input", str(ROOT / "tools/hotkeys_table_test.qml")],
+                       env=dict(os.environ, QT_QPA_PLATFORM="offscreen"), capture_output=True, text=True, timeout=60)
+if table.returncode != 0:
+    raise SystemExit("The Hotkeys table test failed:\n" + table.stdout + table.stderr)
+print("PASS a shortcut is recorded in its row while the daemon republishes its state", flush=True)
+talk = subprocess.run(["/usr/lib/qt6/bin/qmltestrunner", "-input", str(ROOT / "tools/journal_talk_test.qml")],
+                      env=dict(os.environ, QT_QPA_PLATFORM="offscreen"), capture_output=True, text=True, timeout=60)
+if talk.returncode != 0:
+    raise SystemExit("The journal Talk button test failed:\n" + talk.stdout + talk.stderr)
+print("PASS Talk starts a hands-free entry on click and records while held", flush=True)
+todos = subprocess.run(["/usr/lib/qt6/bin/qmltestrunner", "-input", str(ROOT / "tools/todos_test.qml")],
+                       env=dict(os.environ, QT_QPA_PLATFORM="offscreen"), capture_output=True, text=True, timeout=60)
+if todos.returncode != 0:
+    raise SystemExit("The to-do page test failed:\n" + todos.stdout + todos.stderr)
+print("PASS to-dos tick in place, delete and clear with Undo, and Talk starts a to-do take", flush=True)
+overlay = subprocess.run(["/usr/lib/qt6/bin/qmltestrunner", "-input", str(ROOT / "tools/overlay_test.qml")],
+                         env=dict(os.environ, QT_QPA_PLATFORM="offscreen"), capture_output=True, text=True, timeout=60)
+if overlay.returncode != 0:
+    raise SystemExit("The card test failed:\n" + overlay.stdout + overlay.stderr)
+print("PASS cards count down in an Esc ring, wait while pointed at, and edit to-dos in place", flush=True)
+
+# 3. The connection tester's handling of real replies.
+probe = ROOT / "tools/preview/Probe.qml"
+for payload, failed in [
+    (json.dumps({"ok": True, "message": "Saved model accepted"}), False),
+    (json.dumps({"ok": False, "message": "Credentials denied"}), True),
+    ("not-json", True),
+]:
+    run = subprocess.run(["qml6", "-platform", "offscreen", str(probe), "--", payload],
+                         env=dict(os.environ, QT_FORCE_STDERR_LOGGING="1"),
+                         capture_output=True, text=True, timeout=20)
+    log = run.stdout + run.stderr
+    reports = [line.split("PROBE_RESULT ", 1)[1] for line in log.splitlines() if "PROBE_RESULT " in line]
+    assert reports, log
+    report = json.loads(reports[-1])
+    assert report["failed"] == failed, report
+    if payload != "not-json":
+        assert report["status"] == json.loads(payload)["message"], report
+    print("PASS saved-model test", payload, flush=True)
 print(output)

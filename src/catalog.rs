@@ -19,7 +19,7 @@ use std::{
 };
 
 /// Managed NeMo is the only speech engine the catalog offers; a user who wants
-/// their own server still has the free-text fields in Settings → Models.
+/// their own server still has the free-text fields in Settings → Advanced → Your own model.
 pub const SPEECH_ENGINE: &str = "nemo";
 pub const SPEECH_ENDPOINT: &str = "http://127.0.0.1:18103/v1/audio/transcriptions";
 pub const CLEANUP_ENDPOINT: &str = "http://127.0.0.1:11434/api/chat";

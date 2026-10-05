@@ -25,6 +25,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     (repo/'tools').mkdir(); shutil.copy2(ROOT/'tools/set_hotkey.py', repo/'tools/set_hotkey.py')
     shutil.copytree(ROOT/'scripts', repo/'scripts')
     shutil.copy2(ROOT/'tools/install_receipt.py', repo/'tools/install_receipt.py')
+    shutil.copy2(ROOT/'tools/journal_folder.py', repo/'tools/journal_folder.py')
     (repo/'target/release').mkdir(parents=True)
     shutil.copy2(ROOT/'target/release/omaflow', repo/'target/release/omaflow')
     subprocess.run(['/usr/bin/git', 'init', '-q', '-b', 'main', str(repo)], check=True)
@@ -73,18 +74,21 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     defaults = tomllib.loads((ROOT/'config/config.toml').read_text())
     for section, values in defaults.items():
         assert set(values) <= set(complete[section]), section
-    assert complete['shortcut'] == {'keys':['F13'], 'consumed':['F13']}
+    assert complete['shortcut'] == {'keys':['F13'], 'consumed':['F13'], 'window':'SUPER + SHIFT + V', 'journal':'', 'open_journal':'', 'todo':'', 'open_todos':''}
     assert complete['cleanup']['system_prompt'] == defaults['cleanup']['system_prompt']
     assert (config/'hypr/omaflow-hotkey.lua').is_symlink()
     assert 'F13' in (config/'omaflow/shortcut.lua').read_text()
 
     assert not (home/'.local/state/omaflow-install/receipt.json').exists()
     assert 'no model configured yet' in output
-    assert 'Settings -> Speech' in output
+    assert 'Settings -> Advanced -> Models' in output
     assert not any(word in log.read_text() for word in ['ollama ', 'nemo-speech', 'curl ']), log.read_text()
     assert (home/'.local/bin/omaflow').is_symlink()
     for unit in ['omaflow.service', 'omaflow-update.service', 'omaflow-update-reconcile.service', 'omaflow-update-check.service', 'omaflow-update-check.timer']:
         assert (config/'systemd/user'/unit).is_symlink(), unit
+    # The sandboxed daemon is given the default journal folder before it starts.
+    assert (home/'Documents/Journal').is_dir()
+    assert str(home/'Documents/Journal') in (config/'systemd/user/omaflow.service.d/journal-folder.conf').read_text()
     result = subprocess.run([str(home/'.local/bin/omaflow'), 'serve-asr'], env=env, capture_output=True, timeout=3)
     assert result.returncode == 0 and not result.stdout
     print('PASS app-only install links the app and downloads nothing; speech service stays dormant')

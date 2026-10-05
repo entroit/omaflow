@@ -23,9 +23,12 @@ edit by hand.
 | `~/.cache/nemo-speech/models/` | Managed speech weights |
 | Ollama server storage | Cleanup weights, potentially shared with other applications |
 
-To change a setting by hand, edit the personal TOML, then run
-`omaflow reload-config` while idle. `omaflow effective-config` prints the
-merged result. `omaflow config-init` fills every missing key, including the
+To change a setting by hand, edit the personal TOML and save it. Every
+setting is in the file, and the Omarchy shell applies a saved change within a
+second, the same way the Settings panel does, shortcuts and journal folder
+included. A mistake in the file shows as a notification that names it, and
+the previous settings stay in use. Without the shell running, apply it with
+`omaflow reload-config`. `omaflow effective-config` prints the merged result. `omaflow config-init` fills every missing key, including the
 cleanup prompt. It updates exact copies of earlier bundled prompts and
 preserves prompts you edited yourself. Installation and relinking run it.
 
@@ -36,36 +39,64 @@ settable in the TOML.
 
 | Key | Default | Effect |
 |---|---:|---|
-| `[cleanup] enabled` | `false` | Off pastes exactly what the speech model recognized. On sends it to the configured cleanup server. Settings → Cleanup. |
+| `[cleanup] enabled` | `false` | Medium cleanup: sends the transcript to the configured cleanup server. Settings → Basics → Cleanup. |
+| `[cleanup] light` | `false` | With `enabled` off, still drop fillers such as "um" and stutters such as "the the". No model runs. Settings → Basics → Cleanup, as **Light**. |
 | `[cleanup] engine` | `"ollama"` | Cleanup protocol: `ollama` for `/api/chat`, or `openai` for `/v1/chat/completions`. |
 | `[behavior] models_configured` | `false` | Whether a speech model is ready to use. Selecting or downloading a catalog model sets it from the weights actually on disk. |
-| `[behavior] duck_audio_percent` | `70` | How far the default audio output is turned down while a recording is active, 0 to 100. The level found before the recording comes back on release. Settings → Audio. |
-| `[behavior] keep_models_loaded` | `true` | Keep the models loaded between dictations. `false` unloads the cleanup model and stops the managed speech server after five minutes without dictation; the next dictation loads them first. External servers are not touched. Settings → General. |
+| `[behavior] duck_audio_percent` | `70` | How far the default audio output is turned down while a recording is active, 0 to 100. The level found before the recording comes back on release. Settings → Advanced → Audio. |
+| `[behavior] keep_models_loaded` | `true` | Keep the models loaded between dictations. `false` unloads the cleanup model and stops the managed speech server after five minutes without dictation; the next dictation loads them first. External servers are not touched. Settings → Advanced → Models. |
 | `[behavior] history_limit` | `30` | Entries kept, up to 1000; `0` saves nothing. Settings → Privacy. |
+| `[behavior] keep_dictation_audio` | `false` | Keep each saved dictation's recording in `~/.local/state/omaflow/audio/` so History can play it back. A recording is deleted with its dictation, and switching this off deletes all kept dictation audio. Settings → Privacy. |
 | `[behavior] training_log_enabled` | `false` | Append raw ASR and cleaned output to an owner-only JSONL file under `~/.local/state/omaflow/`. Settings → Privacy. |
-| `[behavior] meter_gate_db` | `-60` | Display threshold in dBFS for the meter's Voice detected indicator. It never removes recorded audio. Settings → Audio. |
-| `[behavior] paste_mode` | `"auto"` | `auto`, `ctrl-v`, `shift-insert`, `clipboard` or `custom`. Auto uses Shift+Insert in terminal-tagged windows and Ctrl+V elsewhere. Settings → General. |
-| `[behavior] paste_shortcut` | `{ modifiers = ["ctrl"], key = "V" }` | Chord used by `custom`. Choose one to four distinct `ctrl`, `shift`, `alt` or `super` modifiers and one XKB key name. Settings → General validates and saves the mode and chord together. |
+| `[behavior] meter_gate_db` | `-60` | Display threshold in dBFS for the meter's Voice detected indicator. It never removes recorded audio. Settings → Advanced → Audio. |
+| `[behavior] paste_mode` | `"auto"` | `auto`, `ctrl-v`, `shift-insert`, `clipboard` or `custom`. Auto uses Shift+Insert in terminal-tagged windows and Ctrl+V elsewhere. Settings → Basics. |
+| `[behavior] paste_shortcut` | `{ modifiers = ["ctrl"], key = "V" }` | Chord used by `custom`. Choose one to four distinct `ctrl`, `shift`, `alt` or `super` modifiers and one XKB key name. Settings → Advanced → Hotkeys validates and saves the mode and chord together. |
 | `[behavior] max_recording_seconds` | `1200` | A recording stops itself here. |
-| `[behavior] reduced_motion` | `false` | Disable panel animation. |
-| `[backend] api_key`, `[cleanup] api_key` | empty | Sent as an `Authorization: Bearer` header to a speech or cleanup server that wants one, and only when set. Never published to the panel or `effective-config`. Settings → Speech and Settings → Cleanup, as **API key (optional)**. See [running your own model](custom-models.md#if-your-server-needs-a-key). |
+| `[backend] api_key`, `[cleanup] api_key` | empty | Sent as an `Authorization: Bearer` header to a speech or cleanup server that wants one, and only when set. Never published to the panel or `effective-config`. Settings → Advanced → Your own model and Settings → Advanced → Cleanup, as **API key, optional**. See [running your own model](custom-models.md#if-your-server-needs-a-key). |
 | `[cleanup] use_window_context` | `true` | Put the focused window's class and title into the cleanup prompt so tone follows the app. |
 | `[cleanup] use_clipboard_context` | `false` | Put clipboard text into the cleanup prompt so copied names are spelled the same way. Off because clipboards hold passwords. |
+| `[journal] folder` | `"~/Documents/Journal"` | Where the journal keeps one Markdown file per day. Recordings go in a hidden `.recordings` folder beside them. Journal → ⋯ → Journal settings. The daemon is sandboxed, so choosing a folder there also creates it and opens it to the daemon (`~/.config/systemd/user/omaflow.service.d/journal-folder.conf`); after editing this line by hand, run `tools/journal_folder.py`. |
+| `[journal] cleanup` | `"light"` | `off` keeps every word as spoken, `light` drops fillers, `medium` also runs the cleanup model when `[cleanup] enabled` is on. |
+| `[journal] keep_recordings` | `true` | Keep each spoken entry's recording so it can be played back. Off keeps only the words and the waveform outline, and deletes recordings already kept. |
+| `[journal] empty_day_question` | `false` | Show one short question on a day with no entries yet. |
+| `[todos] folder` | `"~/Documents/To-dos"` | Where the to-do list, `To-dos.md`, lives. To-dos → ⋯ → Change folder. Opened to the sandboxed daemon the same way as the journal folder, by the same drop-in. |
+| `[todos] prompt` | the bundled to-do prompt | The cleanup model's prompt for a to-do take, in place of `[cleanup] system_prompt`: one task per line, in your own words, with each task's timing at its end. Only used when cleanup is on; empty uses the dictation prompt. Check a change with `tools/todo_bench.py --prompt FILE`. |
 | `[cleanup] num_ctx` | `16384` | Context window for cleanup. Prompt, transcript, spelling context and answer must fit. OmaFlow estimates token usage for each request and removes clipboard then window context before rejecting it. Capacity and memory use depend on content, model and runtime; there is no fixed duration guarantee. |
 
 Changing defaults never erases files already written; use Settings → Privacy →
-Erase saved dictations to delete history and training data. Audio is processed
-in memory. The panel keeps temporary text in the runtime directory, and the
+Delete saved dictations to delete history and training data. Dictation audio is
+processed in memory and dropped after transcription unless you switch on
+`keep_dictation_audio`. Journal recordings are kept in your journal folder, and
+deleting an entry deletes its recording. The window keeps temporary text in the runtime directory, and the
 clipboard and destination applications have their own retention.
 
 ## Hotkey
 
-Edit `[shortcut] keys` and `consumed` in the TOML, then run
-`omaflow reload-config`. It validates XKB names and conflicts, regenerates the
-Lua file and reloads Hyprland. The Settings panel and `./install --hotkey`
+Edit `[shortcut] keys` and `consumed` in the TOML and save. The reload
+validates XKB names and conflicts, regenerates the Lua file and reloads
+Hyprland; when nothing about the shortcuts changed, it leaves Hyprland alone. The Settings panel and `./install --hotkey`
 write the same keys and roll back if the reload fails. The adapter is
 registered by `require("omaflow")` in `~/.config/hypr/bindings.lua`, which
 `./install` appends once, after backing the file up.
+
+The other shortcuts are ordinary Hyprland bindings, written as modifiers then
+one key. Settings → Advanced → Hotkeys changes them and refuses keys Omarchy
+already uses; an empty value turns one off.
+
+| Setting | Default | Does |
+|---|---|---|
+| `[shortcut] window` | `"SUPER + SHIFT + V"` | Opens the OmaFlow window where you left it, or closes it |
+| `[shortcut] journal` | `""` | A journal entry from any app, like the dictation key: hold it while you talk, or double-tap to keep going and press again to save |
+| `[shortcut] open_journal` | `""` | Opens the OmaFlow window on the journal, or closes it when the journal is showing |
+| `[shortcut] todo` | `""` | Adds to-dos from any app, held or double-tapped like the journal shortcut |
+| `[shortcut] open_todos` | `""` | Opens the OmaFlow window on the to-do list, or closes it when the list is showing |
+
+The adapter also binds **Esc** to `omaflow close`, which dismisses a finished
+card and never ends a take. A card you can act on shows its Esc button inside a
+ring that fills as its time runs out, and pointing at the card stops the
+clock; a passing "Pasted" or "Nothing heard" just goes. Every OmaFlow shortcut appears in Omarchy's
+**Super K** list; dictation is listed through its reserved key, so a chord
+without one, such as plain F9, is not.
 
 Personal settings are a real file, not a symlink, so removing or updating the
 checkout does not erase them.

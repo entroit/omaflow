@@ -22,6 +22,19 @@ with tempfile.TemporaryDirectory(prefix="omaflow-platform-") as directory:
             set_hotkey.save(["F13"], ["F13"])
         saved = base / "omaflow/shortcut.lua"
         before = saved.read_bytes()
+        # The shell syncs after every change to config.toml; with the shortcuts
+        # already in effect it writes nothing and never reloads Hyprland, so
+        # a sync cannot set off another sync.
+        import contextlib, io, sys as system
+        stamp = (saved.stat().st_mtime_ns, (base/"omaflow/config.toml").stat().st_mtime_ns)
+        def untouched(*args):
+            raise AssertionError(f"An unchanged sync ran {args}")
+        with patch.object(set_hotkey, "run", untouched), patch.object(system, "argv", ["set_hotkey.py", "--sync"]):
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                assert set_hotkey.main() == 0
+        assert "unchanged" in printed.getvalue()
+        assert stamp == (saved.stat().st_mtime_ns, (base/"omaflow/config.toml").stat().st_mtime_ns)
         before_config = (base/"omaflow/config.toml").read_bytes()
         def broken(*args):
             return "[]" if args[-1] == "binds" else "bad configuration" if args[-1] == "configerrors" else ""
@@ -47,6 +60,40 @@ with tempfile.TemporaryDirectory(prefix="omaflow-platform-") as directory:
                 raise AssertionError("Invalid keys accepted")
             except ValueError:
                 pass
+        # The window and journal shortcuts: normalised, clash-checked, and
+        # written into the generated file next to the dictation hotkey.
+        assert set_hotkey.parse_binding("super+shift+v") == "SUPER + SHIFT + V"
+        assert set_hotkey.parse_binding(" shift + win + F13 ") == "SUPER + SHIFT + F13"
+        assert set_hotkey.parse_binding("") == ""
+        for text in ["V", "SUPER + SHIFT", "HYPER + V", "SUPER + SUPER + V", 'SUPER + V"); os.execute("x']:
+            try:
+                set_hotkey.parse_binding(text)
+                raise AssertionError("Invalid binding accepted: " + text)
+            except ValueError:
+                pass
+        with patch.object(set_hotkey, "run", healthy):
+            set_hotkey.save_binding("journal", "super + alt + j")
+            set_hotkey.save_binding("window", "")
+        generated = saved.read_text()
+        assert 'journal = "SUPER + ALT + J"' in generated and 'window = ""' in generated and '"F13"' in generated
+        before, before_config = saved.read_bytes(), (base/"omaflow/config.toml").read_bytes()
+        taken = [{"key":"J", "description":"Existing action", "modmask":72},
+                 {"key":"V", "description":"OmaFlow window", "modmask":65}]
+        with patch.object(set_hotkey, "run", lambda *args: json.dumps(taken) if args[-1] == "binds" else ""):
+            try:
+                set_hotkey.save_binding("window", "SUPER + ALT + J")
+                raise AssertionError("Conflicting binding accepted")
+            except ValueError as error:
+                assert "Existing action" in str(error)
+            set_hotkey.save_binding("window", "SUPER + SHIFT + V")
+        assert 'window = "SUPER + SHIFT + V"' in saved.read_text()
+        with patch.object(set_hotkey, "run", broken):
+            try:
+                set_hotkey.save_binding("window", "SUPER + SHIFT + B")
+                raise AssertionError("Broken reload accepted")
+            except ValueError:
+                pass
+        assert 'window = "SUPER + SHIFT + V"' in saved.read_text()
     print("PASS shortcut validation, conflict rejection and rollback")
 
     commands = base / "bin"; commands.mkdir()
@@ -301,3 +348,32 @@ printf 'nemo-speech 9.9.9\\n'
     result = subprocess.run(['bash','-c',program,'test',str(temporary)], start_new_session=True, timeout=3)
     assert result.returncode == 0 and not temporary.exists()
     print("PASS the NeMo runtime uses one exact, bounded, verified release artifact with no source fallback")
+
+# The sandboxed daemon can only write a journal folder opened to it: the tool
+# creates the folder, writes the drop-in once, and leaves it alone after.
+import journal_folder
+with tempfile.TemporaryDirectory(prefix="omaflow-journal-") as directory:
+    base = Path(directory)
+    folder = base / 'My "Notes" Vault' / "Journal"
+    (base / "omaflow").mkdir()
+    (base / "omaflow/config.toml").write_text(f"[journal]\nfolder = {json.dumps(str(folder))}\n")
+    with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(base), "OMAFLOW_CONFIG": str(base / "omaflow/config.toml")}):
+        assert "now write" in journal_folder.sync(write_only=True)
+        drop_in = base / "systemd/user/omaflow.service.d/journal-folder.conf"
+        assert folder.is_dir()
+        assert 'ReadWritePaths="' + str(folder).replace('"', '\\"') + '"' in drop_in.read_text()
+        assert "already write" in journal_folder.sync(write_only=True)
+        (base / "omaflow/config.toml").write_text("[journal]\nfolder = \"relative/path\"\n")
+        try:
+            journal_folder.sync(write_only=True)
+            raise AssertionError("Relative journal folder accepted")
+        except ValueError:
+            pass
+print("PASS the journal folder is created and opened to the sandboxed daemon once")
+
+# AltGr is Hyprland's MOD5, and a key recorded by its physical code (because
+# AltGr or Shift changed what it types) is named as Hyprland matches it.
+assert set_hotkey.parse_binding("altgr + code:60") == "MOD5 + period"   # the same key on US and German layouts
+assert set_hotkey.label("MOD5 + period") == "AltGr + ."
+assert set_hotkey.parse_binding("super + mod5 + j") == "SUPER + MOD5 + J"
+print("PASS AltGr bindings and physical keys are named the way Hyprland matches them")

@@ -2,8 +2,8 @@
 
 OmaFlow's catalog is a short list. Anything outside it, a model file you built,
 a transcription server you already run, an Ollama tag you pulled yourself, goes
-in through the fields behind **Use your own model or server…** in Settings →
-Speech and **Use another Ollama model…** in Settings → Cleanup.
+in through **Settings → Advanced → Your own model** for speech and **Use another
+Ollama model or machine** in Settings → Advanced → Cleanup.
 
 `omaflow model-select` only accepts catalog ids and refuses anything else. Set
 a custom model through those panel fields or `omaflow configure models`.
@@ -51,8 +51,10 @@ The key is handled as a secret rather than as another setting. It lives in your
 config file, which only your user can read, and it is the one value the daemon
 never publishes: the panel and `omaflow effective-config` see a
 `speech_api_key_set` or `cleanup_api_key_set` boolean and nothing more. It
-reaches curl through an owner-only file that is deleted after the request,
-never as an argument, where anyone reading `/proc` would find it. A key must be
+never appears as a process argument, where anyone reading `/proc` would find
+it: the panel hands it to `omaflow configure models -` on stdin, that passes it
+to the daemon over its owner-only socket, and it reaches curl through an
+owner-only file that is deleted after the request. A key must be
 one line without quotes, at most 4096 characters, so it cannot smuggle a second
 header in.
 
@@ -86,8 +88,8 @@ server would otherwise decide whether NeMo is running.
 `speech_device` accepts `auto`, `cpu`, `cuda`, `vulkan` or `metal`. It selects
 a mode in the runtime you have installed; it does not fetch a different build.
 
-In the panel: answer **A model file**, then fill **Model**, **Server
-address**, **Language** and **Device**. There is no **Health address**, **API
+In the window: choose **A model file**, then fill **Model file**,
+**Address**, **Language** and **Device**. There is no **Health address**, **API
 key** or **Test connection** here: the first two do not apply, and the server is
 not running yet while you are configuring it, so there would be nothing to ask.
 
@@ -98,7 +100,7 @@ omaflow configure models '{"speech_engine":"nemo","speech_model":"/home/you/mode
 ## OpenAI-compatible server
 
 <p align="center">
-  <img src="../assets/custom-model.png" width="460" alt="Settings → Speech: What are you bringing, with A server I run chosen, then What does your server speak, with OpenAI-compatible chosen, then labelled Model, Server address, Health address (optional), Language and API key (optional) fields, each with a hint underneath, and a Test connection button">
+  <img src="../assets/custom-model.png" width="460" alt="Settings, Advanced, Your own model: What you bring set to OpenAI-compatible server, then labelled Model name, Address, Health address, Language and API key fields, each with a hint underneath, and a Test connection button">
 </p>
 
 You run the server. OmaFlow only sends requests to it and never starts, stops
@@ -151,7 +153,7 @@ omaflow configure models '{"speech_engine":"whisper-cpp","speech_endpoint":"http
 
 Cleanup supports Ollama's `/api/chat` protocol and the OpenAI-compatible
 `/v1/chat/completions` protocol used by gateways, vLLM and LM Studio. Choose
-the protocol in Settings → Cleanup. The configured address must end in the
+the protocol in Settings → Advanced → Cleanup. The configured address must end in the
 matching path.
 
 Any Ollama tag you have pulled yourself works, whether or not it is in the
@@ -191,17 +193,16 @@ files cannot add retries or redirects. Put endpoint and credential settings in
 OmaFlow's configuration rather than `.curlrc`.
 
 Cleanup quality is not something a connection check can tell you. The gates in
-[CONTRIBUTING](../CONTRIBUTING.md#model-gates) score the guarded output,
+[CONTRIBUTING](../CONTRIBUTING.md#model-gates) score the cleaned output,
 including the raw fallbacks, for any model or prompt.
 
 ## Did it work
 
-The status card at the top of Settings → Speech is the answer for speech. It
-shows the model name with a filled dot and **Running locally** when OmaFlow
-runs the server, or **Server is reachable** when you do. **Stopped** means the
-health probe failed. **Not set up yet** means `models_configured` is still
-false; the **Enable dictation with this model** button under the fields sets
-it, and appears only while it is false.
+The status line at the top of Settings → Advanced → Models is the answer for
+speech. It shows the model name with a green dot and **running** when the
+server answers. **stopped** means the health probe failed. **not set up yet**
+means `models_configured` is still false; the **Start dictating with this
+model** button sets it, and appears only while it is false.
 
 The probe is one HTTP request with a one-second timeout. With a health endpoint
 set, only a 2xx counts. Without one, OmaFlow probes an external server's
@@ -210,7 +211,7 @@ rejects a bare GET. For whisper.cpp and for the server OmaFlow runs, it derives
 `/health` instead. Reachable is not the same as loaded, and never the same as
 accurate.
 
-Cleanup has no status card. Settings → Cleanup warns when the configured
+Cleanup has no status line. Settings → Advanced → Cleanup warns when the configured
 server is not answering. It offers the install command only for Ollama on a
 local address when `ollama` is missing. An OpenAI-compatible server remains
 under the control of the person who configured it.
@@ -263,7 +264,8 @@ actually using, which is the fastest way to see what your last save did.
 ## The keys
 
 `omaflow configure models JSON` takes partial updates, so send only what
-changes.
+changes. Send a key on stdin with `-` in place of the JSON:
+`printf '%s\n' '{"cleanup_api_key":"…"}' | omaflow configure models -`.
 
 | Key | Panel field |
 |---|---|

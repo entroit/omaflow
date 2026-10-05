@@ -79,6 +79,93 @@ pub fn run() -> ExitCode {
         "stop" | "toggle" => send_command("stop"),
         "cancel" => send_command("cancel"),
         "close" => send_command("close"),
+        "dismiss" => send_command("dismiss"),
+        "retry" => send_command("retry"),
+        "journal" => crate::journal_cli::run(args),
+        // The journal shortcut, down and up: hold to talk, double-tap to lock.
+        "journal-press" => send_command("journal-press"),
+        "journal-release" => send_command("journal-release"),
+        "journal-toggle" => match args.next() {
+            // With a later day: a spoken note to yourself for that day.
+            Some(day) => send_command(&format!("journal-toggle:{day}")),
+            None => send_command("journal-toggle"),
+        },
+        "history-play" => {
+            let id = args.next().and_then(|id| id.parse::<u64>().ok());
+            let offset_ms = args
+                .next()
+                .and_then(|offset| offset.parse::<u64>().ok())
+                .unwrap_or(0);
+            match id {
+                Some(id) => send_command(&format!(
+                    "history-play:{}",
+                    serde_json::json!({"id": id, "offset_ms": offset_ms})
+                )),
+                None => {
+                    eprintln!("Usage: omaflow history-play ID [OFFSET_MS]");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "journal-discard" => send_command("journal-discard"),
+        "todos" => crate::todos_cli::run(args),
+        // The to-do shortcut, down and up, and the Talk button's toggle.
+        "todo-press" => send_command("todo-press"),
+        "todo-release" => send_command("todo-release"),
+        // With JSON such as {"list":"Infra","due":"2026-10-02"}: where the
+        // To-dos tab's Talk button sends the capture.
+        "todo-toggle" => match args.next() {
+            Some(target) => send_command(&format!("todo-toggle:{target}")),
+            None => send_command("todo-toggle"),
+        },
+        // Where to-dos go from now on; "" is the Inbox.
+        "todo-list" => send_command(&format!("todo-list:{}", args.next().unwrap_or_default())),
+        // Moves the capture the card announces to another list.
+        "todo-move" => send_command(&format!("todo-move:{}", args.next().unwrap_or_default())),
+        "card-hold" => send_command("card-hold"),
+        "card-edit" => send_command("card-edit"),
+        "card-resume" => send_command("card-resume"),
+        "todo-card-edit" | "todo-card-remove" => {
+            let index = args.next().and_then(|index| index.parse::<usize>().ok());
+            match (index, args.next()) {
+                (Some(index), Some(text)) => send_command(&format!(
+                    "{command}:{}",
+                    serde_json::json!({"index": index, "text": text, "new_text": args.next().unwrap_or_default()})
+                )),
+                _ => {
+                    eprintln!(
+                        "Usage: omaflow {command} INDEX TEXT{}",
+                        if command == "todo-card-edit" {
+                            " NEW_TEXT"
+                        } else {
+                            ""
+                        }
+                    );
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "todo-discard" => send_command("todo-discard"),
+        "todo-undo" => send_command("todo-undo"),
+        "journal-stop-playback" => send_command("journal-stop-playback"),
+        "journal-play" => {
+            let date = args.next().unwrap_or_default();
+            let id = args.next().and_then(|id| id.parse::<u64>().ok());
+            let offset_ms = args
+                .next()
+                .and_then(|offset| offset.parse::<u64>().ok())
+                .unwrap_or(0);
+            match id {
+                Some(id) => send_command(&format!(
+                    "journal-play:{}",
+                    serde_json::json!({"date": date, "id": id, "offset_ms": offset_ms})
+                )),
+                None => {
+                    eprintln!("Usage: omaflow journal-play DATE ID [OFFSET_MS]");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         "copy" => send_command("copy"),
         "paste-last" => send_command("paste-last"),
         "history-paste" => history_command("history-paste", args.next()),
@@ -118,11 +205,25 @@ pub fn run() -> ExitCode {
             }
         }
         "configure" => {
-            match (
-                args.next(),
-                args.next()
-                    .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok()),
-            ) {
+            // `-` reads the value from stdin, so API keys never appear in the
+            // process arguments, which other local users can read in /proc.
+            let key = args.next();
+            let value = args.next().and_then(|value| {
+                let value = if value == "-" {
+                    // One line, so a caller that keeps stdin open still works.
+                    let mut input = String::new();
+                    std::io::BufRead::read_line(
+                        &mut std::io::BufReader::new(std::io::stdin().take(64 * 1024)),
+                        &mut input,
+                    )
+                    .ok()?;
+                    input
+                } else {
+                    value
+                };
+                serde_json::from_str::<serde_json::Value>(value.trim()).ok()
+            });
+            match (key, value) {
                 (Some(key), Some(value)) => send_command(&format!(
                     "configure:{}",
                     serde_json::json!({"key":key,"value":value})
@@ -273,6 +374,52 @@ pub fn run() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        // The to-do pipeline on one transcript, as a take would run it, with
+        // dates read on a fixed day: {"transcript", "todo_prompt"?, "model"?,
+        // "today"?, "now"?}. Prints the tasks; nothing is added.
+        "evaluate-todos" => {
+            let mut input = String::new();
+            let result = std::io::stdin()
+                .read_to_string(&mut input)
+                .map_err(|e| e.to_string())
+                .and_then(|_| serde_json::from_str::<serde_json::Value>(&input).map_err(|e| e.to_string()))
+                .and_then(|value| {
+                    let mut config = Config::load()?;
+                    config.cleanup.enabled = value.get("cleanup").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                    if let Some(prompt) = value.get("todo_prompt").and_then(serde_json::Value::as_str) {
+                        config.todos.prompt = prompt.into();
+                    }
+                    if let Some(model) = value.get("model").and_then(serde_json::Value::as_str) {
+                        config.cleanup.model = model.into();
+                    }
+                    let transcript = value.get("transcript").and_then(serde_json::Value::as_str).ok_or("Missing transcript")?;
+                    let (local_today, local_now) = omaflow_platform::clock::local_now();
+                    let today = match value.get("today").and_then(serde_json::Value::as_str) {
+                        Some(day) => day.parse().map_err(|_| format!("Not a date: {day}"))?,
+                        None => local_today,
+                    };
+                    let now = value.get("now").and_then(serde_json::Value::as_str).map_or(local_now, str::to_string);
+                    let (items, warning) = backend::evaluate_todos(&config, transcript)?;
+                    let items: Vec<serde_json::Value> = items
+                        .iter()
+                        .map(|item| {
+                            let (text, due, time) = omaflow_core::todos::due(item, today, &now);
+                            serde_json::json!({"text": text, "due": due.map(|due| due.to_string()), "time": time, "line": item})
+                        })
+                        .collect();
+                    Ok(serde_json::json!({"items": items, "warning": warning}))
+                });
+            match result {
+                Ok(value) => {
+                    println!("{value}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("omaflow: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         "cleanup" => {
             let mut input = String::new();
             let result = std::io::stdin()
@@ -309,15 +456,22 @@ fn print_help() {
 
 Usage: omaflow COMMAND
 
-Recording: press, release, stop, cancel, close
+Recording: press, release, stop, cancel, retry, close, dismiss, card-hold, card-edit, card-resume
+Journal: journal-toggle [LATER_DATE], journal-press, journal-release, journal-discard, journal-play DATE ID [MS], journal-stop-playback,
+         journal day DATE|month YYYY-MM|stats|search WORDS|year-ago DATE|add TEXT [LATER_DATE]|due|
+         edit DATE ID TEXT|delete DATE ID|restore DATE ID|forget-deleted|export
+To-dos: todo-press, todo-release, todo-toggle [JSON], todo-discard, todo-undo, todo-list LIST, todo-move LIST,
+        todo-card-edit I TEXT NEW, todo-card-remove I TEXT,
+        todos list|add TEXT [LIST [DUE]]|done|undone|edit|due I TEXT DATE [HH:MM]|reminders|move|delete|clear-done [LIST]|
+              new-list NAME|rename-list LIST NAME|delete-list LIST|restore|forget-deleted
 Delivery: copy, paste-last, paste-mode auto|ctrl-v|shift-insert|clipboard
-History: history-copy ID, history-raw ID, history-paste ID, history-edit ID TEXT,
+History: history-copy ID, history-raw ID, history-paste ID, history-play ID [MS], history-edit ID TEXT,
          history-delete ID, history-undo, history-clear, erase-data
-Settings: vocabulary-add TERM, vocabulary-remove TERM, configure KEY JSON
+Settings: vocabulary-add TERM, vocabulary-remove TERM, configure KEY JSON|-
 Models: model-catalog, model-select speech|cleanup ID,
         model-install speech|cleanup ID, configure models JSON
 Microphone: meter-gate DB, meter-preview-start, meter-preview-stop
-Evaluation: cleanup < text, evaluate < JSON, transcribe-file FILE.wav, test-cleanup
+Evaluation: cleanup < text, evaluate < JSON, evaluate-todos < JSON, transcribe-file FILE.wav, test-cleanup
 Maintenance: daemon, launch, quit, reload-config, effective-config,
              version [--json], check-update, update check|request|later|run|reconcile"
     );

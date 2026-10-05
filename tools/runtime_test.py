@@ -45,7 +45,11 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
             "import os, sys; from pathlib import Path\n"
             "runtime = Path(os.environ['XDG_RUNTIME_DIR'])\n"
             "(runtime / 'model-command').touch()\n"
-            "if (runtime / 'capture-fixture').exists():\n"
+            "if (runtime / 'capture-fixture').exists() and (runtime / 'asr-fail').exists():\n"
+            "    sys.exit(7)\n"
+            "elif (runtime / 'capture-fixture').exists() and (runtime / 'asr-empty').exists():\n"
+            "    print('{\"text\":\"\"}')\n"
+            "elif (runtime / 'capture-fixture').exists():\n"
             "    form = next((sys.argv[index + 1] for index, value in enumerate(sys.argv[:-1]) if value == '--form' and sys.argv[index + 1].startswith('file=@')), 'file=@-')\n"
             "    source = form.split('@', 1)[1].split(';', 1)[0]\n"
             "    audio = sys.stdin.buffer.read() if source == '-' else Path(source).read_bytes()\n"
@@ -57,7 +61,9 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         "pw-cat": (
             "import os, signal, sys, time; from pathlib import Path\n"
             "runtime = Path(os.environ['XDG_RUNTIME_DIR'])\n"
-            "if not (runtime / 'capture-fixture').exists():\n"
+            "if '--playback' in sys.argv:\n"
+            "    (runtime / 'playback').write_text(str(len(sys.stdin.buffer.read())))\n"
+            "elif not (runtime / 'capture-fixture').exists():\n"
             "    time.sleep(120)\n"
             "else:\n"
             "    sys.stdout.buffer.write(b'\\x01\\x00' * 1600)\n"
@@ -92,7 +98,8 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         # false, waiting on the background weights download, and every case but
         # the pending one is about a machine that is past that point.
         configured = "false" if pending else "true"
-        config.write_text(f'[cleanup]\nenabled=false\n[behavior]\nmodels_configured={configured}\nhistory_limit=30\ndouble_tap_ms=30\n[backend]\nstatus_timeout_ms=300\n{backend}')
+        # The journal folder always points into the case, never at ~/Documents.
+        config.write_text(f'[cleanup]\nenabled=false\n[behavior]\nmodels_configured={configured}\nhistory_limit=30\ndouble_tap_ms=30\n[backend]\nstatus_timeout_ms=300\n{backend}\n[journal]\nfolder="{case / "Journal"}"\n[todos]\nfolder="{case / "To-dos"}"\n')
         env = dict(os.environ, PATH=f"{commands}:/usr/bin", XDG_RUNTIME_DIR=str(runtime),
                    XDG_STATE_HOME=str(case / "state"), OMAFLOW_CONFIG=str(config))
         env.pop("OMAFLOW_FAKE_TRANSCRIPT", None)
@@ -172,6 +179,52 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         assert request[44:44 + pcm_bytes] == (
             b"\x01\x00" * 1600 + b"\x02\x00" * 320
         )
+        assert not (case / "state/omaflow/audio").exists(), "dictation audio is off by default"
+        assert state()["history"][0]["audio"] is False
+
+    def retry_failed(case, runtime, state, send):
+        # The speech engine fails a complete recording: it is kept, and the
+        # card waits for Try again instead of closing on a timer.
+        (runtime / "capture-fixture").touch()
+        (runtime / "asr-fail").touch()
+        send("press")
+        wait_until(lambda: state()["phase"] == "recording")
+        time.sleep(.08)
+        send("release")
+        wait_until(lambda: state()["phase"] == "error")
+        assert state()["can_retry"] is True, state()["error"]
+        assert state()["error"].endswith("Your recording is kept."), state()["error"]
+        assert state()["card_timer"] is None
+        # Try again sends the same recording, and this time it goes through.
+        (runtime / "asr-fail").unlink()
+        send("retry")
+        wait_until(lambda: state()["phase"] == "result" and state()["text"] == "Complete fixture transcript.")
+        request = (runtime / "asr-request").read_bytes()
+        assert int.from_bytes(request[40:44], "little") == 3840, "the whole recording, sent again"
+        # Closing a failed card lets the recording go: nothing to try again.
+        send("close")
+        wait_until(lambda: state()["phase"] == "idle")
+        (runtime / "asr-fail").touch()
+        send("press")
+        wait_until(lambda: state()["phase"] == "recording")
+        time.sleep(.08)
+        send("release")
+        wait_until(lambda: state()["phase"] == "error" and state()["can_retry"])
+        send("close")
+        wait_until(lambda: state()["phase"] == "idle" and not state()["can_retry"])
+        send("retry")
+        time.sleep(.2)
+        assert state()["phase"] == "idle"
+        # The engine answers but hears no words: not a failure, nothing to
+        # try again, and the quiet card goes by itself.
+        (runtime / "asr-fail").unlink()
+        (runtime / "asr-empty").touch()
+        send("press")
+        wait_until(lambda: state()["phase"] == "recording")
+        time.sleep(.08)
+        send("release")
+        wait_until(lambda: state()["phase"] == "notice")
+        assert state()["can_retry"] is False and state()["card_timer"]["total_ms"] > 0
 
     def settings(case, runtime, state, send):
         send('configure:{"key":"style","value":"verbatim"}')
@@ -196,6 +249,13 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         wait_until(lambda: state()["model_settings"]["speech_model"] == "test-whisper")
         assert state()["cleanup_model"] == "test-cleanup"
         assert state()["model_settings"]["cleanup_engine"] == "openai"
+        # A key goes in on stdin, never in the arguments, and is never published.
+        env = dict(os.environ, OMAFLOW_CONFIG=str(case / "config.toml"), XDG_RUNTIME_DIR=str(runtime))
+        subprocess.run([str(BINARY), "configure", "models", "-"], env=env, input='{"cleanup_api_key":"sk-stdin"}\n',
+                       text=True, capture_output=True, timeout=5, check=True)
+        wait_until(lambda: state()["model_settings"]["cleanup_api_key_set"] is True)
+        assert "sk-stdin" not in (runtime / "omaflow-state.json").read_text()
+        assert "sk-stdin" in (case/'config.toml').read_text()
         before = (case/'config.toml').read_bytes()
         send('configure:' + json.dumps({"key":"models","value":{"speech_engine":"unsupported"}}))
         wait_until(lambda: state()["feedback_error"])
@@ -319,6 +379,203 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         wait_until(lambda: log.read_text().split()[-1].startswith("0.8"))
         wait_until(lambda: not (runtime / "duck-restore").exists())
 
+    def journal_take(case, runtime, state, send):
+        send("journal-toggle")
+        wait_until(lambda: state()["phase"] == "recording" and state()["journal_take"] and state()["latched"])
+        send("journal-toggle")
+        wait_until(lambda: state()["phase"] == "journal-saved")
+        saved = state()["journal_saved"]
+        day = case / "Journal" / (saved["date"] + ".md")
+        text = day.read_text()
+        assert "This completed dictation must remain recoverable." in text, text
+        assert text.startswith("# ") and "<!-- omaflow:" + str(saved["id"]) + " -->" in text
+        assert saved["words"] == 6 and state()["journal_revision"] == 1
+        assert not state()["history"], "a journal entry is not a dictation"
+        log = runtime / "hyprctl-log"
+        assert not log.exists() or "send_key_state" not in log.read_text(), "a journal entry is never pasted"
+        assert not (runtime / "copy-attempt").exists(), "nor copied"
+        # Esc is pressed in other apps all the time; it must not end a take.
+        send("journal-toggle")
+        wait_until(lambda: state()["phase"] == "recording")
+        send("close")
+        time.sleep(.2)
+        assert state()["phase"] == "recording"
+        # Discard throws the take away and writes nothing.
+        send("journal-discard")
+        wait_until(lambda: state()["phase"] == "idle")
+        time.sleep(.2)
+        assert day.read_text() == text
+        # A typed entry from the window goes straight to the file.
+        env = dict(os.environ, OMAFLOW_CONFIG=str(case / "config.toml"), XDG_RUNTIME_DIR=str(runtime))
+        added = json.loads(subprocess.run([str(BINARY), "journal", "add", "Typed from the window."],
+                                          env=env, capture_output=True, text=True, timeout=5).stdout)
+        listed = json.loads(subprocess.run([str(BINARY), "journal", "day", added["date"]],
+                                           env=env, capture_output=True, text=True, timeout=5).stdout)
+        assert [entry["typed"] for entry in listed["entries"]] == [False, True]
+        found = json.loads(subprocess.run([str(BINARY), "journal", "search", "window"],
+                                          env=env, capture_output=True, text=True, timeout=5).stdout)
+        assert found["days"] == [added["date"]] and found["hits"][0]["matches"] == [[15, 6]]
+
+    def todo_take(case, runtime, state, send):
+        send("todo-toggle")
+        wait_until(lambda: state()["phase"] == "recording" and state()["todo_take"] and not state()["journal_take"])
+        send("todo-toggle")
+        wait_until(lambda: state()["phase"] == "todos-saved")
+        items = state()["todos_saved"]["items"]
+        assert [item["text"] for item in items] == ["This completed dictation must remain recoverable"], items
+        listed = (case / "To-dos" / "To-dos.md").read_text()
+        assert "- [ ] This completed dictation must remain recoverable\n" in listed, listed
+        assert not state()["history"], "to-dos are not a dictation"
+        assert not (runtime / "copy-attempt").exists(), "nor copied"
+        # Undo on the card takes exactly the capture back out.
+        revision = state()["todos_revision"]
+        send("todo-undo")
+        wait_until(lambda: state()["todos_revision"] > revision and state()["phase"] == "idle")
+        assert "- [ ]" not in (case / "To-dos" / "To-dos.md").read_text()
+        # Held like the dictation key: letting go adds them.
+        send("todo-press")
+        wait_until(lambda: state()["phase"] == "recording" and state()["todo_take"])
+        time.sleep(.1)
+        send("todo-release")
+        wait_until(lambda: state()["phase"] == "todos-saved")
+        # Cancel throws a take away and adds nothing.
+        send("todo-toggle")
+        wait_until(lambda: state()["phase"] == "recording")
+        send("todo-discard")
+        wait_until(lambda: state()["phase"] == "idle")
+        assert (case / "To-dos" / "To-dos.md").read_text().count("- [ ]") == 1
+        # With lists: a take goes to the current list, and the card's list
+        # chip moves it to another one, which becomes current.
+        env = dict(os.environ, OMAFLOW_CONFIG=str(case / "config.toml"), XDG_RUNTIME_DIR=str(runtime))
+        for name in ("Infra", "Dev"):
+            subprocess.run([str(BINARY), "todos", "new-list", name], env=env, capture_output=True, timeout=5, check=True)
+        send("todo-list:Infra")
+        wait_until(lambda: state()["todo_list"] == "Infra")
+        send("todo-toggle")
+        wait_until(lambda: state()["phase"] == "recording")
+        send("todo-toggle")
+        wait_until(lambda: state()["phase"] == "todos-saved")
+        assert state()["todos_saved"]["items"][0]["list"] == "Infra"
+        send("todo-move:Dev")
+        wait_until(lambda: state()["todos_saved"]["moved"] and state()["todo_list"] == "Dev")
+        listed = json.loads(subprocess.run([str(BINARY), "todos", "list"], env=env, capture_output=True, text=True, timeout=5).stdout)
+        assert [todo["list"] for todo in listed["todos"]] == ["", "Dev"], listed
+        assert listed["current"] == "Dev"
+        # The To-dos tab's Talk button names its list.
+        send('todo-toggle:{"list":"Infra","due":"2026-10-09"}')
+        wait_until(lambda: state()["phase"] == "recording" and state()["todo_list"] == "Infra")
+        send("todo-toggle")
+        wait_until(lambda: state()["phase"] == "todos-saved")
+        saved = state()["todos_saved"]["items"][0]
+        assert saved["list"] == "Infra" and saved["due"] == "2026-10-09", saved
+        # The card's clock is published, stops while the card is pointed at,
+        # and starts over when it is let go.
+        timer = state()["card_timer"]
+        assert timer["total_ms"] >= 5000 and 0 < timer["remaining_ms"] <= timer["total_ms"], timer
+        send("card-hold")
+        wait_until(lambda: state()["card_timer"]["remaining_ms"] is None)
+        # Editing a to-do on the card: Esc ends the edit, not the card.
+        send("card-edit")
+        time.sleep(.1)
+        send("close")
+        time.sleep(.2)
+        assert state()["phase"] == "todos-saved"
+        send("todo-card-edit:" + json.dumps({"index": saved["index"], "text": saved["text"], "new_text": "Renew the certs"}))
+        wait_until(lambda: state()["todos_saved"]["items"][0]["text"] == "Renew the certs")
+        edited = state()["todos_saved"]["items"][0]
+        assert edited["due"] == "2026-10-09" and edited["list"] == "Infra", "an edit keeps the date and list"
+        assert "- [ ] Renew the certs 📅 2026-10-09" in (case / "To-dos" / "To-dos.md").read_text()
+        send("card-resume")
+        wait_until(lambda: state()["card_timer"]["remaining_ms"] is not None)
+        # Taking out the last to-do on the card closes it, like Undo.
+        send("todo-card-remove:" + json.dumps({"index": edited["index"], "text": edited["text"]}))
+        wait_until(lambda: state()["phase"] == "idle")
+        assert "Renew the certs" not in (case / "To-dos" / "To-dos.md").read_text()
+        # A time said with the deadline becomes a reminder, handed out once.
+        added = json.loads(subprocess.run([str(BINARY), "todos", "add", "Call Mira tomorrow at 3pm"], env=env,
+                                          capture_output=True, text=True, timeout=5, check=True).stdout)["added"][0]
+        assert added["text"] == "Call Mira" and added["time"] == "15:00", added
+        assert f"- [ ] Call Mira ⏰ {added['due']} 15:00 📅 {added['due']}" in (case / "To-dos" / "To-dos.md").read_text()
+        clock = time.strftime("%H:%M")
+        today = time.strftime("%Y-%m-%d")
+        subprocess.run([str(BINARY), "todos", "due", str(added["index"]), "Call Mira", today, clock], env=env,
+                       capture_output=True, timeout=5, check=True)
+        reminders = lambda: json.loads(subprocess.run([str(BINARY), "todos", "reminders"], env=env, capture_output=True,
+                                                      text=True, timeout=5, check=True).stdout)["reminders"]
+        assert [todo["text"] for todo in reminders()] == ["Call Mira"]
+        assert reminders() == [], "once"
+        # The card's own close button closes it even mid-edit.
+        send("todo-toggle")
+        wait_until(lambda: state()["phase"] == "recording")
+        send("todo-toggle")
+        wait_until(lambda: state()["phase"] == "todos-saved")
+        send("card-edit")
+        time.sleep(.1)
+        send("dismiss")
+        wait_until(lambda: state()["phase"] == "idle")
+
+    def journal_recording(case, runtime, state, send):
+        (runtime / "capture-fixture").touch()
+        send("journal-toggle")
+        wait_until(lambda: state()["phase"] == "recording")
+        time.sleep(.08)
+        send("journal-toggle")
+        wait_until(lambda: state()["phase"] == "journal-saved")
+        saved = state()["journal_saved"]
+        journal = case / "Journal"
+        wav = (journal / ".recordings" / saved["date"] / f'{saved["id"]}.wav').read_bytes()
+        assert wav.startswith(b"RIFF") and len(wav) == 44 + 3840
+        meta = json.loads((journal / ".omaflow" / (saved["date"] + ".json")).read_text())["entries"][str(saved["id"])]
+        assert meta["duration_ms"] == 120 and meta["peaks"] and meta["raw_text"] == "Complete fixture transcript."
+        assert "Complete fixture transcript." in (journal / (saved["date"] + ".md")).read_text()
+        send("journal-play:" + json.dumps({"date": saved["date"], "id": saved["id"], "offset_ms": 60}))
+        wait_until(lambda: (runtime / "playback").exists())
+        assert int((runtime / "playback").read_text()) == 1920, "playback starts at the offset"
+        wait_until(lambda: state()["journal_playback"] is None)
+        # Turning recordings off deletes them; the entry and its words stay.
+        send('configure:{"key":"journal_keep_recordings","value":false}')
+        wait_until(lambda: state()["journal_settings"]["keep_recordings"] is False)
+        wait_until(lambda: not (journal / ".recordings").exists())
+        assert "Complete fixture transcript." in (journal / (saved["date"] + ".md")).read_text()
+
+    def dictation_audio(case, runtime, state, send):
+        (runtime / "capture-fixture").touch()
+        send('configure:{"key":"keep_dictation_audio","value":true}')
+        wait_until(lambda: state()["keep_dictation_audio"])
+        send("press"); time.sleep(.08); send("release")
+        wait_until(lambda: state()["phase"] == "result")
+        entry = state()["history"][0]
+        audio = case / "state/omaflow/audio" / f'{entry["id"]}.wav'
+        assert entry["audio"] and audio.read_bytes().startswith(b"RIFF")
+        send("history-play:" + json.dumps({"id": entry["id"]}))
+        wait_until(lambda: (runtime / "playback").exists())
+        assert int((runtime / "playback").read_text()) == 3840
+        # Deleting keeps the recording while Undo is offered.
+        send("history-delete:" + str(entry["id"]))
+        wait_until(lambda: not state()["history"])
+        assert audio.exists()
+        send("history-undo")
+        wait_until(lambda: state()["history"] and state()["history"][0]["audio"])
+        # Switching the setting off deletes what was kept.
+        send('configure:{"key":"keep_dictation_audio","value":false}')
+        wait_until(lambda: not state()["keep_dictation_audio"])
+        wait_until(lambda: not audio.exists())
+        assert state()["history"][0]["audio"] is False
+
+    run_case(
+        "dictation audio is kept only when asked, played back, and deleted with its dictation",
+        False,
+        dictation_audio,
+        backend='engine="openai"\nendpoint="http://fixture.invalid/transcribe"\n',
+    )
+    run_case("a journal take is written to the day's file, never pasted", True, journal_take)
+    run_case("a to-do take is added to the list, and Undo takes it back out", True, todo_take)
+    run_case(
+        "a spoken journal entry keeps its recording and plays it back",
+        False,
+        journal_recording,
+        backend='engine="openai"\nendpoint="http://fixture.invalid/transcribe"\n',
+    )
     run_case("history changes survive failed storage without false success", True, failed_history_write)
     run_case("dictation ducks the sink and always restores it", False, audio_ducking)
     run_case("clipboard-only delivery never reports a paste", True, clipboard_only)
@@ -330,6 +587,12 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         "stop drains final recorder bytes into the transcription request",
         False,
         drained_capture,
+        backend='engine="openai"\nendpoint="http://fixture.invalid/transcribe"\n',
+    )
+    run_case(
+        "a failed transcription keeps its recording, and Try again sends it again",
+        False,
+        retry_failed,
         backend='engine="openai"\nendpoint="http://fixture.invalid/transcribe"\n',
     )
     run_case("validated dictation preferences; unknown settings and commands rejected", True, settings)

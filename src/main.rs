@@ -1,14 +1,19 @@
-mod audio;
+mod backend;
 mod catalog;
 mod cleanup;
 mod cli;
-use crate::process::CommandExt;
-mod backend;
-mod config;
-mod process;
-mod state;
+mod journal_cli;
+mod todos_cli;
 mod update;
-mod vocabulary;
+
+// The core and platform crates are re-bound here so every module in this
+// binary keeps addressing them as `crate::config`, `crate::process` and so on.
+use omaflow_core::history::{self, HistoryEntry};
+use omaflow_core::journal::{Journal, NewEntry};
+use omaflow_core::todos::{NewTodo, TodoList};
+use omaflow_core::{config, state, vocabulary};
+use omaflow_platform::ducking as audio;
+use omaflow_platform::process::{self, CommandExt};
 
 use config::{Config, PasteDelivery, PasteMode};
 use serde::{Deserialize, Serialize};
@@ -42,6 +47,24 @@ enum SessionCommand {
     Stop,
     Cancel,
     Close,
+    /// The card's own close button: closes it even mid-edit.
+    Dismiss,
+    /// Try again on a failed take, from its kept recording.
+    Retry,
+    /// Starts a journal entry, or saves the one being taken. With a later
+    /// day, the entry is a note to yourself for that day.
+    JournalToggle(Option<omaflow_core::date::Date>),
+    /// The journal shortcut, pressed and let go: hold to talk, double-tap to
+    /// keep going hands-free, exactly like the dictation key.
+    JournalPress(Option<omaflow_core::date::Date>),
+    JournalRelease,
+    /// Throws away the journal entry or to-dos being taken.
+    JournalDiscard,
+    /// The to-do shortcut and button: hold, double-tap or toggle, like the
+    /// journal's, but the words become tasks on the to-do list.
+    TodoPress,
+    TodoRelease,
+    TodoToggle,
 }
 
 /// Everything the panel asks for that leaves the recording state untouched.
@@ -67,6 +90,60 @@ enum PanelCommand {
     CopyRaw(u64),
     EraseData,
     ReloadConfig,
+    JournalPlay(JournalPlayback),
+    JournalStopPlayback,
+    /// Takes back the to-dos the last capture added.
+    UndoTodos,
+    /// Where new to-dos go, picked in the pill or the composer. During a
+    /// capture it also redirects that capture.
+    TodoSetList(String),
+    /// The card's list chip: moves the capture it announces to another list.
+    TodoMoveCapture(String),
+    /// A card that closes by itself waits while you point at it, open its
+    /// list menu, or edit a to-do on it.
+    CardHold(CardHold),
+    /// Edits one of the to-dos the card announces.
+    TodoCardEdit(TodoCardChange),
+    /// Takes one of the to-dos the card announces back out.
+    TodoCardRemove(TodoCardChange),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CardHold {
+    #[default]
+    None,
+    /// Pointed at, or its menu open: Esc still closes it.
+    Hover,
+    /// A to-do on it being edited: Esc ends the edit, not the card.
+    Edit,
+}
+
+/// One of the card's to-dos, by its place and words, and for an edit, the
+/// new words.
+#[derive(Debug, Clone, Deserialize)]
+struct TodoCardChange {
+    index: usize,
+    text: String,
+    #[serde(default)]
+    new_text: String,
+}
+
+/// How long a card that closes by itself has left.
+#[derive(Debug, Serialize)]
+struct CardTimer {
+    total_ms: u64,
+    /// None while it waits for you.
+    remaining_ms: Option<u64>,
+}
+
+/// Where the Talk button in the To-dos tab sends a capture: the list it
+/// shows, and on Today, a due date for to-dos that do not say one.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct TodoTarget {
+    #[serde(default)]
+    list: Option<String>,
+    #[serde(default)]
+    due: Option<String>,
 }
 
 #[derive(Debug)]
@@ -76,17 +153,24 @@ enum Message {
     PrepareUpdate(String),
     CancelUpdate(String, mpsc::Sender<bool>),
     Completed(u64, backend::StopOutcome),
-    Failed(u64, String),
+    TodoToggleFor(TodoTarget),
+    /// A take failed; true when its recording is kept for Try again.
+    Failed(u64, String, bool),
     RuntimeStatus(RuntimeStatus),
     ModelProgress(String, DownloadProgress),
     Feedback(Result<(), String>, String),
     ResultCopied(u64, Result<(), String>),
+    PlaybackFinished(u64),
 }
 
 #[derive(Debug)]
 enum BackendJob {
     Start(u64),
-    Stop(u64),
+    Stop(u64, backend::Take),
+    /// Transcribe a failed take's kept recording again.
+    Retry(u64, backend::Take),
+    /// The failed take's card closed: drop its recording.
+    Forget,
     Cancel,
     MeterPreviewStart,
     MeterPreviewStop,
@@ -151,20 +235,45 @@ enum ResultView {
     Transcript,
     Notice,
     Error,
+    JournalSaved,
+    TodosSaved,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct HistoryEntry {
+/// The to-dos the overlay announces after a capture, kept so Undo can take
+/// exactly them back out.
+#[derive(Debug, Clone, Serialize)]
+struct TodosSaved {
+    items: Vec<omaflow_core::todos::Todo>,
+    /// Moved to another list from the card since.
+    moved: bool,
+}
+
+/// The journal entry the overlay announces after a take is written down.
+#[derive(Debug, Clone, Serialize)]
+struct JournalSaved {
+    date: String,
     id: u64,
-    created_at_ms: u64,
-    text: String,
+    words: usize,
+    duration_ms: u64,
+}
+
+/// A journal recording being played back. The panel draws progress from
+/// `started_at_ms` and `offset_ms`; the daemon only says when it ends.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A recording being played back: a journal entry, or with an empty date a
+/// kept dictation.
+struct JournalPlayback {
     #[serde(default)]
-    raw_text: String,
+    date: String,
+    id: u64,
     #[serde(default)]
-    cleanup_model: String,
-    pasted: bool,
+    offset_ms: u64,
     #[serde(default)]
-    cleanup_warning: String,
+    duration_ms: u64,
+    #[serde(default)]
+    started_at_ms: u64,
+    #[serde(skip)]
+    token: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,16 +324,31 @@ struct SurfaceState<'a> {
     config_path: String,
     shortcut_settings: serde_json::Value,
     cleanup_enabled: bool,
+    cleanup_level: &'static str,
     style: &'a str,
     use_window_context: bool,
     use_clipboard_context: bool,
     history_limit: usize,
     feedback: &'a str,
     feedback_error: bool,
-    reduced_motion: bool,
     keep_models_loaded: bool,
+    keep_dictation_audio: bool,
     paste_sent: bool,
     recording_elapsed_ms: u64,
+    journal_take: bool,
+    journal_saved: Option<&'a JournalSaved>,
+    todo_take: bool,
+    todos_saved: Option<&'a TodosSaved>,
+    todos_revision: u64,
+    /// Where the next to-do goes, or during a capture, where it is going.
+    todo_list: &'a str,
+    todo_settings: serde_json::Value,
+    journal_revision: u64,
+    journal_settings: serde_json::Value,
+    journal_playback: Option<&'a JournalPlayback>,
+    card_timer: Option<CardTimer>,
+    /// A failed take's recording is kept: the card offers Try again.
+    can_retry: bool,
     published_at_ms: u64,
     serial: u64,
 }
@@ -235,6 +359,15 @@ struct Daemon {
     transcript: String,
     error: String,
     close_at: Option<Duration>,
+    /// The whole time a self-closing card is shown for, 0 for one that stays.
+    close_total_ms: u64,
+    card_hold: CardHold,
+    /// The last take sent for transcribing, so Try again can send it again.
+    last_take: Option<backend::Take>,
+    /// The failed take's recording is kept, and Try again can use it.
+    can_retry: bool,
+    /// The daemon's clock, the one `close_at` is measured on.
+    epoch: Instant,
     serial: u64,
     state_path: PathBuf,
     history: Vec<HistoryEntry>,
@@ -263,6 +396,26 @@ struct Daemon {
     audio_ducked: bool,
     model_downloads: HashMap<String, DownloadProgress>,
     pending_update: Option<String>,
+    /// True while the recording, or its processing, is a journal entry.
+    journal_take: bool,
+    journal_saved: Option<JournalSaved>,
+    /// True while the recording, or its processing, is a list of to-dos.
+    todo_take: bool,
+    todos_saved: Option<TodosSaved>,
+    /// The current list, "" for the Inbox, and the list and default due date
+    /// of the capture being taken.
+    todo_current: String,
+    todo_take_list: String,
+    todo_take_due: Option<omaflow_core::date::Date>,
+    todo_request: Option<TodoTarget>,
+    /// Bumped whenever the daemon writes the to-do list.
+    todos_revision: u64,
+    /// Bumped whenever the daemon writes to the journal, so an open window
+    /// knows to read the day again.
+    journal_revision: u64,
+    playback: Option<(JournalPlayback, Arc<AtomicBool>)>,
+    playback_token: u64,
+    journal_started: Option<(omaflow_core::date::Date, String)>,
 }
 
 fn main() -> ExitCode {
@@ -316,7 +469,7 @@ fn run_daemon() -> ExitCode {
     start_status_worker(config.clone(), message_tx.clone());
 
     let history_path = history_path();
-    let history = load_history(&history_path, config.behavior.history_limit);
+    let history = history::load(&history_path, config.behavior.history_limit);
     let epoch = Instant::now();
     let mut daemon = Daemon {
         state: StateMachine::with_max_recording(
@@ -327,6 +480,11 @@ fn run_daemon() -> ExitCode {
         transcript: String::new(),
         error: String::new(),
         close_at: None,
+        close_total_ms: 0,
+        card_hold: CardHold::None,
+        last_take: None,
+        can_retry: false,
+        epoch,
         serial: 0,
         state_path: surface_state_path(),
         history,
@@ -355,7 +513,30 @@ fn run_daemon() -> ExitCode {
         audio_ducked: false,
         model_downloads: HashMap::new(),
         pending_update: None,
+        journal_take: false,
+        journal_saved: None,
+        todo_take: false,
+        todos_saved: None,
+        todo_current: String::new(),
+        todo_take_list: String::new(),
+        todo_take_due: None,
+        todo_request: None,
+        todos_revision: 0,
+        journal_revision: 0,
+        playback: None,
+        playback_token: 0,
+        journal_started: None,
     };
+    daemon.todo_current = daemon.todos().current_list();
+    if !config.behavior.keep_dictation_audio {
+        for entry in &mut daemon.history {
+            entry.audio = false;
+        }
+    }
+    daemon.prune_audio();
+    if let Err(error) = forget_journal_recordings(&config) {
+        eprintln!("omaflow: {error}");
+    }
     daemon.publish();
     if let Err(error) = update::finalize_recovery_for_running_daemon() {
         eprintln!("omaflow: could not finalize update recovery: {error}");
@@ -392,7 +573,7 @@ fn run_daemon() -> ExitCode {
         if daemon.close_at.is_some_and(|deadline| now >= deadline)
             && matches!(daemon.state.phase(), Phase::Result | Phase::Error)
         {
-            daemon.close_at = None;
+            daemon.keep_open();
             daemon.view = ResultView::None;
             daemon.state.close();
             daemon.publish();
@@ -420,6 +601,16 @@ fn handle_message(
     jobs: &mpsc::Sender<BackendJob>,
 ) {
     match message {
+        Message::TodoToggleFor(target) => {
+            daemon.todo_request = Some(target);
+            handle_message(
+                Message::Session(SessionCommand::TodoToggle),
+                now,
+                daemon,
+                jobs,
+            );
+            daemon.todo_request = None;
+        }
         Message::PrepareUpdate(transaction_id) => {
             daemon.pending_update = Some(transaction_id);
             daemon.feedback = "Finishing your dictation before the update.".into();
@@ -492,6 +683,7 @@ fn handle_message(
                 next.truncate(daemon.history_limit);
                 if daemon.save_history_change(next, false, "History restored") {
                     daemon.last_deleted = None;
+                    daemon.prune_audio();
                     daemon.publish();
                 }
             }
@@ -600,6 +792,14 @@ fn handle_message(
             }
         }
         Message::Panel(PanelCommand::ReloadConfig) => match Config::load() {
+            // The shell reloads after every change to the file, including the
+            // ones this daemon just wrote for the Settings panel; those are
+            // already applied, so they reload nothing and say nothing.
+            Ok(config)
+                if serde_json::to_value(&config).ok()
+                    == serde_json::to_value(&daemon.effective_config).ok()
+                    && config.backend.api_key == daemon.effective_config.backend.api_key
+                    && config.cleanup.api_key == daemon.effective_config.cleanup.api_key => {}
             Ok(config) => {
                 let result = daemon.apply_config(config.clone());
                 let _ = jobs.send(BackendJob::ReloadConfig(Box::new(config)));
@@ -627,7 +827,7 @@ fn handle_message(
             daemon.generation = daemon.generation.wrapping_add(1);
             let action = daemon.state.cancel();
             daemon.state.close();
-            daemon.close_at = None;
+            daemon.keep_open();
             run_action(action, jobs, daemon);
             let mut errors = Vec::new();
             for path in [&daemon.history_path, &daemon.training_log_path] {
@@ -636,6 +836,11 @@ fn handle_message(
                 {
                     errors.push(format!("{}: {error}", path.display()));
                 }
+            }
+            if let Err(error) = fs::remove_dir_all(audio_dir())
+                && error.kind() != ErrorKind::NotFound
+            {
+                errors.push(format!("{}: {error}", audio_dir().display()));
             }
             if !daemon.history_path.exists() {
                 daemon.history.clear();
@@ -653,7 +858,7 @@ fn handle_message(
             };
             daemon.operation_feedback(
                 result,
-                "History and training data deleted. Your clipboard is unchanged.",
+                "History, its audio and training data deleted. Your clipboard is unchanged.",
             );
         }
         Message::Panel(PanelCommand::RefreshUpdate) => {
@@ -661,14 +866,25 @@ fn handle_message(
             daemon.publish();
         }
         Message::Session(command) => {
+            // Esc while a to-do on the card is being edited ends the edit; the
+            // card stays.
+            if matches!(command, SessionCommand::Close) && daemon.card_hold == CardHold::Edit {
+                return;
+            }
             if matches!(
                 command,
                 SessionCommand::Press
                     | SessionCommand::Stop
                     | SessionCommand::Cancel
                     | SessionCommand::Close
+                    | SessionCommand::Dismiss
+                    | SessionCommand::JournalToggle(_)
+                    | SessionCommand::JournalPress(_)
+                    | SessionCommand::JournalDiscard
+                    | SessionCommand::TodoPress
+                    | SessionCommand::TodoToggle
             ) {
-                daemon.close_at = None;
+                daemon.keep_open();
             }
             let phase_before = daemon.state.phase().clone();
             let action = match command {
@@ -685,8 +901,82 @@ fn handle_message(
                     let action = daemon.state.press(now);
                     if action == Action::Start {
                         daemon.generation = daemon.generation.wrapping_add(1);
+                        daemon.journal_take = false;
+                        daemon.todo_take = false;
+                        // The microphone would record the playback.
+                        daemon.stop_playback();
                     }
                     action
+                }
+                SessionCommand::JournalPress(target) => match daemon.state.phase() {
+                    // A second tap locks it; a press while locked saves it.
+                    Phase::Recording { .. } if daemon.journal_take => daemon.state.press(now),
+                    Phase::Processing if daemon.journal_take => Action::None,
+                    Phase::Recording { .. } | Phase::Processing => {
+                        daemon.feedback =
+                            "Finish the dictation first, then start the journal entry.".into();
+                        daemon.feedback_error = false;
+                        Action::None
+                    }
+                    Phase::Idle | Phase::Result | Phase::Error => {
+                        start_journal(daemon, target, now, false)
+                    }
+                },
+                SessionCommand::JournalRelease => {
+                    if daemon.journal_take {
+                        daemon.state.release(now)
+                    } else {
+                        Action::None
+                    }
+                }
+                SessionCommand::JournalToggle(target) => match daemon.state.phase() {
+                    Phase::Recording { .. } if daemon.journal_take => daemon.state.stop(),
+                    // A second press while the entry is being written down.
+                    Phase::Processing if daemon.journal_take => Action::None,
+                    Phase::Recording { .. } | Phase::Processing => {
+                        daemon.feedback =
+                            "Finish the dictation first, then start the journal entry.".into();
+                        daemon.feedback_error = false;
+                        Action::None
+                    }
+                    Phase::Idle | Phase::Result | Phase::Error => {
+                        start_journal(daemon, target, now, true)
+                    }
+                },
+                SessionCommand::TodoPress => match daemon.state.phase() {
+                    Phase::Recording { .. } if daemon.todo_take => daemon.state.press(now),
+                    Phase::Processing if daemon.todo_take => Action::None,
+                    Phase::Recording { .. } | Phase::Processing => {
+                        daemon.feedback = "Finish this take first, then add to-dos.".into();
+                        daemon.feedback_error = false;
+                        Action::None
+                    }
+                    Phase::Idle | Phase::Result | Phase::Error => start_todos(daemon, now, false),
+                },
+                SessionCommand::TodoRelease => {
+                    if daemon.todo_take {
+                        daemon.state.release(now)
+                    } else {
+                        Action::None
+                    }
+                }
+                SessionCommand::TodoToggle => match daemon.state.phase() {
+                    Phase::Recording { .. } if daemon.todo_take => daemon.state.stop(),
+                    Phase::Processing if daemon.todo_take => Action::None,
+                    Phase::Recording { .. } | Phase::Processing => {
+                        daemon.feedback = "Finish this take first, then add to-dos.".into();
+                        daemon.feedback_error = false;
+                        Action::None
+                    }
+                    Phase::Idle | Phase::Result | Phase::Error => start_todos(daemon, now, true),
+                },
+                SessionCommand::JournalDiscard => {
+                    if daemon.journal_take || daemon.todo_take {
+                        daemon.view = ResultView::None;
+                        daemon.state.cancel()
+                    } else {
+                        Action::None
+                    }
                 }
                 SessionCommand::Release => daemon.state.release(now),
                 SessionCommand::Stop => daemon.state.stop(),
@@ -694,10 +984,32 @@ fn handle_message(
                     daemon.view = ResultView::None;
                     daemon.state.cancel()
                 }
-                SessionCommand::Close => {
+                // Esc is bound in every app and never consumed, so it only ever
+                // dismisses a card. Throwing a take away takes a deliberate
+                // Discard or Cancel.
+                SessionCommand::Close | SessionCommand::Dismiss => {
                     if matches!(daemon.state.phase(), Phase::Result | Phase::Error) {
                         daemon.view = ResultView::None;
                         daemon.state.close();
+                        daemon.forget_failed_take(jobs);
+                    }
+                    Action::None
+                }
+                SessionCommand::Retry => {
+                    if let (true, Some(take)) = (daemon.can_retry, daemon.last_take)
+                        && daemon.state.retry()
+                    {
+                        daemon.can_retry = false;
+                        daemon.view = ResultView::None;
+                        daemon.error.clear();
+                        if jobs
+                            .send(BackendJob::Retry(daemon.generation, take))
+                            .is_err()
+                        {
+                            daemon.state.failed();
+                            daemon.view = ResultView::Error;
+                            daemon.error = "speech backend worker stopped".into();
+                        }
                     }
                     Action::None
                 }
@@ -721,12 +1033,23 @@ fn handle_message(
             {
                 return;
             }
-            let backend::StopOutcome::Transcript(transcript) = outcome else {
-                daemon.state.completed();
-                daemon.view = ResultView::Notice;
-                daemon.close_at = Some(now + Duration::from_millis(daemon.notice_visible_ms));
-                daemon.publish();
-                return;
+            let transcript = match outcome {
+                backend::StopOutcome::NoSpeech => {
+                    daemon.state.completed();
+                    daemon.view = ResultView::Notice;
+                    daemon.close_after(now, daemon.notice_visible_ms);
+                    daemon.publish();
+                    return;
+                }
+                backend::StopOutcome::Journal(entry) => {
+                    daemon.save_journal(entry, now);
+                    return;
+                }
+                backend::StopOutcome::Todos(todos) => {
+                    daemon.save_todos(todos, now);
+                    return;
+                }
+                backend::StopOutcome::Transcript(transcript) => transcript,
             };
             daemon.state.completed();
             daemon.transcript = transcript.text.clone();
@@ -736,19 +1059,15 @@ fn handle_message(
             daemon.feedback_error = !transcript.cleanup_warning.is_empty();
             daemon.remember_transcript(&transcript);
             daemon.view = if transcript.pasted && !daemon.feedback_error {
-                daemon.close_at = Some(
-                    now + Duration::from_millis(
-                        daemon.effective_config.behavior.success_visible_ms,
-                    ),
-                );
+                daemon.close_after(now, daemon.effective_config.behavior.success_visible_ms);
                 ResultView::Success
             } else {
-                daemon.close_at = None;
+                daemon.keep_open();
                 ResultView::Transcript
             };
             daemon.publish();
         }
-        Message::Failed(generation, error) => {
+        Message::Failed(generation, error, kept) => {
             if generation != daemon.generation
                 || !matches!(
                     daemon.state.phase(),
@@ -758,12 +1077,41 @@ fn handle_message(
                 return;
             }
             eprintln!("omaflow: dictation failed: {error}");
-            daemon.close_at = Some(
-                now + Duration::from_millis(daemon.effective_config.behavior.error_visible_ms),
-            );
+            daemon.can_retry = kept && daemon.last_take.is_some();
+            // With the recording kept, the card waits for Try again; your
+            // words are at stake, so it does not leave on a timer.
+            if daemon.can_retry {
+                daemon.keep_open();
+            } else {
+                daemon.close_after(now, daemon.effective_config.behavior.error_visible_ms);
+            }
             daemon.state.failed();
             daemon.view = ResultView::Error;
-            daemon.error = friendly_error(&error);
+            daemon.error = failure_text(&error, daemon.can_retry);
+            daemon.publish();
+        }
+        Message::PlaybackFinished(token) => {
+            if daemon
+                .playback
+                .as_ref()
+                .is_some_and(|(playback, _)| playback.token == token)
+            {
+                daemon.playback = None;
+                daemon.publish();
+            }
+        }
+        Message::Panel(PanelCommand::JournalPlay(request)) => daemon.play(request),
+        Message::Panel(PanelCommand::UndoTodos) => daemon.undo_todos(),
+        Message::Panel(PanelCommand::TodoSetList(list)) => daemon.set_todo_list(list),
+        Message::Panel(PanelCommand::TodoMoveCapture(list)) => daemon.move_capture(list, now),
+        Message::Panel(PanelCommand::CardHold(hold)) => {
+            daemon.hold_card(hold, now);
+            daemon.publish();
+        }
+        Message::Panel(PanelCommand::TodoCardEdit(change)) => daemon.edit_card_todo(change),
+        Message::Panel(PanelCommand::TodoCardRemove(change)) => daemon.remove_card_todo(change),
+        Message::Panel(PanelCommand::JournalStopPlayback) => {
+            daemon.stop_playback();
             daemon.publish();
         }
         Message::ModelProgress(id, progress) => {
@@ -789,9 +1137,25 @@ fn run_action(action: Action, jobs: &mpsc::Sender<BackendJob>, daemon: &mut Daem
         Action::Stop | Action::Cancel => daemon.unduck(),
         Action::None => {}
     }
+    if matches!(action, Action::Start) {
+        daemon.can_retry = false;
+    }
+    let take = if daemon.todo_take {
+        backend::Take::Todos
+    } else if daemon.journal_take {
+        backend::Take::Journal(backend::JournalTake {
+            cleanup: daemon.effective_config.journal.cleanup,
+            keep_recording: daemon.effective_config.journal.keep_recordings,
+        })
+    } else {
+        backend::Take::Paste
+    };
     let Some(job) = (match action {
         Action::Start => Some(BackendJob::Start(daemon.generation)),
-        Action::Stop => Some(BackendJob::Stop(daemon.generation)),
+        Action::Stop => {
+            daemon.last_take = Some(take);
+            Some(BackendJob::Stop(daemon.generation, take))
+        }
         Action::Cancel => Some(BackendJob::Cancel),
         Action::None => None,
     }) else {
@@ -808,14 +1172,31 @@ fn run_action(action: Action, jobs: &mpsc::Sender<BackendJob>, daemon: &mut Daem
 /// Backend failures are written for a log. The card shows one sentence for
 /// what happened and one for what to do about it, because the person reading
 /// it is mid-sentence and wants their words back, not a diagnosis.
+/// The card's sentence for a failure. With the recording kept, the advice
+/// to try again is the Try again button, and it says the words are safe.
+fn failure_text(error: &str, kept: bool) -> String {
+    let text = friendly_error(error);
+    if !kept {
+        return text;
+    }
+    let text = text
+        .trim_end_matches(" Try again.")
+        .replace(" — try again in a moment.", ".")
+        .replace(
+            " Try again, or restart it from the bar.",
+            " If it keeps failing, restart OmaFlow from the bar.",
+        );
+    format!("{text} Your recording is kept.")
+}
+
 fn friendly_error(error: &str) -> String {
     let lowered = error.to_lowercase();
     let matches = |needles: &[&str]| needles.iter().any(|needle| lowered.contains(needle));
 
     if matches(&["speech model is not configured"]) {
-        "The speech model is missing or ambiguous. Set an installed GGUF path in Settings → Models."
+        "The speech model is missing or ambiguous. Set an installed GGUF path in Settings → Advanced → Your own model."
     } else if matches(&["models not configured"]) {
-        "Models not configured. Open Settings → Models to finish setup."
+        "Models not configured. Open Settings → Advanced → Models to finish setup."
     } else if matches(&["asr.service", "could not connect", "did not start"]) {
         "The transcription engine is not answering. It may still be loading — try again in a moment."
     } else if matches(&["too large"]) {
@@ -843,14 +1224,387 @@ fn friendly_error(error: &str) -> String {
 }
 
 impl Daemon {
+    fn journal(&self) -> Journal {
+        Journal::new(self.effective_config.journal.folder_path())
+    }
+
+    /// Writes a finished take into today's file. If that fails the words must
+    /// not be lost, so they go to the clipboard and the card says so.
+    fn save_journal(&mut self, entry: backend::JournalTranscript, now: Duration) {
+        let (date, time) = self
+            .journal_started
+            .take()
+            .unwrap_or_else(omaflow_platform::clock::local_now);
+        let clock_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let words = entry.text.split_whitespace().count();
+        let saved = self.journal().add(
+            date,
+            NewEntry {
+                id: clock_ms,
+                time: &time,
+                text: &entry.text,
+                typed: false,
+                raw_text: &entry.raw_text,
+                duration_ms: entry.duration_ms,
+                peaks: entry.peaks,
+                recording: entry.wav.as_deref(),
+            },
+        );
+        match saved {
+            Ok(saved) => {
+                self.state.completed();
+                self.journal_revision = self.journal_revision.wrapping_add(1);
+                self.journal_saved = Some(JournalSaved {
+                    date: date.to_string(),
+                    id: saved.id,
+                    words,
+                    duration_ms: entry.duration_ms,
+                });
+                self.view = ResultView::JournalSaved;
+                self.close_after(now, self.notice_visible_ms);
+                self.feedback_error = !entry.cleanup_warning.is_empty();
+                self.feedback = entry.cleanup_warning;
+            }
+            Err(error) => {
+                eprintln!("omaflow: could not save journal entry: {error}");
+                let text = entry.text;
+                thread::spawn(move || {
+                    let _ = backend::copy_text(&text);
+                });
+                self.state.failed();
+                self.view = ResultView::Error;
+                self.error = format!(
+                    "The entry could not be saved, so its text is on your clipboard. {error}"
+                );
+                self.keep_open();
+            }
+        }
+        self.publish();
+    }
+
+    /// Shows a finished card for `ms`, then closes it.
+    fn close_after(&mut self, now: Duration, ms: u64) {
+        self.close_at = Some(now + Duration::from_millis(ms));
+        self.close_total_ms = ms;
+        self.card_hold = CardHold::None;
+    }
+
+    /// The card stays until it is closed.
+    fn keep_open(&mut self) {
+        self.close_at = None;
+        self.close_total_ms = 0;
+        self.card_hold = CardHold::None;
+    }
+
+    /// A self-closing card waits while held, and when let go, gets its whole
+    /// time again, so you are never cut off mid-read.
+    fn hold_card(&mut self, hold: CardHold, now: Duration) {
+        if self.close_total_ms == 0 || !matches!(self.state.phase(), Phase::Result | Phase::Error) {
+            return;
+        }
+        self.card_hold = hold;
+        self.close_at = match hold {
+            CardHold::None => Some(now + Duration::from_millis(self.close_total_ms)),
+            CardHold::Hover | CardHold::Edit => None,
+        };
+    }
+
+    /// Long enough to read what was added: a second more per to-do.
+    fn todo_card_ms(&self) -> u64 {
+        let count = self
+            .todos_saved
+            .as_ref()
+            .map_or(1, |saved| saved.items.len()) as u64;
+        (self.notice_visible_ms + 1_000 * count.saturating_sub(1)).min(15_000)
+    }
+
+    fn edit_card_todo(&mut self, change: TodoCardChange) {
+        let todos = self.todos();
+        let result = todos
+            .edit(change.index, &change.text, &change.new_text)
+            .and_then(|()| todos.list());
+        match result {
+            Ok(listed) => {
+                if let Some(saved) = self.todos_saved.as_mut() {
+                    let fresh = listed.into_iter().find(|todo| todo.index == change.index);
+                    if let (Some(item), Some(fresh)) = (
+                        saved
+                            .items
+                            .iter_mut()
+                            .find(|item| item.index == change.index),
+                        fresh,
+                    ) {
+                        *item = fresh;
+                    }
+                }
+                self.todos_revision = self.todos_revision.wrapping_add(1);
+                self.publish();
+            }
+            Err(error) => self.operation_feedback(Err(error), ""),
+        }
+    }
+
+    /// One wrong to-do out of a capture; the last one going closes the card,
+    /// the same as Undo.
+    fn remove_card_todo(&mut self, change: TodoCardChange) {
+        let result = self
+            .todos()
+            .remove(&[(change.index, change.text.clone())], false);
+        match result {
+            Ok(_) => {
+                self.todos_revision = self.todos_revision.wrapping_add(1);
+                let mut empty = false;
+                if let Some(saved) = self.todos_saved.as_mut() {
+                    saved
+                        .items
+                        .retain(|item| !(item.index == change.index && item.text == change.text));
+                    for item in saved.items.iter_mut() {
+                        if item.index > change.index {
+                            item.index -= 1;
+                        }
+                    }
+                    empty = saved.items.is_empty();
+                }
+                if empty {
+                    self.todos_saved = None;
+                    if matches!(self.view, ResultView::TodosSaved) {
+                        self.view = ResultView::None;
+                        self.state.close();
+                    }
+                    self.keep_open();
+                }
+                self.publish();
+            }
+            Err(error) => self.operation_feedback(Err(error), ""),
+        }
+    }
+
+    /// The failed take's card is gone, so its kept recording goes too.
+    fn forget_failed_take(&mut self, jobs: &mpsc::Sender<BackendJob>) {
+        if self.can_retry {
+            self.can_retry = false;
+            let _ = jobs.send(BackendJob::Forget);
+        }
+    }
+
+    fn todos(&self) -> TodoList {
+        TodoList::new(self.effective_config.todos.folder_path())
+    }
+
+    /// Adds a capture's tasks to the list. Like a journal entry, words that
+    /// cannot be saved go to the clipboard rather than being lost.
+    fn save_todos(&mut self, todos: backend::TodoTranscript, now: Duration) {
+        let (today, clock) = omaflow_platform::clock::local_now();
+        let list = self.todo_take_list.clone();
+        // "Move the backups before Friday" is due Friday; without a date of
+        // its own, a to-do captured on Today is due today.
+        let items: Vec<NewTodo> = todos
+            .items
+            .iter()
+            .map(|item| {
+                let (text, due, time) = omaflow_core::todos::due(item, today, &clock);
+                NewTodo {
+                    text,
+                    due: due.or(self.todo_take_due),
+                    time,
+                }
+            })
+            .collect();
+        match self.todos().add(&items, &list) {
+            Ok(items) => {
+                self.state.completed();
+                self.todos_revision = self.todos_revision.wrapping_add(1);
+                self.todos_saved = Some(TodosSaved {
+                    items,
+                    moved: false,
+                });
+                // Adding to a list makes it the current one.
+                self.remember_todo_list(&list);
+                self.view = ResultView::TodosSaved;
+                self.close_after(now, self.todo_card_ms());
+                self.feedback_error = !todos.cleanup_warning.is_empty();
+                self.feedback = todos.cleanup_warning;
+            }
+            Err(error) => {
+                eprintln!("omaflow: could not save to-dos: {error}");
+                let text = todos
+                    .items
+                    .iter()
+                    .map(|item| format!("- [ ] {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                thread::spawn(move || {
+                    let _ = backend::copy_text(&text);
+                });
+                self.state.failed();
+                self.view = ResultView::Error;
+                self.error = format!(
+                    "The to-dos could not be saved, so they are on your clipboard. {error}"
+                );
+                self.keep_open();
+            }
+        }
+        self.publish();
+    }
+
+    fn remember_todo_list(&mut self, list: &str) {
+        if let Err(error) = self.todos().set_current_list(list) {
+            eprintln!("omaflow: could not remember the to-do list: {error}");
+        }
+        self.todo_current = list.to_string();
+    }
+
+    /// Picks where to-dos go. A capture still being taken goes there too.
+    fn set_todo_list(&mut self, list: String) {
+        self.remember_todo_list(&list);
+        if self.todo_take
+            && matches!(
+                self.state.phase(),
+                Phase::Recording { .. } | Phase::Processing
+            )
+        {
+            self.todo_take_list = list;
+        }
+        self.publish();
+    }
+
+    /// The card's list chip: the capture moves, and that list becomes current.
+    fn move_capture(&mut self, list: String, now: Duration) {
+        let Some(saved) = self.todos_saved.as_ref() else {
+            return;
+        };
+        let tasks: Vec<(usize, String)> = saved
+            .items
+            .iter()
+            .map(|todo| (todo.index, todo.text.clone()))
+            .collect();
+        match self.todos().move_to(&tasks, &list) {
+            Ok(items) => {
+                self.todos_saved = Some(TodosSaved { items, moved: true });
+                self.todos_revision = self.todos_revision.wrapping_add(1);
+                self.remember_todo_list(&list);
+                if matches!(self.view, ResultView::TodosSaved) {
+                    let hold = self.card_hold;
+                    self.close_after(now, self.todo_card_ms());
+                    self.hold_card(hold, now);
+                }
+                self.publish();
+            }
+            Err(error) => self.operation_feedback(Err(error), ""),
+        }
+    }
+
+    /// Undo on the "to-dos added" card: the capture's tasks come back out.
+    fn undo_todos(&mut self) {
+        let Some(saved) = self.todos_saved.take() else {
+            return;
+        };
+        let tasks: Vec<(usize, String)> = saved
+            .items
+            .iter()
+            .map(|todo| (todo.index, todo.text.clone()))
+            .collect();
+        let result = self.todos().remove(&tasks, false);
+        self.todos_revision = self.todos_revision.wrapping_add(1);
+        if matches!(self.view, ResultView::TodosSaved) {
+            self.view = ResultView::None;
+            self.state.close();
+        }
+        self.keep_open();
+        match result {
+            Ok(_) => {
+                self.feedback.clear();
+                self.feedback_error = false;
+                self.publish();
+            }
+            Err(error) => self.operation_feedback(Err(error), ""),
+        }
+    }
+
+    /// Plays a journal recording, or with an empty date a kept dictation.
+    fn play(&mut self, mut request: JournalPlayback) {
+        self.stop_playback();
+        let path = if request.date.is_empty() {
+            audio_path(request.id)
+        } else {
+            let Ok(date) = request.date.parse() else {
+                return;
+            };
+            self.journal().recording_path(date, request.id)
+        };
+        let duration_ms = omaflow_platform::sound::wav_duration_ms(&path).unwrap_or(0);
+        if duration_ms == 0 {
+            self.operation_feedback(Err("That recording is no longer on disk.".into()), "");
+            return;
+        }
+        self.playback_token = self.playback_token.wrapping_add(1);
+        request.token = self.playback_token;
+        request.duration_ms = duration_ms;
+        request.offset_ms = request.offset_ms.min(duration_ms.saturating_sub(1));
+        request.started_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let messages = self.message_tx.clone();
+        let (token, offset_ms) = (request.token, request.offset_ms);
+        thread::spawn(move || {
+            if let Err(error) = omaflow_platform::sound::play_wav(&path, offset_ms, worker_stop) {
+                eprintln!("omaflow: could not play journal recording: {error}");
+            }
+            let _ = messages.send(Message::PlaybackFinished(token));
+        });
+        self.playback = Some((request, stop));
+        self.publish();
+    }
+
+    fn stop_playback(&mut self) {
+        if let Some((_, stop)) = self.playback.take() {
+            stop.store(true, Ordering::Release);
+        }
+    }
+
+    /// Deletes kept recordings whose dictation is gone. A deletion that can
+    /// still be undone keeps its recording until the undo is no longer offered.
+    fn prune_audio(&self) {
+        let Ok(files) = fs::read_dir(audio_dir()) else {
+            return;
+        };
+        let kept = |id: u64| {
+            self.history
+                .iter()
+                .any(|entry| entry.id == id && entry.audio)
+                || self
+                    .last_deleted
+                    .iter()
+                    .flatten()
+                    .any(|entry| entry.id == id && entry.audio)
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            let id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<u64>().ok());
+            if id.is_none_or(|id| !kept(id)) {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
     fn save_history_change(&mut self, next: Vec<HistoryEntry>, undo: bool, label: &str) -> bool {
-        let result = write_history(&self.history_path, &next);
+        let result = history::write(&self.history_path, &next);
         let saved = result.is_ok();
         if saved {
             if undo {
                 self.last_deleted = Some(self.history.clone());
             }
             self.history = next;
+            self.prune_audio();
         }
         self.operation_feedback(result, label);
         saved
@@ -882,7 +1636,19 @@ impl Daemon {
         self.training_log_enabled = config.behavior.training_log_enabled;
         self.history_limit = config.behavior.history_limit;
         self.history.truncate(self.history_limit);
-        let retained = write_history(&self.history_path, &self.history);
+        // Turning dictation audio off deletes what was kept, as the setting says.
+        if !config.behavior.keep_dictation_audio {
+            for entry in self
+                .history
+                .iter_mut()
+                .chain(self.last_deleted.iter_mut().flatten())
+            {
+                entry.audio = false;
+            }
+        }
+        let retained = history::write(&self.history_path, &self.history);
+        self.prune_audio();
+        let recordings = forget_journal_recordings(&config);
         self.clipboard_result_visible_ms = config.behavior.clipboard_result_visible_ms;
         self.error_visible_ms = config.behavior.error_visible_ms;
         self.notice_visible_ms = config.behavior.notice_visible_ms;
@@ -895,9 +1661,15 @@ impl Daemon {
             config.behavior.max_recording_seconds,
         );
         self.effective_config = config;
-        retained.map_err(|error| {
-            format!("Settings saved, but stored history could not be updated: {error}")
-        })
+        self.todo_current = self.todos().current_list();
+        self.journal_revision = self.journal_revision.wrapping_add(1);
+        retained
+            .map_err(|error| {
+                format!("Settings saved, but stored history could not be updated: {error}")
+            })
+            .and(recordings.map_err(|error| {
+                format!("Settings saved, but journal recordings could not be deleted: {error}")
+            }))
     }
     fn operation_feedback(&mut self, outcome: Result<(), String>, success: &str) {
         self.feedback_error = outcome.is_err();
@@ -931,6 +1703,8 @@ impl Daemon {
                     ResultView::Success => "success",
                     ResultView::Transcript => "result",
                     ResultView::Notice => "notice",
+                    ResultView::JournalSaved => "journal-saved",
+                    ResultView::TodosSaved => "todos-saved",
                     _ => "result",
                 },
                 false,
@@ -1003,14 +1777,15 @@ impl Daemon {
             ),
             model_downloads: downloads_json(&self.model_downloads),
             cleanup_enabled: self.effective_config.cleanup.enabled,
+            cleanup_level: self.effective_config.cleanup.level(),
             style: &self.effective_config.cleanup.style,
             use_window_context: self.effective_config.cleanup.use_window_context,
             use_clipboard_context: self.effective_config.cleanup.use_clipboard_context,
             history_limit: self.history_limit,
             feedback: &self.feedback,
             feedback_error: self.feedback_error,
-            reduced_motion: self.effective_config.behavior.reduced_motion,
             keep_models_loaded: self.effective_config.behavior.keep_models_loaded,
+            keep_dictation_audio: self.effective_config.behavior.keep_dictation_audio,
             paste_sent: self.paste_sent,
             recording_elapsed_ms: if matches!(self.state.phase(), Phase::Recording { .. }) {
                 self.recording_started
@@ -1018,6 +1793,41 @@ impl Daemon {
             } else {
                 0
             },
+            journal_take: self.journal_take,
+            journal_saved: self.journal_saved.as_ref(),
+            todo_take: self.todo_take,
+            todos_saved: self.todos_saved.as_ref(),
+            todos_revision: self.todos_revision,
+            todo_list: if self.todo_take
+                && matches!(
+                    self.state.phase(),
+                    Phase::Recording { .. } | Phase::Processing
+                ) {
+                &self.todo_take_list
+            } else {
+                &self.todo_current
+            },
+            todo_settings: serde_json::json!({
+                "folder": self.effective_config.todos.folder,
+                "folder_path": self.effective_config.todos.folder_path(),
+                "file_path": self.todos().path(),
+            }),
+            journal_revision: self.journal_revision,
+            journal_settings: serde_json::json!({
+                "folder": self.effective_config.journal.folder,
+                "folder_path": self.effective_config.journal.folder_path(),
+                "cleanup": self.effective_config.journal.cleanup.as_str(),
+                "keep_recordings": self.effective_config.journal.keep_recordings,
+                "empty_day_question": self.effective_config.journal.empty_day_question,
+            }),
+            journal_playback: self.playback.as_ref().map(|(playback, _)| playback),
+            can_retry: self.can_retry,
+            card_timer: (self.close_total_ms > 0).then(|| CardTimer {
+                total_ms: self.close_total_ms,
+                remaining_ms: self.close_at.map(|deadline| {
+                    deadline.saturating_sub(self.epoch.elapsed()).as_millis() as u64
+                }),
+            }),
             published_at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1055,6 +1865,14 @@ impl Daemon {
             }
         }
         if self.history_limit > 0 {
+            let audio = transcript.wav.as_deref().is_some_and(|wav| {
+                omaflow_core::fsutil::private_dir(&audio_dir())
+                    .and_then(|()| omaflow_core::fsutil::write_private(&audio_path(id), wav))
+                    .inspect_err(|error| {
+                        eprintln!("omaflow: could not keep dictation audio: {error}")
+                    })
+                    .is_ok()
+            });
             self.history.insert(
                 0,
                 HistoryEntry {
@@ -1065,66 +1883,23 @@ impl Daemon {
                     cleanup_model: self.cleanup_model.clone(),
                     pasted: transcript.pasted,
                     cleanup_warning: transcript.cleanup_warning.clone(),
+                    audio,
                 },
             );
             self.history.truncate(self.history_limit);
             self.persist_history();
+            self.prune_audio();
         }
     }
 
     fn persist_history(&mut self) {
-        if let Err(error) = write_history(&self.history_path, &self.history) {
+        if let Err(error) = history::write(&self.history_path, &self.history) {
             self.feedback_error = true;
             self.feedback = format!(
                 "History could not be saved to disk: {error}. Keep a copy of this dictation before quitting."
             );
         }
     }
-}
-
-fn load_history(path: &Path, limit: usize) -> Vec<HistoryEntry> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    let Ok(text) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let mut entries: Vec<HistoryEntry> = match serde_json::from_str(&text) {
-        Ok(entries) => entries,
-        Err(error) => {
-            eprintln!("omaflow: ignoring invalid {}: {error}", path.display());
-            return Vec::new();
-        }
-    };
-    entries.retain(|entry| !entry.text.trim().is_empty());
-    entries.truncate(limit);
-    entries
-}
-
-fn write_history(path: &Path, history: &[HistoryEntry]) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("could not protect {}: {error}", parent.display()))?;
-
-    let temporary = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec(history).map_err(|error| error.to_string())?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(|error| format!("{}: {error}", temporary.display()))?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("could not protect {}: {error}", temporary.display()))?;
-    file.write_all(&bytes)
-        .map_err(|error| format!("{}: {error}", temporary.display()))?;
-    fs::rename(&temporary, path)
-        .map_err(|error| format!("{} -> {}: {error}", temporary.display(), path.display()))
 }
 
 fn append_training_sample(path: &Path, sample: &TrainingSample<'_>) -> Result<(), String> {
@@ -1196,7 +1971,7 @@ fn start_backend_worker(
                 Ok(job) => job,
                 Err(RecvTimeoutError::Timeout) => {
                     if let Some(error) = runtime.capture_error() {
-                        let _ = messages.send(Message::Failed(recording_generation, error));
+                        let _ = messages.send(Message::Failed(recording_generation, error, false));
                     }
                     let busy = processing_busy
                         .as_ref()
@@ -1222,12 +1997,19 @@ fn start_backend_worker(
                         cancel.store(true, Ordering::Release);
                     }
                     if let Err(error) = runtime.start() {
-                        let _ = messages.send(Message::Failed(generation, error));
+                        let _ = messages.send(Message::Failed(generation, error, false));
                     }
                 }
-                BackendJob::Stop(generation) => {
+                BackendJob::Forget => runtime.forget_kept(),
+                BackendJob::Stop(generation, take) | BackendJob::Retry(generation, take) => {
                     runtime.touch();
-                    match runtime.stop() {
+                    let retrying = matches!(job, BackendJob::Retry(..));
+                    let kept = runtime.kept_recording();
+                    match if retrying {
+                        runtime.retry(take)
+                    } else {
+                        runtime.stop(take)
+                    } {
                         Ok(session) => {
                             let cancel = Arc::clone(&session.cancel);
                             active_processing = Some(cancel);
@@ -1241,15 +2023,16 @@ fn start_backend_worker(
                                             .send(Message::Completed(generation, outcome));
                                     }
                                     Err(error) => {
+                                        let kept = kept.lock().is_ok_and(|kept| kept.is_some());
                                         let _ = completion_messages
-                                            .send(Message::Failed(generation, error));
+                                            .send(Message::Failed(generation, error, kept));
                                     }
                                 }
                                 busy.store(false, Ordering::Release);
                             });
                         }
                         Err(error) => {
-                            let _ = messages.send(Message::Failed(generation, error));
+                            let _ = messages.send(Message::Failed(generation, error, false));
                         }
                     }
                 }
@@ -1525,6 +2308,62 @@ fn start_ipc(listener: UnixListener, messages: mpsc::Sender<Message>) {
                 "stop" => Some(Message::Session(SessionCommand::Stop)),
                 "cancel" => Some(Message::Session(SessionCommand::Cancel)),
                 "close" => Some(Message::Session(SessionCommand::Close)),
+                "dismiss" => Some(Message::Session(SessionCommand::Dismiss)),
+                "retry" => Some(Message::Session(SessionCommand::Retry)),
+                "journal-toggle" => Some(Message::Session(SessionCommand::JournalToggle(None))),
+                "journal-press" => Some(Message::Session(SessionCommand::JournalPress(None))),
+                "journal-release" => Some(Message::Session(SessionCommand::JournalRelease)),
+                value if value.starts_with("journal-toggle:") => value["journal-toggle:".len()..]
+                    .parse()
+                    .ok()
+                    .map(|day| Message::Session(SessionCommand::JournalToggle(Some(day)))),
+                "journal-discard" | "todo-discard" => {
+                    Some(Message::Session(SessionCommand::JournalDiscard))
+                }
+                "todo-press" => Some(Message::Session(SessionCommand::TodoPress)),
+                "todo-release" => Some(Message::Session(SessionCommand::TodoRelease)),
+                "todo-toggle" => Some(Message::Session(SessionCommand::TodoToggle)),
+                value if value.starts_with("todo-toggle:") => {
+                    serde_json::from_str::<TodoTarget>(&value["todo-toggle:".len()..])
+                        .ok()
+                        .map(Message::TodoToggleFor)
+                }
+                value if value.starts_with("todo-list:") => Some(Message::Panel(
+                    PanelCommand::TodoSetList(value["todo-list:".len()..].trim().to_string()),
+                )),
+                value if value.starts_with("todo-move:") => Some(Message::Panel(
+                    PanelCommand::TodoMoveCapture(value["todo-move:".len()..].trim().to_string()),
+                )),
+                "card-hold" => Some(Message::Panel(PanelCommand::CardHold(CardHold::Hover))),
+                "card-edit" => Some(Message::Panel(PanelCommand::CardHold(CardHold::Edit))),
+                "card-resume" => Some(Message::Panel(PanelCommand::CardHold(CardHold::None))),
+                value if value.starts_with("todo-card-edit:") => {
+                    serde_json::from_str(&value["todo-card-edit:".len()..])
+                        .ok()
+                        .map(|change| Message::Panel(PanelCommand::TodoCardEdit(change)))
+                }
+                value if value.starts_with("todo-card-remove:") => {
+                    serde_json::from_str(&value["todo-card-remove:".len()..])
+                        .ok()
+                        .map(|change| Message::Panel(PanelCommand::TodoCardRemove(change)))
+                }
+                "todo-undo" => Some(Message::Panel(PanelCommand::UndoTodos)),
+                "journal-stop-playback" => Some(Message::Panel(PanelCommand::JournalStopPlayback)),
+                value if value.starts_with("history-play:") => {
+                    serde_json::from_str::<JournalPlayback>(&value["history-play:".len()..])
+                        .ok()
+                        .map(|request| {
+                            Message::Panel(PanelCommand::JournalPlay(JournalPlayback {
+                                date: String::new(),
+                                ..request
+                            }))
+                        })
+                }
+                value if value.starts_with("journal-play:") => {
+                    serde_json::from_str::<JournalPlayback>(&value["journal-play:".len()..])
+                        .ok()
+                        .map(|request| Message::Panel(PanelCommand::JournalPlay(request)))
+                }
                 "copy" => Some(Message::Panel(PanelCommand::Copy)),
                 "paste-last" => Some(Message::Panel(PanelCommand::PasteLast)),
                 "history-undo" => Some(Message::Panel(PanelCommand::UndoDelete)),
@@ -1797,13 +2636,7 @@ fn send_command(command: &str) -> ExitCode {
     }
 }
 
-fn runtime_dir() -> PathBuf {
-    env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            env::temp_dir().join(format!("omaflow-{}", env::var("USER").unwrap_or_default()))
-        })
-}
+use omaflow_platform::runtime_dir;
 
 fn socket_path() -> PathBuf {
     runtime_dir().join("omaflow.sock")
@@ -1813,12 +2646,100 @@ fn surface_state_path() -> PathBuf {
     runtime_dir().join("omaflow-state.json")
 }
 
+/// Starts a journal entry: `latched` for the Talk button and the old toggle,
+/// otherwise held like the dictation key. Filed under when you started
+/// talking, so a take that crosses midnight stays on the day it began; a take
+/// for a later day is a note, headed with when it was written.
+fn start_journal(
+    daemon: &mut Daemon,
+    target: Option<omaflow_core::date::Date>,
+    now: Duration,
+    latched: bool,
+) -> Action {
+    if daemon.pending_update.is_some() || update::blocks_new_dictation() {
+        daemon.feedback = "OmaFlow is finishing an update. New entries are paused.".into();
+        daemon.feedback_error = false;
+        return Action::None;
+    }
+    daemon.view = ResultView::None;
+    daemon.error.clear();
+    daemon.stop_playback();
+    let action = if latched {
+        daemon.state.start_latched(now)
+    } else {
+        daemon.state.press(now)
+    };
+    if action == Action::Start {
+        daemon.generation = daemon.generation.wrapping_add(1);
+        daemon.journal_take = true;
+        daemon.todo_take = false;
+        let (today, time) = omaflow_platform::clock::local_now();
+        daemon.journal_started = Some(match target {
+            Some(day) if day > today => (day, omaflow_core::journal::note_heading(today, &time)),
+            _ => (today, time),
+        });
+    }
+    action
+}
+
+/// Starts a to-do capture: `latched` for the Talk button, otherwise held
+/// like the dictation key.
+fn start_todos(daemon: &mut Daemon, now: Duration, latched: bool) -> Action {
+    if daemon.pending_update.is_some() || update::blocks_new_dictation() {
+        daemon.feedback = "OmaFlow is finishing an update. New to-dos are paused.".into();
+        daemon.feedback_error = false;
+        return Action::None;
+    }
+    let request = daemon.todo_request.take().unwrap_or_default();
+    daemon.view = ResultView::None;
+    daemon.error.clear();
+    daemon.stop_playback();
+    let action = if latched {
+        daemon.state.start_latched(now)
+    } else {
+        daemon.state.press(now)
+    };
+    if action == Action::Start {
+        daemon.generation = daemon.generation.wrapping_add(1);
+        daemon.journal_take = false;
+        daemon.todo_take = true;
+        daemon.todos_saved = None;
+        // The list the Talk button showed, or the current list; a list
+        // deleted since falls back to the Inbox.
+        let lists = daemon.todos().lists().unwrap_or_default();
+        daemon.todo_take_list = request
+            .list
+            .filter(|list| list.is_empty() || lists.contains(list))
+            .unwrap_or_else(|| daemon.todos().current_list());
+        daemon.todo_take_due = request.due.and_then(|due| due.parse().ok());
+    }
+    action
+}
+
 fn state_dir() -> PathBuf {
     env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .unwrap_or_else(|| env::temp_dir().join("omaflow-state"))
         .join("omaflow")
+}
+
+/// Kept dictation recordings, one WAV per history entry id.
+/// Turning journal recordings off deletes the ones already kept, as the
+/// setting says.
+fn forget_journal_recordings(config: &Config) -> Result<(), String> {
+    if config.journal.keep_recordings {
+        return Ok(());
+    }
+    omaflow_core::journal::Journal::new(config.journal.folder_path()).delete_recordings()
+}
+
+fn audio_dir() -> PathBuf {
+    state_dir().join("audio")
+}
+
+fn audio_path(id: u64) -> PathBuf {
+    audio_dir().join(format!("{id}.wav"))
 }
 
 fn history_path() -> PathBuf {

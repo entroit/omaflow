@@ -1,10 +1,16 @@
 use crate::cleanup::cleanup;
 pub use crate::cleanup::{cleanup_text, evaluate_text};
-use crate::process::CommandExt;
 use crate::{
-    config::{Config, PasteDelivery, PasteMode, PasteModifier, PasteShortcut},
+    config::{Config, JournalCleanup, PasteDelivery, PasteMode},
     vocabulary,
 };
+use omaflow_core::{journal, todos};
+use omaflow_platform::desktop::{
+    ClipboardSnapshot, DELIVERY_LOCK, active_window, active_window_matches, paste, read_clipboard,
+    set_clipboard,
+};
+pub use omaflow_platform::desktop::{copy_text, paste_text_now};
+use omaflow_platform::process::CommandExt;
 use serde_json::Value;
 use std::{
     env,
@@ -18,15 +24,13 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering},
         mpsc,
     },
     thread,
     time::{Duration, Instant},
 };
-
-static DELIVERY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const METER_BARS: usize = 13;
 const METER_SILENCE: &[u8] =
@@ -40,11 +44,50 @@ pub struct Transcript {
     pub pasted: bool,
     pub delivery_error: String,
     pub cleanup_warning: String,
+    /// The recording as a WAV file, when dictation audio is kept.
+    pub wav: Option<Vec<u8>>,
+}
+
+/// A spoken journal entry, ready to be written to the day's file.
+#[derive(Debug)]
+pub struct JournalTranscript {
+    pub text: String,
+    pub raw_text: String,
+    /// The complete WAV file, when recordings are kept.
+    pub wav: Option<Vec<u8>>,
+    pub peaks: Vec<u8>,
+    pub duration_ms: u64,
+    pub cleanup_warning: String,
+}
+
+/// How a journal take is finished: tidied to the journal's own level and
+/// written down rather than pasted.
+#[derive(Debug, Clone, Copy)]
+pub struct JournalTake {
+    pub cleanup: JournalCleanup,
+    pub keep_recording: bool,
+}
+
+/// Spoken to-dos, split into tasks for the to-do list.
+#[derive(Debug)]
+pub struct TodoTranscript {
+    pub items: Vec<String>,
+    pub cleanup_warning: String,
+}
+
+/// Where a finished take goes: pasted, the journal, or the to-do list.
+#[derive(Debug, Clone, Copy)]
+pub enum Take {
+    Paste,
+    Journal(JournalTake),
+    Todos,
 }
 
 #[derive(Debug)]
 pub enum StopOutcome {
     Transcript(Transcript),
+    Journal(JournalTranscript),
+    Todos(TodoTranscript),
     NoSpeech,
 }
 
@@ -65,32 +108,15 @@ impl ProcessingSession {
     }
 }
 
-#[derive(Debug, Default)]
-enum ClipboardSnapshot {
-    #[default]
-    Empty,
-    Content {
-        mime_type: String,
-        data: Vec<u8>,
-    },
-}
-
-impl ClipboardSnapshot {
-    fn text_context(&self) -> &str {
-        match self {
-            Self::Content { mime_type, data } if is_text_mime(mime_type) => {
-                std::str::from_utf8(data).unwrap_or("")
-            }
-            _ => "",
-        }
-    }
-}
-
 pub struct Runtime {
     config: Config,
     meter_gate_db: Arc<AtomicI32>,
     recording: Option<CaptureSession>,
     completed_recording: Option<CapturedAudio>,
+    /// A recording whose transcription failed, kept in memory (never on
+    /// disk) so Try again can send it once more instead of asking you to
+    /// say it all again. Gone with the next take or when the card closes.
+    kept: KeptRecording,
     preview: Option<MeterPreviewSession>,
     /// Last dictation activity, for releasing models after an idle spell.
     last_activity: Instant,
@@ -98,6 +124,10 @@ pub struct Runtime {
     /// Earliest moment to try releasing again after a failed attempt.
     release_retry_at: Option<Instant>,
 }
+
+/// Shared with the worker that transcribes, which puts the recording back
+/// here when transcription fails.
+pub type KeptRecording = Arc<Mutex<Option<CapturedAudio>>>;
 
 /// Idle time after which models leave the GPU when `keep_models_loaded` is off.
 const IDLE_RELEASE: Duration = Duration::from_secs(5 * 60);
@@ -118,7 +148,7 @@ struct AudioMeter {
     last_write: Instant,
 }
 
-struct CapturedAudio {
+pub struct CapturedAudio {
     file: fs::File,
     pcm_bytes: usize,
 }
@@ -168,6 +198,16 @@ impl CapturedAudio {
             .seek(SeekFrom::Start(0))
             .and_then(|_| self.file.write_all(&header))
             .map_err(|error| format!("could not finalize recording memory: {error}"))
+    }
+
+    /// The whole recording as a WAV file, header included.
+    fn wav_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut file = &self.file;
+        let mut bytes = Vec::with_capacity(44 + self.pcm_bytes);
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.read_to_end(&mut bytes))
+            .map_err(|error| format!("could not read the recording back: {error}"))?;
+        Ok(bytes)
     }
 
     fn curl_form(&self) -> String {
@@ -355,6 +395,7 @@ impl Runtime {
             meter_gate_db: Arc::new(AtomicI32::new(meter_gate_db.clamp(-70, -35))),
             recording: None,
             completed_recording: None,
+            kept: Arc::default(),
             preview: None,
             last_activity: Instant::now(),
             idle_released: false,
@@ -504,8 +545,11 @@ impl Runtime {
 
     pub fn start(&mut self) -> Result<(), String> {
         self.stop_preview();
+        self.forget_kept();
         if !self.config.behavior.models_configured {
-            return Err("Models not configured. Open Settings → Models to finish setup.".into());
+            return Err(
+                "Models not configured. Open Settings → Advanced → Models to finish setup.".into(),
+            );
         }
         if fake_transcript_override().is_some() {
             return Ok(());
@@ -526,7 +570,28 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn stop(&mut self) -> Result<ProcessingSession, String> {
+    /// Whether a failed take's recording can be tried again.
+    pub fn kept_recording(&self) -> KeptRecording {
+        Arc::clone(&self.kept)
+    }
+
+    pub fn forget_kept(&mut self) {
+        self.kept.lock().map(|mut kept| kept.take()).ok();
+    }
+
+    /// Transcribes the kept recording again, as the take it was.
+    pub fn retry(&mut self, take: Take) -> Result<ProcessingSession, String> {
+        let captured = self
+            .kept
+            .lock()
+            .ok()
+            .and_then(|mut kept| kept.take())
+            .ok_or("That recording is no longer kept")?;
+        self.completed_recording = Some(captured);
+        self.stop(take)
+    }
+
+    pub fn stop(&mut self, take: Take) -> Result<ProcessingSession, String> {
         let fake = fake_transcript_override();
         let recording = if fake.is_some() {
             None
@@ -538,6 +603,7 @@ impl Runtime {
             )?))
         };
         let config = self.config.clone();
+        let kept = Arc::clone(&self.kept);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
@@ -546,6 +612,16 @@ impl Runtime {
                 thread::sleep(Duration::from_millis(120));
                 if worker_cancel.load(Ordering::Acquire) {
                     Err("dictation cancelled".into())
+                } else if let Take::Journal(journal) = take {
+                    finish_journal(
+                        &config,
+                        text.to_string_lossy().into_owned(),
+                        None,
+                        journal,
+                        &worker_cancel,
+                    )
+                } else if let Take::Todos = take {
+                    finish_todos(&config, text.to_string_lossy().into_owned(), &worker_cancel)
                 } else {
                     let raw_text = text.to_string_lossy().into_owned();
                     let previous = if config.cleanup.use_clipboard_context {
@@ -567,7 +643,9 @@ impl Runtime {
                 stop_recording(
                     &config,
                     recording.expect("recording is present without fake input"),
+                    take,
                     &worker_cancel,
+                    &kept,
                 )
             };
             let _ = result_tx.send(result);
@@ -1004,12 +1082,17 @@ fn signal_audio_capture(capture: &Child, signal: libc::c_int) -> Result<(), Stri
 fn stop_recording(
     config: &Config,
     recording: Recording,
+    take: Take,
     cancel: &AtomicBool,
+    kept: &KeptRecording,
 ) -> Result<StopOutcome, String> {
     let total_started = Instant::now();
-    let window = active_window();
+    // A journal entry or a to-do is written down, not pasted, so it needs
+    // neither the focused window nor the clipboard as context.
+    let pasting = matches!(take, Take::Paste);
+    let window = if pasting { active_window() } else { None };
     let backend_started = Instant::now();
-    let previous = if config.cleanup.use_clipboard_context {
+    let previous = if pasting && config.cleanup.use_clipboard_context {
         read_clipboard().unwrap_or_default()
     } else {
         ClipboardSnapshot::Empty
@@ -1066,18 +1149,47 @@ fn stop_recording(
     if cancel.load(Ordering::Acquire) {
         return Err("dictation cancelled".into());
     }
-    ensure_speech_server(config)?;
-    let raw_text = transcribe_audio(config, &captured, cancel)?;
+    // The recording is complete; if the speech engine fails it, keep it for
+    // Try again.
+    let raw_text = match ensure_speech_server(config)
+        .and_then(|()| transcribe_audio(config, &captured, cancel))
+    {
+        Ok(text) if text.trim().is_empty() => return Ok(StopOutcome::NoSpeech),
+        Ok(text) => text,
+        Err(error) if error == EMPTY_TRANSCRIPT => return Ok(StopOutcome::NoSpeech),
+        Err(error) => {
+            if worth_retrying(&error)
+                && !cancel.load(Ordering::Acquire)
+                && let Ok(mut slot) = kept.lock()
+            {
+                *slot = Some(captured);
+            }
+            return Err(error);
+        }
+    };
     let backend_elapsed = backend_started.elapsed();
+    match take {
+        Take::Journal(journal) => {
+            return finish_journal(config, raw_text, Some(&captured), journal, cancel);
+        }
+        Take::Todos => return finish_todos(config, raw_text, cancel),
+        Take::Paste => {}
+    }
 
-    finish_transcript(
+    let mut outcome = finish_transcript(
         config,
         raw_text,
         previous,
         window.as_ref(),
         (backend_elapsed, total_started),
         cancel,
-    )
+    )?;
+    if config.behavior.keep_dictation_audio
+        && let StopOutcome::Transcript(transcript) = &mut outcome
+    {
+        transcript.wav = captured.wav_bytes().ok();
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -1149,10 +1261,30 @@ fn transcribe_audio(
         )?
     };
     if text.is_empty() {
-        Err("speech server returned an empty transcript".into())
+        Err(EMPTY_TRANSCRIPT.into())
     } else {
         Ok(text)
     }
+}
+
+/// The engine answered and heard no words: nothing failed, there was just
+/// nothing to write.
+const EMPTY_TRANSCRIPT: &str = "speech server returned an empty transcript";
+
+/// Whether sending the same recording again could go differently: the engine
+/// was unreachable, stalled or slow. Not when it answered with no words, or
+/// the recording itself was the problem.
+fn worth_retrying(error: &str) -> bool {
+    let error = error.to_lowercase();
+    ![
+        "empty transcript",
+        "too large",
+        "cancelled",
+        "could not read recording",
+        "recording memory",
+    ]
+    .iter()
+    .any(|reason| error.contains(reason))
 }
 
 fn quiet_segment_boundaries(captured: &CapturedAudio) -> Result<Vec<usize>, String> {
@@ -1386,6 +1518,116 @@ fn wav_header(pcm_bytes: usize) -> Result<[u8; 44], String> {
     Ok(header)
 }
 
+fn finish_journal(
+    config: &Config,
+    raw_text: String,
+    captured: Option<&CapturedAudio>,
+    take: JournalTake,
+    cancel: &AtomicBool,
+) -> Result<StopOutcome, String> {
+    let spoken = vocabulary::apply(&raw_text, &config.cleanup.custom_vocabulary);
+    if spoken.trim().is_empty() {
+        return Ok(StopOutcome::NoSpeech);
+    }
+    let mut cleanup_warning = String::new();
+    let text = match take.cleanup {
+        JournalCleanup::Off => spoken.trim().to_string(),
+        JournalCleanup::Light => journal::tidy(&spoken),
+        // Medium asks the cleanup model when there is one, and falls back to
+        // the light pass rather than to nothing when it does not answer.
+        JournalCleanup::Medium if config.cleanup.enabled => {
+            match cleanup(config, &spoken, "", None, cancel) {
+                Ok(cleaned) if !cleaned.trim().is_empty() => cleaned,
+                Ok(_) => journal::tidy(&spoken),
+                Err(error) => {
+                    eprintln!("omaflow: journal cleanup unavailable, using light cleanup: {error}");
+                    cleanup_warning = crate::cleanup::cleanup_warning_text(&error);
+                    journal::tidy(&spoken)
+                }
+            }
+        }
+        JournalCleanup::Medium => journal::tidy(&spoken),
+    };
+    if cancel.load(Ordering::Acquire) {
+        return Err("dictation cancelled".into());
+    }
+    let (wav, peaks, duration_ms) = match captured {
+        Some(captured) => {
+            let wav = captured.wav_bytes()?;
+            let pcm = wav.get(44..).unwrap_or_default();
+            let peaks = journal::peaks(pcm, journal::PEAKS);
+            let duration_ms = (pcm.len() / (BYTES_PER_SECOND / 1000)) as u64;
+            (take.keep_recording.then_some(wav), peaks, duration_ms)
+        }
+        None => (None, Vec::new(), 0),
+    };
+    Ok(StopOutcome::Journal(JournalTranscript {
+        text,
+        raw_text: spoken.trim().to_string(),
+        wav,
+        peaks,
+        duration_ms,
+        cleanup_warning,
+    }))
+}
+
+/// Spoken to-dos: the cleanup prompt with the to-do addition, then one task
+/// per line. Without the cleanup model, or when it does not answer, the
+/// speech is split by sentence instead, so to-dos work fully offline.
+fn finish_todos(
+    config: &Config,
+    raw_text: String,
+    cancel: &AtomicBool,
+) -> Result<StopOutcome, String> {
+    let spoken = vocabulary::apply(&raw_text, &config.cleanup.custom_vocabulary);
+    if spoken.trim().is_empty() {
+        return Ok(StopOutcome::NoSpeech);
+    }
+    let mut cleanup_warning = String::new();
+    let mut items = Vec::new();
+    if config.cleanup.enabled {
+        // The to-do prompt replaces the dictation prompt: that one keeps the
+        // speaker's sentences whole, the opposite of splitting them into
+        // tasks. Without one, the dictation prompt still cleans the words.
+        let mut todo_config = config.clone();
+        if !config.todos.prompt.trim().is_empty() {
+            todo_config.cleanup.system_prompt = config.todos.prompt.clone();
+        }
+        match cleanup(&todo_config, &spoken, "", None, cancel) {
+            Ok(cleaned) => items = todos::split(&cleaned),
+            Err(error) => {
+                eprintln!("omaflow: to-do cleanup unavailable, splitting by sentence: {error}");
+                cleanup_warning = crate::cleanup::cleanup_warning_text(&error);
+            }
+        }
+    }
+    if items.is_empty() {
+        items = todos::split(&journal::tidy(&spoken));
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err("dictation cancelled".into());
+    }
+    if items.is_empty() {
+        return Ok(StopOutcome::NoSpeech);
+    }
+    Ok(StopOutcome::Todos(TodoTranscript {
+        items,
+        cleanup_warning,
+    }))
+}
+
+/// The to-do pipeline on a transcript, for evaluation: the tasks it would
+/// add, before dates are read from them.
+pub(crate) fn evaluate_todos(
+    config: &Config,
+    transcript: &str,
+) -> Result<(Vec<String>, String), String> {
+    match finish_todos(config, transcript.to_string(), &AtomicBool::new(false))? {
+        StopOutcome::Todos(todos) => Ok((todos.items, todos.cleanup_warning)),
+        _ => Ok((Vec::new(), String::new())),
+    }
+}
+
 fn finish_transcript(
     config: &Config,
     raw_text: String,
@@ -1414,6 +1656,9 @@ fn finish_transcript(
                 cleanup_warning = crate::cleanup::cleanup_warning_text(&error);
             }
         }
+    }
+    if !config.cleanup.enabled && config.cleanup.light {
+        text = journal::tidy(&text);
     }
     let cleanup_elapsed = cleanup_started.elapsed();
     if text.trim().is_empty() {
@@ -1458,222 +1703,8 @@ fn finish_transcript(
         pasted,
         delivery_error,
         cleanup_warning,
+        wav: None,
     }))
-}
-
-pub fn copy_text(text: &str) -> Result<(), String> {
-    let _guard = DELIVERY_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    set_clipboard(text.as_bytes(), None)
-}
-
-pub fn paste_text_now(text: &str, delivery: &PasteDelivery) -> Result<(), String> {
-    let _guard = DELIVERY_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    set_clipboard(text.as_bytes(), None)?;
-    if delivery.mode == PasteMode::Clipboard {
-        return Ok(());
-    }
-    // The panel defers this command until its fade has released keyboard
-    // focus. Keep one final compositor frame between clipboard ownership and
-    // the synthetic paste shortcut.
-    thread::sleep(Duration::from_millis(80));
-    let window = active_window();
-    let window = window.ok_or_else(|| "no focused window".to_string())?;
-    focus_window(&window)?;
-    // Layer-shell focus changes are asynchronous. Wait for Hyprland to
-    // deliver the focus commit before injecting the paste chord.
-    thread::sleep(Duration::from_millis(200));
-    if !active_window_matches(Some(&window)) {
-        return Err("Focus changed; text remains on the clipboard".into());
-    }
-    paste(delivery, Some(&window))
-}
-
-fn focus_window(window: &Value) -> Result<(), String> {
-    let address = window
-        .get("address")
-        .and_then(Value::as_str)
-        .filter(|address| !address.is_empty())
-        .ok_or_else(|| "focused window has no address".to_string())?;
-    let dispatcher = format!(r#"hl.dsp.focus({{ window = "address:{address}" }})"#);
-    let output = Command::new("hyprctl")
-        .args(["dispatch", &dispatcher])
-        .bounded_output()
-        .map_err(|error| format!("could not restore focused window: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err("Hyprland could not restore the focused window".into())
-    }
-}
-
-fn set_clipboard(data: &[u8], mime_type: Option<&str>) -> Result<(), String> {
-    let mut command = Command::new("wl-copy");
-    if let Some(mime_type) = mime_type {
-        command.args(["--type", mime_type]);
-    }
-    command.stdout(Stdio::null()).stderr(Stdio::null());
-    let status = crate::process::run(
-        &mut command,
-        data,
-        &AtomicBool::new(false),
-        Duration::from_secs(3),
-    )?
-    .status;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("wl-copy failed".into())
-    }
-}
-
-fn read_clipboard() -> Result<ClipboardSnapshot, String> {
-    let types_output = Command::new("wl-paste")
-        .arg("--list-types")
-        .bounded_output()
-        .map_err(|error| format!("could not inspect clipboard: {error}"))?;
-    if !types_output.status.success() {
-        return Ok(ClipboardSnapshot::Empty);
-    }
-    let types_text = String::from_utf8_lossy(&types_output.stdout);
-    let types: Vec<&str> = types_text
-        .lines()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .collect();
-    let Some(mime_type) = preferred_clipboard_type(&types) else {
-        return Ok(ClipboardSnapshot::Empty);
-    };
-    if !is_text_mime(mime_type) {
-        return Ok(ClipboardSnapshot::Empty);
-    }
-    let output = Command::new("wl-paste")
-        .args(["--type", mime_type])
-        .bounded_output()
-        .map_err(|error| format!("could not read clipboard as {mime_type}: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "could not read clipboard as {mime_type}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(ClipboardSnapshot::Content {
-        mime_type: mime_type.to_string(),
-        data: output.stdout,
-    })
-}
-
-fn preferred_clipboard_type<'a>(types: &'a [&'a str]) -> Option<&'a str> {
-    [
-        "text/plain;charset=utf-8",
-        "text/plain",
-        "UTF8_STRING",
-        "STRING",
-        "TEXT",
-        "text/uri-list",
-    ]
-    .into_iter()
-    .find_map(|preferred| {
-        types
-            .iter()
-            .copied()
-            .find(|mime_type| mime_type.eq_ignore_ascii_case(preferred))
-    })
-}
-
-fn is_text_mime(mime_type: &str) -> bool {
-    mime_type.starts_with("text/")
-        || ["UTF8_STRING", "STRING", "TEXT"]
-            .iter()
-            .any(|text_type| mime_type.eq_ignore_ascii_case(text_type))
-}
-
-fn paste(delivery: &PasteDelivery, window: Option<&Value>) -> Result<(), String> {
-    let Some(shortcut) = paste_shortcut(delivery, window) else {
-        return Ok(());
-    };
-    send_hyprland_shortcut(&shortcut)
-}
-
-fn send_hyprland_shortcut(shortcut: &PasteShortcut) -> Result<(), String> {
-    // Keep down and delayed up in one Hyprland Lua evaluation. Separate
-    // `hyprctl` calls lose the synthetic key between Lua contexts, which can
-    // leave the shortcut pressed or make the release fail.
-    let modifier = shortcut.hyprland_modifiers();
-    let key = &shortcut.key;
-    let dispatcher = format!(
-        "function() \
-         hl.dispatch(hl.dsp.send_key_state({{ mods = \"{modifier}\", key = \"{key}\", state = \"down\" }})); \
-         hl.timer(function() \
-           hl.dispatch(hl.dsp.send_key_state({{ mods = \"{modifier}\", key = \"{key}\", state = \"up\" }})) \
-         end, {{ timeout = 50, type = \"oneshot\" }}) \
-         end"
-    );
-    let output = Command::new("hyprctl")
-        .args(["dispatch", &dispatcher])
-        .bounded_output()
-        .map_err(|error| format!("could not ask Hyprland to paste: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err("Hyprland could not send the paste shortcut".into())
-    }
-}
-
-fn paste_shortcut(delivery: &PasteDelivery, window: Option<&Value>) -> Option<PasteShortcut> {
-    let ctrl_v = || PasteShortcut {
-        modifiers: vec![PasteModifier::Ctrl],
-        key: "V".into(),
-    };
-    let shift_insert = || PasteShortcut {
-        modifiers: vec![PasteModifier::Shift],
-        key: "Insert".into(),
-    };
-    match delivery.mode {
-        PasteMode::Clipboard => None,
-        PasteMode::CtrlV => Some(ctrl_v()),
-        PasteMode::ShiftInsert => Some(shift_insert()),
-        PasteMode::Auto if window_has_tag(window, "terminal") => Some(shift_insert()),
-        PasteMode::Auto => Some(ctrl_v()),
-        PasteMode::Custom => Some(delivery.shortcut.clone()),
-    }
-}
-
-fn window_has_tag(window: Option<&Value>, expected: &str) -> bool {
-    window
-        .and_then(|window| window.get("tags"))
-        .and_then(Value::as_array)
-        .is_some_and(|tags| {
-            tags.iter()
-                .filter_map(Value::as_str)
-                .any(|tag| tag.trim_end_matches('*').eq_ignore_ascii_case(expected))
-        })
-}
-
-fn active_window() -> Option<Value> {
-    Command::new("hyprctl")
-        .args(["activewindow", "-j"])
-        .bounded_output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| serde_json::from_slice(&output.stdout).ok())
-}
-
-fn active_window_matches(expected: Option<&Value>) -> bool {
-    let expected = expected
-        .and_then(|window| window.get("address"))
-        .and_then(Value::as_str)
-        .filter(|address| !address.is_empty());
-    let current = active_window();
-    let current = current
-        .as_ref()
-        .and_then(|window| window.get("address"))
-        .and_then(Value::as_str)
-        .filter(|address| !address.is_empty());
-    expected.is_some() && expected == current
 }
 
 // Resolve only files already on disk. Passing a repository name to NeMo can
@@ -1706,7 +1737,7 @@ fn installed_speech_model(model: &str) -> Result<PathBuf, String> {
             .canonicalize()
             .map_err(|e| e.to_string());
     }
-    Err("Speech model is not configured as a unique installed file. Install it separately and enter its absolute GGUF path in Settings → Models.".into())
+    Err("Speech model is not configured as a unique installed file. Install it separately and enter its absolute GGUF path in Settings → Advanced → Your own model.".into())
 }
 
 /// Foreground entry point for omaflow-asr.service: resolves the configured
@@ -1774,12 +1805,9 @@ pub fn unload_cleanup(config: &Config) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{PasteDelivery, PasteMode, PasteModifier, PasteShortcut};
-    use serde_json::json;
-
     use super::{
-        CapturedAudio, ClipboardSnapshot, captured_audio_from_wav, meter_level, paste_shortcut,
-        preferred_clipboard_type, rms_dbfs, voice_above_threshold, wav_header,
+        CapturedAudio, EMPTY_TRANSCRIPT, captured_audio_from_wav, meter_level, rms_dbfs,
+        voice_above_threshold, wav_header, worth_retrying,
     };
 
     fn rms_at(dbfs: f32) -> f32 {
@@ -1926,6 +1954,19 @@ mod tests {
         runtime.config.behavior.keep_models_loaded = true;
         runtime.release_idle_models_at(retry_at + IDLE_RELEASE * 10, false);
         assert!(!runtime.idle_released);
+    }
+
+    #[test]
+    fn only_a_failing_engine_is_worth_trying_again() {
+        assert!(worth_retrying(
+            "could not connect to the managed speech server"
+        ));
+        assert!(worth_retrying("timed out waiting for the speech server"));
+        assert!(!worth_retrying(EMPTY_TRANSCRIPT));
+        assert!(!worth_retrying(
+            "recording is too large for a standard WAV file"
+        ));
+        assert!(!worth_retrying("dictation cancelled"));
     }
 
     #[test]
@@ -2184,69 +2225,6 @@ mod tests {
         assert!(!voice_above_threshold(quiet, -60));
         assert!(voice_above_threshold(quiet, -65));
         assert_eq!(meter_level(quiet), level);
-    }
-
-    #[test]
-    fn automatic_paste_matches_omarchy_terminal_behavior() {
-        let terminal = json!({"tags": ["default-opacity*", "terminal*"]});
-        let graphical = json!({"tags": ["browser*"]});
-        let delivery = |mode| PasteDelivery {
-            mode,
-            shortcut: PasteShortcut::default(),
-        };
-        assert_eq!(
-            paste_shortcut(&delivery(PasteMode::Auto), Some(&terminal)),
-            Some(PasteShortcut {
-                modifiers: vec![PasteModifier::Shift],
-                key: "Insert".into(),
-            })
-        );
-        assert_eq!(
-            paste_shortcut(&delivery(PasteMode::Auto), Some(&graphical)),
-            Some(PasteShortcut::default())
-        );
-        assert_eq!(
-            paste_shortcut(&delivery(PasteMode::CtrlV), Some(&terminal)),
-            Some(PasteShortcut::default())
-        );
-        assert_eq!(
-            paste_shortcut(&delivery(PasteMode::ShiftInsert), Some(&graphical)),
-            Some(PasteShortcut {
-                modifiers: vec![PasteModifier::Shift],
-                key: "Insert".into(),
-            })
-        );
-        assert_eq!(
-            paste_shortcut(&delivery(PasteMode::Clipboard), Some(&graphical)),
-            None
-        );
-    }
-
-    #[test]
-    fn custom_paste_uses_the_saved_chord_in_every_window() {
-        let shortcut = PasteShortcut {
-            modifiers: vec![PasteModifier::Shift, PasteModifier::Ctrl],
-            key: "F8".into(),
-        };
-        let delivery = PasteDelivery {
-            mode: PasteMode::Custom,
-            shortcut: shortcut.clone(),
-        };
-        let terminal = json!({"tags": ["terminal*"]});
-        assert_eq!(paste_shortcut(&delivery, Some(&terminal)), Some(shortcut));
-        assert_eq!(delivery.shortcut.hyprland_modifiers(), "CTRL SHIFT");
-    }
-
-    #[test]
-    fn clipboard_context_reads_text_and_ignores_binary() {
-        let types = ["text/plain", "image/jpeg", "image/png"];
-        assert_eq!(preferred_clipboard_type(&types), Some("text/plain"));
-        assert_eq!(preferred_clipboard_type(&["image/png"]), None);
-        let snapshot = ClipboardSnapshot::Content {
-            mime_type: "image/png".into(),
-            data: vec![0, 159, 146, 150],
-        };
-        assert_eq!(snapshot.text_context(), "");
     }
 
     #[test]

@@ -1,22 +1,18 @@
 {
   "schemaVersion": 1,
   "pluginId": "entroit.omaflow",
-  "version": "0.18.0",
-  "summary": "Keep every sentence and install verified updates.",
+  "version": "0.19.0",
+  "summary": "A new window, a journal you can talk to, and spoken to-dos.",
   "changes": [
-    "Retain recordings that finish just before the stop command",
-    "Recover middle passages in long recordings by splitting audio at quiet points",
-    "Prefer minimal cleanup edits without guessing missing speech",
-    "Keep the raw transcript when a cleanup response is incomplete",
-    "Let the cleanup model apply context-dependent corrections",
-    "See and install approved releases without a terminal",
-    "Restore the previous release when a health check fails"
+    "Browse history, the journal and to-dos in one window that follows your theme",
+    "Talk to your journal, and speak to-dos into lists with dates, times and reminders",
+    "Try a failed transcription again from the same recording"
   ],
   "binary": {
     "target": "x86_64-unknown-linux-gnu",
     "path": "dist/bin/x86_64-unknown-linux-gnu/omaflow",
-    "bytes": 2016360,
-    "sha256": "39e42ace10ddfdcdf26a1df0d6000361204f9f33274504e6b3a58f7b9c3449f7"
+    "bytes": 2561384,
+    "sha256": "35f10b4c94db810085f8d46393879ff25ae8266d0390e28ddaa598de65d3fac3"
   },
   "stateSchemaVersion": 4
 }

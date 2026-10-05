@@ -1,0 +1,13 @@
+[package]
+name = "omaflow-platform"
+version = "0.19.0"
+edition = "2024"
+description = "OmaFlow's desktop adapters: clipboard, paste, focused window, audio ducking and subprocess I/O"
+license = "MIT"
+publish = false
+
+[dependencies]
+omaflow-core = { path = "../omaflow-core" }
+httpdate = "1.0.3"
+libc = "0.2.189"
+serde_json = "1.0"

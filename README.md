@@ -17,7 +17,7 @@ Your words appear where your cursor is, in any app.
      resulting user-attachments URL here alone on its own line. -->
 
 <p align="center">
-  <img src="assets/recording.png" width="400" alt="OmaFlow recording overlay: Listening, a lock indicator, a timer, a waveform and a Stop button">
+  <img src="assets/recording.png" width="400" alt="The OmaFlow card while recording hands-free: a lock, the time, a live waveform, Stop, and Cancel with Esc">
 </p>
 
 Speaking is faster than typing, and the tools that prove it want your voice on
@@ -51,9 +51,9 @@ or Cargo.
 
 OmaFlow checks the official Omarchy plugin marketplace once a day. When the
 marketplace publishes a verified OmaFlow commit, a desktop notification opens
-the panel. The bar also keeps a dot visible, and the panel shows the release
-summary and changes. Click **Update** to install it. Click **Later** to hide the
-home card for one day. The bar dot and the Settings row remain.
+the OmaFlow window. The bar icon keeps a dot, and **Settings → Advanced →
+Updates** shows the release summary and changes. Click **Update and restart**
+to install it, or **Later** to be reminded tomorrow.
 
 An update waits for an active dictation to finish. OmaFlow then switches the
 plugin and daemon together, checks the new service, and restores the previous
@@ -75,12 +75,12 @@ runner and release receipt.
 
 ## Nothing else is downloaded behind your back
 
-No model weights come with the install. **Settings → Speech** lists every model
+No model weights come with the install. **Settings → Advanced → Models** lists every model
 with its size, the hardware it needs and its licence. You pick one, and only
 then does anything download.
 
 <p align="center">
-  <img src="assets/settings-models.png" width="460" alt="Settings → Speech: the running model, then catalog cards with size, hardware and licence and a Download button">
+  <img src="assets/settings-models.png" width="460" alt="Settings, Advanced, Models: the running model, then a table of models with size and licence and a Download link">
 </p>
 
 Your own model or server works too. [Details →](docs/custom-models.md)
@@ -91,30 +91,90 @@ Your own model or server works too. [Details →](docs/custom-models.md)
 |---|---|
 | Dictate a sentence | Hold your hotkey, speak, then release. |
 | Talk hands-free | Double-tap to lock. Press again or click **Stop**. |
-| Copy without pasting | Choose **Copy only** in Settings → General. |
-| Use an app-specific paste key | Choose **Custom** in Settings → General, select the modifiers and enter the key. |
-| Fix a result | Open it in History to edit or copy again. |
+| Stop a hands-free take without keeping it | Click **Cancel** on the card. |
+| Copy without pasting | Choose **Copy only** in Settings → Basics. |
+| Use an app-specific paste key | Set it in Settings → Advanced → Hotkeys. |
+| Fix a result | Open it in History: see what cleanup changed, fix a word, paste it again. |
 
 <!-- MEDIA 3 — WORKS EVERYWHERE (missing)
      6-8s GIF, one continuous take: same gesture in a terminal, a browser field
      and an editor. Proves it is not app-specific. -->
 
 Your music ducks while you talk and comes back when you release. Adjustable in
-Settings → Audio, down to off.
+Settings → Advanced → Audio, down to off.
 
 <p align="center">
-  <img src="assets/history-english.png" width="460" alt="OmaFlow History with three saved dictations, each with Copy and Delete">
+  <img src="assets/history.png" width="460" alt="OmaFlow History: dictations grouped by day, and the selected one with Cleaned, Raw and Changes views and Paste again">
 </p>
+
+## A journal you can talk to
+
+Press **Talk** in the Journal, say what's on your mind, and press **Stop**.
+OmaFlow writes it into today's page instead of pasting it, and keeps the
+recording so you can hear the entry again. **Cancel** throws a take away.
+**Super Shift V** opens the OmaFlow window, or closes it; **Esc** and
+**Super W** close it too. Two more shortcuts
+have none by default and can be set in Settings → Advanced → Hotkeys: one
+starts and saves an entry from any app, the other opens the window on the
+journal.
+
+Each day is a plain Markdown file in `~/Documents/Journal`, so any editor or
+notes app can read it, and entries you edit there show up in OmaFlow as you
+wrote them. The Journal tab adds a calendar, search across every day, what you
+wrote a year ago today, and a place to type when talking isn't an option.
+Open a day in the future to leave yourself a note: it stays sealed until that
+day, then OmaFlow tells you it has arrived.
+Recordings live next to the files in a hidden `.recordings` folder, and nothing
+leaves the machine. Turning Keep recordings off in the journal settings deletes
+them and keeps the words.
+
+<p align="center">
+  <img src="assets/journal.png" width="460" alt="The Journal: a calendar, today's entries in a book typeface with playable recordings, and a Talk button">
+</p>
+
+## To-dos, said out loud
+
+Hold the to-do shortcut in any app and list what you need to do: "call Mira
+about the lease, and move the backups before Friday". OmaFlow adds one task
+per thing you named. "Before Friday" becomes a due date, and "Friday at 3pm"
+a reminder that arrives as a notification with Done and Open. The card lists
+them and where they went: click one to fix its words, × takes one out, and
+**Undo** takes them all back if it split them wrong.
+With cleanup on, the cleanup model splits them with a prompt of its own,
+which keeps your words and language and puts each task's timing on that task;
+without it, each sentence becomes a task. The shortcut works like the dictation key, held or double-tapped, and
+has none by default: set it, and one that opens the list, in Settings →
+Advanced → Hotkeys.
+
+Lists keep things apart, such as Infra, Dev or Errands: **New list** in the
+To-dos sidebar makes one, and hovering a list offers Rename and Delete. Above
+them, Today, Upcoming, All and Done look across every list. New to-dos go to
+the current list, the one you last added to or picked, and the recording
+card names it while you talk. Click the name to send this capture somewhere
+else, or click it on the card afterwards to move what was added.
+
+Everything lives in one Markdown checklist, `~/Documents/To-dos/To-dos.md`.
+Each list is a `## Heading`, to-dos above the first heading are the Inbox,
+and dates are written as `📅 2026-10-02`, which Obsidian's Tasks plugin
+reads; a time goes just before it as `⏰ 2026-10-02 15:00`, the Obsidian
+Reminder plugin's way. Click a to-do's date for this week's days, or **Pick a
+date and time…** for any other. Tick a to-do and it moves to Done; **Clear done** takes those out,
+with Undo for ten seconds.
 
 ## Cleanup is opt-in
 
-Off by default, OmaFlow pastes exactly what it heard. Turn on **Natural
-cleanup** and a second local model strips fillers, applies the corrections you
-speak out loud, and punctuates — keeping every language exactly as spoken. A
-Rust guard rejects any cleanup that changes a number or a name.
+Off by default, OmaFlow pastes exactly what it heard. **Light** drops fillers
+such as "um" and stutters such as "the the" and needs no model. **Medium** adds
+a second local model that applies the corrections you speak out loud and
+punctuates, keeping every language exactly as spoken. What to change depends on
+context, so that is the model's call; OmaFlow only falls back to the raw
+transcript when the model's answer is empty or cut off. History shows what
+cleanup changed, and Keep the raw text undoes it. Choose the level in
+Settings → Basics.
 
 Cleanup uses Ollama by default and also supports OpenAI-compatible chat
-servers. The Cleanup tab hands you the Ollama command if it is missing.
+servers. Settings → Advanced → Cleanup hands you the Ollama command if it is
+missing.
 
 ## Yours to configure
 
@@ -125,7 +185,8 @@ agent. [Every setting →](docs/configuration.md)
 ## Remove it
 
 `./uninstall` takes everything back off your machine: settings, history, the
-checkout, and the models and runtimes OmaFlow installed.
+checkout, and the models and runtimes OmaFlow installed. Your journal folder is
+yours and stays.
 
 ---
 

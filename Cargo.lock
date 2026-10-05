@@ -50,14 +50,36 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "omaflow"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "httpdate",
  "libc",
+ "omaflow-core",
+ "omaflow-platform",
  "serde",
  "serde_json",
  "toml",
  "toml_edit",
+]
+
+[[package]]
+name = "omaflow-core"
+version = "0.19.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml",
+ "toml_edit",
+]
+
+[[package]]
+name = "omaflow-platform"
+version = "0.19.0"
+dependencies = [
+ "httpdate",
+ "libc",
+ "omaflow-core",
+ "serde_json",
 ]
 
 [[package]]
