@@ -2,7 +2,8 @@ import QtQuick
 import "Dates.js" as Dates
 
 // One month, Monday first. A dot under a day means something was written;
-// while searching, the days that mention the words are marked instead.
+// while searching, the days that mention the words are marked instead. The
+// chosen day is filled and today has a ring.
 Column {
   id: calendar
 
@@ -13,6 +14,17 @@ Column {
   property var highlighted: []     // iso dates, while searching
   signal picked(string date)
   signal monthShifted(int delta)
+
+  // Tab lands on one day, the chosen one or today; the arrow keys move from
+  // there, into the next month and back.
+  readonly property string tabDay: selected.slice(0, 7) === month ? selected
+    : today.slice(0, 7) === month ? today : month + "-01"
+  property string focusDay: ""
+  function moveFocus(from, days) {
+    var next = Dates.addDays(from, days)
+    focusDay = next
+    if (next.slice(0, 7) !== month) monthShifted(next.slice(0, 7) > month ? 1 : -1)
+  }
 
   spacing: 6
 
@@ -43,6 +55,8 @@ Column {
           Icon { anchors.centerIn: parent; name: modelData.icon; size: 9; color: Theme.text }
           MouseArea { id: hover; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: calendar.monthShifted(modelData.delta) }
           Keys.onReturnPressed: calendar.monthShifted(modelData.delta)
+          Keys.onEnterPressed: calendar.monthShifted(modelData.delta)
+          Keys.onSpacePressed: calendar.monthShifted(modelData.delta)
           Accessible.role: Accessible.Button
           Accessible.name: modelData.name
         }
@@ -79,27 +93,43 @@ Column {
           id: cell
           required property string modelData
           readonly property bool isDay: modelData.length > 0
-          readonly property bool isToday: modelData === calendar.today
-          readonly property bool isSelected: modelData === calendar.selected
+          readonly property bool isToday: isDay && modelData === calendar.today
+          readonly property bool isSelected: isDay && modelData === calendar.selected
           readonly property bool future: isDay && modelData > calendar.today
           readonly property bool hit: calendar.highlighted.indexOf(modelData) >= 0
           readonly property bool written: (calendar.counts[modelData] || 0) > 0
           width: 30
           height: 34
+          activeFocusOnTab: isDay && modelData === calendar.tabDay
+          function claimFocus() { if (isDay && calendar.focusDay === modelData) { calendar.focusDay = ""; forceActiveFocus() } }
+          Component.onCompleted: claimFocus()
+          Connections { target: calendar; function onFocusDayChanged() { cell.claimFocus() } }
 
           Rectangle {
             visible: cell.isDay
             width: 26; height: 26; radius: 13
             anchors.horizontalCenter: parent.horizontalCenter
-            color: cell.isToday ? Theme.accent
-              : cell.isSelected || cell.hit ? Theme.fill18
+            color: cell.isSelected ? Theme.accent
+              : cell.hit ? Theme.fill18
               : dayMouse.containsMouse ? Theme.fill8 : "transparent"
+            border.width: cell.isToday && !cell.isSelected ? 1.5 : 0
+            border.color: Theme.accent
             UiText {
               anchors.centerIn: parent
               text: cell.isDay ? String(Number(cell.modelData.slice(8))) : ""
               font.pixelSize: 12
-              weight: cell.isToday ? Font.Bold : Font.Normal
-              color: cell.isToday ? Theme.onAccent : cell.future ? Theme.secondary : Theme.text
+              weight: cell.isToday || cell.isSelected ? Font.Bold : Font.Normal
+              color: cell.isSelected ? Theme.onAccent
+                : cell.future ? Theme.secondary : Theme.text
+            }
+            Rectangle {
+              anchors.fill: parent
+              anchors.margins: -3
+              radius: width / 2
+              color: "transparent"
+              border.width: 2
+              border.color: Theme.accent
+              visible: cell.activeFocus
             }
           }
           Rectangle {
@@ -118,8 +148,17 @@ Column {
             cursorShape: Qt.PointingHandCursor
             onClicked: calendar.picked(cell.modelData)
           }
+          Keys.onReturnPressed: calendar.picked(cell.modelData)
+          Keys.onEnterPressed: calendar.picked(cell.modelData)
+          Keys.onSpacePressed: calendar.picked(cell.modelData)
+          Keys.onLeftPressed: calendar.moveFocus(cell.modelData, -1)
+          Keys.onRightPressed: calendar.moveFocus(cell.modelData, 1)
+          Keys.onUpPressed: calendar.moveFocus(cell.modelData, -7)
+          Keys.onDownPressed: calendar.moveFocus(cell.modelData, 7)
           Accessible.role: Accessible.Button
-          Accessible.name: cell.isDay ? Dates.full(cell.modelData) + (cell.written ? ", " + calendar.counts[cell.modelData] + " entries" : "") : ""
+          Accessible.name: !cell.isDay ? ""
+            : Dates.full(cell.modelData) + (cell.isToday ? ", today" : "")
+              + (cell.written ? ", " + calendar.counts[cell.modelData] + (calendar.counts[cell.modelData] === 1 ? " entry" : " entries") : "")
         }
       }
     }

@@ -8,24 +8,48 @@
 #
 # Non-interactive and unprivileged by design: it prompts for nothing, needs no
 # sudo, and writes only under $HOME, so it is safe to run from the daemon.
-# Safe to re-run: a working runtime is left alone.
+# Safe to re-run: a working runtime of the build this machine needs is left
+# alone, and a machine that gained or lost its NVIDIA driver gets the other one.
 
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 prefix="${1:-$HOME/.local/lib/nemo-speech}"
 binary="$prefix/bin/nemo-speech"
-# This is the published upstream v0.1.0 Linux x86_64 CUDA artifact. Changing
-# any value requires reviewing and hashing the replacement archive first.
+marker="$prefix/.nemo-speech-install"
+# These are the published upstream v0.1.0 Linux x86_64 artifacts, one per
+# build. Changing any value requires reviewing and hashing the replacement
+# archive first.
 readonly runtime_version="0.1.0"
-readonly runtime_archive="nemo-speech-$runtime_version-linux-x86_64-cuda.tar.gz"
-readonly runtime_root="${runtime_archive%.tar.gz}"
-readonly runtime_bytes=107310946
-readonly runtime_sha256="e68628f396489c98fb353e070efaea5bc4977409ae7734fce56c251a79e29147"
-readonly runtime_url="https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v$runtime_version/$runtime_archive"
+declare -rA runtime_bytes=(
+  [cuda]=107310946
+  [cpu]=4583913
+)
+declare -rA runtime_sha256=(
+  [cuda]="e68628f396489c98fb353e070efaea5bc4977409ae7734fce56c251a79e29147"
+  [cpu]="0f74131d631ad2c694cf0ec53490866bb6461147959589a69fb6fc231944065b"
+)
 
-if "$binary" --version >/dev/null 2>&1; then
-  printf 'NeMo-Speech runtime already installed at %s\n' "$prefix"
+# The CUDA build links libcuda.so.1 and will not start without it, and it is
+# only faster when the NVIDIA kernel driver has a GPU to give it.
+nvidia_driver_present() {
+  local libraries
+  libraries="$(PATH="$PATH:/usr/sbin:/sbin" ldconfig -p 2>/dev/null || true)"
+  [[ -e /proc/driver/nvidia/version && $libraries == *'libcuda.so.1 (libc6,x86-64)'* ]]
+}
+
+if nvidia_driver_present; then variant=cuda; else variant=cpu; fi
+readonly variant
+readonly runtime_archive="nemo-speech-$runtime_version-linux-x86_64-$variant.tar.gz"
+readonly runtime_root="${runtime_archive%.tar.gz}"
+readonly runtime_url="https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v$runtime_version/$runtime_archive"
+readonly runtime_marker="$runtime_version linux x86_64 $variant"
+readonly expected_bytes="${runtime_bytes[$variant]}"
+readonly expected_sha256="${runtime_sha256[$variant]}"
+
+if [[ -f $marker && $(<"$marker") == "$runtime_marker" ]] &&
+  "$binary" --version >/dev/null 2>&1; then
+  printf 'NeMo-Speech runtime (%s) already installed at %s\n' "$variant" "$prefix"
   exit 0
 fi
 
@@ -49,7 +73,7 @@ trap 'rm -rf -- "$temporary"' EXIT
 
 if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
   --fail --silent --show-error --location --retry 3 \
-  --max-filesize "$runtime_bytes" \
+  --max-filesize "$expected_bytes" \
   --output "$archive" \
   "$runtime_url"; then
   printf 'Could not download the NeMo-Speech runtime. Check the network and\n' >&2
@@ -58,15 +82,15 @@ if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
 fi
 
 downloaded_bytes="$(wc -c < "$archive")"
-if ((downloaded_bytes != runtime_bytes)); then
+if ((downloaded_bytes != expected_bytes)); then
   printf 'The NeMo-Speech runtime size is %d bytes; expected exactly %d.\n' \
-    "$downloaded_bytes" "$runtime_bytes" >&2
+    "$downloaded_bytes" "$expected_bytes" >&2
   printf 'Refusing to extract it. Update OmaFlow before trying again.\n' >&2
   exit 1
 fi
 
 downloaded_sha256="$(sha256sum "$archive" | cut -d ' ' -f 1)"
-if [[ $downloaded_sha256 != "$runtime_sha256" ]]; then
+if [[ $downloaded_sha256 != "$expected_sha256" ]]; then
   printf 'The NeMo-Speech runtime failed checksum verification.\n' >&2
   printf 'Refusing to extract it. Update OmaFlow before trying again.\n' >&2
   exit 1
@@ -97,7 +121,7 @@ if ! installed_version="$("$staged_binary" --version 2>/dev/null)" ||
     "$runtime_version" >&2
   exit 1
 fi
-printf '%s linux x86_64 cuda\n' "$runtime_version" > "$staged/.nemo-speech-install"
+printf '%s\n' "$runtime_marker" > "$staged/.nemo-speech-install"
 
 next="$prefix.new"
 previous="$prefix.old"
@@ -120,4 +144,4 @@ if ((was_absent)); then
   # case is that ./uninstall leaves the prefix behind for the user to delete.
   python3 "$repo_dir/tools/install_receipt.py" nemo-runtime "$prefix" || true
 fi
-printf 'NeMo-Speech runtime installed at %s\n' "$prefix"
+printf 'NeMo-Speech runtime (%s) installed at %s\n' "$variant" "$prefix"

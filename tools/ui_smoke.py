@@ -48,6 +48,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-host-") as staging:
     host = stage / "hosts/omarchy"
     host.mkdir(parents=True)
     shutil.copy(ROOT / "hosts/omarchy/Job.qml", host)
+    shutil.copy(ROOT / "hosts/omarchy/Copies.js", host)
     # Offscreen Qt has no layer shell, so the overlay window becomes an Item;
     # everything inside it is still created and bound.
     source = (ROOT / "hosts/omarchy/OmaFlow.qml").read_text()
@@ -89,7 +90,7 @@ ShellRoot {
     run = subprocess.run(
         ["quickshell", "-p", str(stage)],
         env=dict(headless, QT_QPA_PLATFORM="offscreen", QT_QPA_PLATFORMTHEME="", XDG_RUNTIME_DIR=str(runtime),
-                 PATH=f"{bin_dir}:" + os.environ["PATH"]),
+                 XDG_STATE_HOME=str(stage / "state"), PATH=f"{bin_dir}:" + os.environ["PATH"]),
         capture_output=True, text=True, timeout=20,
     )
     log = run.stdout + run.stderr
@@ -130,6 +131,11 @@ overlay = subprocess.run(["/usr/lib/qt6/bin/qmltestrunner", "-input", str(ROOT /
 if overlay.returncode != 0:
     raise SystemExit("The card test failed:\n" + overlay.stdout + overlay.stderr)
 print("PASS cards count down in an Esc ring, wait while pointed at, and edit to-dos in place", flush=True)
+window = subprocess.run(["/usr/lib/qt6/bin/qmltestrunner", "-input", str(ROOT / "tools/window_test.qml")],
+                        env=dict(os.environ, QT_QPA_PLATFORM="offscreen"), capture_output=True, text=True, timeout=60)
+if window.returncode != 0:
+    raise SystemExit("The window test failed:\n" + window.stdout + window.stderr)
+print("PASS the window keeps its header, toasts and update states readable and reachable", flush=True)
 
 # 3. The connection tester's handling of real replies.
 probe = ROOT / "tools/preview/Probe.qml"

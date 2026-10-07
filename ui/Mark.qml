@@ -7,6 +7,9 @@ Item {
   property color color: Theme.accent
   property bool badge: false
   property color badgeColor: Theme.accent
+  // A ring instead of a dot, for a state that must read apart from the
+  // others where a theme's red and yellow are close or grey.
+  property bool badgeRing: false
 
   implicitWidth: 18
   implicitHeight: 18
@@ -35,8 +38,8 @@ Item {
     radius: width / 2
     x: mark.width - width * 0.7
     y: -width * 0.25
-    color: mark.badgeColor
+    color: mark.badgeRing ? Theme.background : mark.badgeColor
     border.width: 1.5
-    border.color: Theme.background
+    border.color: mark.badgeRing ? mark.badgeColor : Theme.background
   }
 }

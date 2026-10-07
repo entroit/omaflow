@@ -21,11 +21,14 @@ FocusScope {
     { key: "cleanup", label: "Cleanup" },
     { key: "hotkeys", label: "Hotkeys" },
     { key: "audio", label: "Audio" },
-    { key: "updates", label: "Updates" }
+    { key: "updates", label: "Updates and app" }
   ]
 
   // The microphone meter only runs while a page that shows it is open.
   readonly property bool meterVisible: active && (page === "basics" || page === "audio")
+  // OmaFlow itself saves every setting, so while it is not running nothing
+  // here would stick. Updates and app works without it.
+  readonly property bool saves: app.connected || page === "updates"
   onMeterVisibleChanged: app.setMeterPreview(meterVisible)
   Component.onDestruction: app.setMeterPreview(false)
   onPageChanged: { if (advanced.indexOf(page) >= 0) advancedOpen = true; flick.contentY = 0 }
@@ -51,10 +54,12 @@ FocusScope {
         text: "Advanced"
         expander: true
         expanded: screen.advancedOpen
-        onClicked: { screen.advancedOpen = !screen.advancedOpen; if (screen.advancedOpen && screen.advanced.indexOf(screen.page) < 0) screen.page = "models" }
+        onClicked: screen.advancedOpen = !screen.advancedOpen
       }
+      // Collapsed, Advanced still shows the page you are on.
       Repeater {
-        model: screen.advancedOpen ? screen.advancedSections : []
+        model: screen.advancedOpen ? screen.advancedSections
+          : screen.advancedSections.filter(function(section) { return section.key === screen.page })
         NavItem { required property var modelData; text: modelData.label; nested: true; selected: screen.page === modelData.key; onClicked: screen.page = modelData.key }
       }
     }
@@ -67,22 +72,59 @@ FocusScope {
       Layout.fillHeight: true
       clip: true
       contentWidth: width
-      contentHeight: loader.height + 48
+      contentHeight: content.height + 48
       boundsBehavior: Flickable.StopAtBounds
 
-      Loader {
-        id: loader
+      // Tab to a control below the fold, or above it, and the page follows.
+      function reveal(item) {
+        if (!item || !screen.active) return
+        for (var p = item; p !== loader; p = p.parent) if (!p) return
+        var top = item.mapToItem(contentItem, 0, 0).y
+        var bottom = top + item.height
+        if (top - 16 < contentY) contentY = Math.max(0, top - 16)
+        else if (bottom + 16 > contentY + height) contentY = Math.max(0, Math.min(contentHeight - height, bottom + 16 - height))
+      }
+      Connections {
+        target: screen.Window.window
+        function onActiveFocusItemChanged() { flick.reveal(screen.Window.activeFocusItem) }
+      }
+
+      Column {
+        id: content
         x: 32; y: 24
         width: flick.width - 64
-        sourceComponent: screen.page === "words" ? words
-          : screen.page === "privacy" ? privacy
-          : screen.page === "models" ? models
-          : screen.page === "ownmodel" ? ownModel
-          : screen.page === "cleanup" ? cleanup
-          : screen.page === "hotkeys" ? hotkeys
-          : screen.page === "audio" ? audio
-          : screen.page === "updates" ? updates
-          : basics
+        spacing: 24
+
+        Item {
+          visible: !screen.saves
+          width: parent.width
+          height: stopped.implicitHeight
+          Icon { y: 2; name: "warning"; size: 14; color: Theme.yellow }
+          UiText {
+            id: stopped
+            x: 24
+            width: parent.width - 24
+            wrapMode: Text.Wrap
+            text: !screen.app.binaryFound
+              ? "OmaFlow is not installed yet, so changes here are not saved. History shows the command that finishes installing."
+              : "OmaFlow is stopped, so changes here are not saved. Start it from the top of the window."
+          }
+        }
+
+        Loader {
+          id: loader
+          width: parent.width
+          enabled: screen.saves
+          sourceComponent: screen.page === "words" ? words
+            : screen.page === "privacy" ? privacy
+            : screen.page === "models" ? models
+            : screen.page === "ownmodel" ? ownModel
+            : screen.page === "cleanup" ? cleanup
+            : screen.page === "hotkeys" ? hotkeys
+            : screen.page === "audio" ? audio
+            : screen.page === "updates" ? updates
+            : basics
+        }
       }
     }
   }

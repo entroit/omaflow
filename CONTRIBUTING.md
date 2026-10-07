@@ -88,7 +88,7 @@ tools/cleanup_probe.py          # 88 cases
 tools/cleanup_generalization.py # 21 cases
 tools/cleanup_itn_gate.py       # 180 spoken-to-written pairs
 tools/dictation_modes_gate.py   # natural, verbatim, vocabulary, obsolete keys
-tools/todo_bench.py             # 46 spoken to-do takes: splitting, dates, times
+tools/todo_bench.py             # 80 spoken to-do takes: splitting, cleanup, dates, times, reminders
 ```
 
 The to-do bench runs the to-do prompt, not the dictation prompt: a spoken take

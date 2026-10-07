@@ -11,6 +11,21 @@ Column {
   readonly property var shown: app.customVocabulary.filter(function(word) {
     return page.filter.trim().length === 0 || String(word).toLowerCase().indexOf(page.filter.trim().toLowerCase()) >= 0
   })
+  // A word already in the list keeps what you typed and says so, rather than
+  // clearing the field as if it had been added.
+  function add(value) {
+    var term = String(value || "").trim().replace(/\s+/g, " ")
+    var existing = app.customVocabulary.find(function(word) { return String(word).toLowerCase() === term.toLowerCase() })
+    if (existing !== undefined) {
+      newWord.text = term
+      newWord.problem = existing + " is already in your words."
+        + (existing !== term ? " To change how it is written, remove it first." : "")
+      return false
+    }
+    app.addVocabulary(term)
+    newWord.text = ""
+    return true
+  }
 
   PageTitle { width: parent.width; title: "Words"; subtitle: "Names and terms you want spelled exactly. They apply with or without cleanup." }
 
@@ -20,28 +35,41 @@ Column {
     Field {
       id: newWord
       width: parent.width - add.width - 8
+      name: "Add a word"
       placeholderText: "Add a name, product or term"
       maximumLength: 80
-      onAccepted: { page.app.addVocabulary(text); text = "" }
+      onTextChanged: problem = ""
+      onAccepted: if (text.trim().length > 0) page.add(text)
     }
     Pill {
       id: add
-      anchors.verticalCenter: newWord.verticalCenter
+      y: newWord.input.y + (newWord.input.height - height) / 2
       kind: "primary"; text: "Add word"; size: 13; verticalPadding: 9; horizontalPadding: 14
       enabled: newWord.text.trim().length > 0
-      onClicked: { page.app.addVocabulary(newWord.text); newWord.text = "" }
+      onClicked: page.add(newWord.text)
     }
   }
 
   SearchField {
+    id: search
     visible: page.app.customVocabulary.length > 8
     width: parent.width
     placeholder: "Search " + page.app.customVocabulary.length + " words"
     onTextChanged: page.filter = text
+    // A search that finds nothing is usually a word you meant to add.
+    onAccepted: if (page.shown.length === 0 && text.trim().length > 0 && page.add(text)) text = ""
+  }
+
+  UiText {
+    visible: page.filter.trim().length > 0 && page.shown.length === 0
+    width: parent.width
+    wrapMode: Text.Wrap
+    muted: true
+    text: "No word matches “" + page.filter.trim() + "”. Press Enter to add it."
   }
 
   Rectangle {
-    visible: page.app.customVocabulary.length > 0
+    visible: page.shown.length > 0
     width: parent.width
     height: table.implicitHeight
     radius: Theme.radiusCard + 2
@@ -64,13 +92,15 @@ Column {
           width: table.width
           height: 42
           Rectangle { width: parent.width; height: 1; color: Theme.divider }
-          UiText { x: 14; anchors.verticalCenter: parent.verticalCenter; text: String(modelData); font.pixelSize: 14; weight: Font.DemiBold }
+          // A long word, up to 80 characters, stops short of Remove.
+          UiText { x: 14; width: remove.x - x - 12; anchors.verticalCenter: parent.verticalCenter; text: String(modelData); font.pixelSize: 14; weight: Font.DemiBold; elide: Text.ElideRight }
           Pill {
+            id: remove
             anchors.right: parent.right
             anchors.rightMargin: 10
             anchors.verticalCenter: parent.verticalCenter
             kind: "ghost"; text: "Remove"; size: 12
-            hint: "Remove " + modelData
+            Accessible.name: "Remove " + modelData
             onClicked: page.app.removeVocabulary(modelData)
           }
         }

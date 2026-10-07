@@ -4,11 +4,12 @@
 use crate::config::Config;
 use omaflow_core::{
     date::Date,
-    journal::{Journal, NewEntry},
+    journal::{Journal, MoveError, NewEntry},
 };
 use serde_json::{Value, json};
 use std::{
     env,
+    io::IsTerminal,
     path::PathBuf,
     process::ExitCode,
     time::{SystemTime, UNIX_EPOCH},
@@ -26,8 +27,11 @@ pub fn run(mut args: impl Iterator<Item = String>) -> ExitCode {
             println!("{value}");
             ExitCode::SUCCESS
         }
+        // The window reads the JSON; a person at a terminal needs only the words.
         Err(error) => {
-            println!("{}", json!({ "error": error }));
+            if !std::io::stdout().is_terminal() {
+                println!("{}", json!({ "error": error }));
+            }
             eprintln!("omaflow: {error}");
             ExitCode::FAILURE
         }
@@ -53,8 +57,14 @@ fn dispatch(
                 "days": to_value(journal.month(date.year, date.month)?)?,
             }))
         }
-        "stats" => Ok(json!({ "days": journal.dates()?.len() })),
-        "search" => to_value(journal.search(&next("words to search for")?)?),
+        "stats" => Ok(json!({
+            "days": journal.dates()?.len(),
+            "recordings": journal.recording_count(),
+        })),
+        "search" => {
+            let (today, _) = omaflow_platform::clock::local_now();
+            to_value(journal.search(&next("words to search for")?, today)?)
+        }
         "year-ago" => {
             let date = parse_date(&next("date")?)?;
             Ok(match journal.a_year_ago(date)? {
@@ -65,16 +75,12 @@ fn dispatch(
         "add" => {
             let text = next("text")?;
             let (today, now) = omaflow_platform::clock::local_now();
-            // A later day makes the entry a note to yourself for that day.
-            let (date, time) = match args.next() {
-                Some(day) => {
-                    let day = parse_date(&day)?;
-                    if day <= today {
-                        return Err("Notes go to a later day; write today's entry without a date".into());
-                    }
-                    (day, omaflow_core::journal::note_heading(today, &now))
-                }
-                None => (today, now),
+            // A later day makes the entry a note to yourself for that day; a
+            // past day gets it added, saying when it really was written.
+            let (date, time) = match args.next().map(|day| parse_date(&day)).transpose()? {
+                Some(day) if day > today => (day, omaflow_core::journal::note_heading(today, &now)),
+                Some(day) if day < today => (day, omaflow_core::journal::added_heading(&now, today)),
+                _ => (today, now),
             };
             let id = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -132,6 +138,44 @@ fn dispatch(
             }
             Ok(json!({ "date": today.to_string(), "notes": due }))
         }
+        "move-folder" => {
+            // Run by the window, which can write both folders; the sandboxed
+            // daemon can only write the folder it was given. The days and
+            // the setting move together, so the journal never points at a
+            // folder its days have left.
+            let folder = next("folder")?.trim().to_string();
+            if !(folder.starts_with('/') || folder.starts_with('~')) {
+                return Err("Enter a full folder path, such as ~/Documents/Journal".into());
+            }
+            let destination = omaflow_core::config::expand_home(&folder);
+            // Days whose originals could not be removed have still moved:
+            // the copies are checked, so the folder changes with them.
+            match journal.move_to(&destination) {
+                Ok(moved) => match Config::save_setting("journal_folder", json!(folder)) {
+                    Ok(_) => Ok(json!({
+                        "days": moved.days,
+                        "moved": moved.days,
+                        "folder": folder,
+                        "left_behind": moved.left_behind,
+                    })),
+                    Err(error) => Err(match Journal::new(&destination).move_to(journal.folder()) {
+                        Ok(_) => format!("Could not save the new folder: {error}. Nothing was moved."),
+                        Err(_) => format!(
+                            "Your days are in {folder}, but the setting could not be saved: {error}. Choose {folder} again in Journal settings."
+                        ),
+                    }),
+                },
+                Err(MoveError::Clash(days)) => Err(format!(
+                    "{} already {} in {folder}: {}. Nothing was moved. Move or rename those files in {folder}, or choose another folder.",
+                    plural(days.len(), "day"),
+                    if days.len() == 1 { "exists" } else { "exist" },
+                    days.join(", ")
+                )),
+                Err(MoveError::Failed(error)) => Err(format!(
+                    "Could not move your days to {folder}: {error}. Nothing was moved."
+                )),
+            }
+        }
         "forget-deleted" => {
             journal.empty_trash();
             Ok(json!({ "ok": true }))
@@ -150,9 +194,18 @@ fn dispatch(
         }
         _ => Err(
             "Usage: omaflow journal day DATE | month YYYY-MM | stats | search WORDS | year-ago DATE | \
-             add TEXT [LATER_DATE] | due | edit DATE ID TEXT | delete DATE ID | restore DATE ID | forget-deleted | export"
+             add TEXT [DATE] | due | edit DATE ID TEXT | delete DATE ID | restore DATE ID | forget-deleted | \
+             move-folder FOLDER | export"
                 .into(),
         ),
+    }
+}
+
+fn plural(count: usize, word: &str) -> String {
+    if count == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{count} {word}s")
     }
 }
 

@@ -6,11 +6,11 @@ in through **Settings → Advanced → Your own model** for speech and **Use ano
 Ollama model or machine** in Settings → Advanced → Cleanup.
 
 `omaflow model-select` only accepts catalog ids and refuses anything else. Set
-a custom model through those panel fields or `omaflow configure models`.
+a custom model through those fields in the window or `omaflow configure models`.
 
 ## Two questions
 
-The panel asks two questions. This page is organised around the same two.
+The window asks two questions. This page is organised around the same two.
 
 **What are you bringing?** **A model file** means weights on disk, which OmaFlow
 runs the server for. **A server I run** means you start the server and OmaFlow
@@ -49,10 +49,10 @@ does accept `--api-key` if you have reasons of your own to use it.
 
 The key is handled as a secret rather than as another setting. It lives in your
 config file, which only your user can read, and it is the one value the daemon
-never publishes: the panel and `omaflow effective-config` see a
+never publishes: the window and `omaflow effective-config` see a
 `speech_api_key_set` or `cleanup_api_key_set` boolean and nothing more. It
 never appears as a process argument, where anyone reading `/proc` would find
-it: the panel hands it to `omaflow configure models -` on stdin, that passes it
+it: the window hands it to `omaflow configure models -` on stdin, that passes it
 to the daemon over its owner-only socket, and it reaches curl through an
 owner-only file that is deleted after the request. A key must be
 one line without quotes, at most 4096 characters, so it cannot smuggle a second
@@ -87,6 +87,8 @@ server would otherwise decide whether NeMo is running.
 
 `speech_device` accepts `auto`, `cpu`, `cuda`, `vulkan` or `metal`. It selects
 a mode in the runtime you have installed; it does not fetch a different build.
+The managed runtime is the CUDA build on a computer with an NVIDIA driver and
+the CPU build everywhere else, so on the CPU build only `auto` and `cpu` work.
 
 In the window: choose **A model file**, then fill **Model file**,
 **Address**, **Language** and **Device**. There is no **Health address**, **API
@@ -115,7 +117,7 @@ recording as `file` (16 kHz mono WAV named `dictation.wav`, type `audio/wav`),
 language on `auto` it omits the `language` field and lets the server decide; an
 explicit code is sent. The reply must be a JSON object with a `text` string.
 
-In the panel: answer **A server I run** and **OpenAI-compatible**, then fill
+In the window: answer **A server I run** and **OpenAI-compatible**, then fill
 **Model**, **Server address**, **Health address (optional)** and **Language**,
 plus **API key (optional)** if your server wants one.
 
@@ -140,7 +142,7 @@ POST only, so a GET on it answers 404 and OmaFlow's probe counts only 2xx and
 OmaFlow probes `/health` on the same origin when the field is empty. Fill it in
 only to override that.
 
-In the panel: answer **A server I run** and **whisper.cpp**, then fill **Server
+In the window: answer **A server I run** and **whisper.cpp**, then fill **Server
 address**, and **API key (optional)** if your server wants one.
 
 Use whatever address you started whisper-server on:
@@ -217,11 +219,11 @@ local address when `ollama` is missing. An OpenAI-compatible server remains
 under the control of the person who configured it.
 
 Every field checks itself as you type. A bad one turns red and says why, and
-**Save** stays disabled until they are all valid, so the panel refuses what the
+**Save** stays disabled until they are all valid, so the window refuses what the
 daemon would have refused anyway. The daemon validates again on save, and
 nothing is written unless the whole configuration passes.
 
-### Test it from the panel
+### Test it from the window
 
 **Test connection** on the Speech tab sends one unauthenticated GET and tells you what came back. On the Speech
 tab it appears once you answer **A server I run**, and asks the health address if

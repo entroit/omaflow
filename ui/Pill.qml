@@ -20,6 +20,8 @@ Rectangle {
   property string hint: ""
   // A key that also does this, shown quieter after the label: "Discard Esc".
   property string shortcut: ""
+  // Past this width the label ends in "…"; 0 lets it be as long as it is.
+  property real labelMaximumWidth: 0
   property Component leading: null
   property Component trailing: null
   signal clicked()
@@ -31,8 +33,12 @@ Rectangle {
   implicitHeight: Math.round(label.lineHeight + verticalPadding * 2)
   radius: height / 2
   activeFocusOnTab: enabled && visible
-  opacity: enabled ? 1 : 0.45
-  color: kind === "primary" ? (pressed ? Theme.mix(Theme.accent, Theme.background, 0.2)
+  // Faded, a pale accent would leave its words unreadable; a disabled
+  // primary is drawn as a quiet fill instead.
+  readonly property bool quietPrimary: kind === "primary" && !enabled
+  opacity: enabled || quietPrimary ? 1 : 0.45
+  color: quietPrimary ? Theme.fill18
+    : kind === "primary" ? (pressed ? Theme.mix(Theme.accent, Theme.background, 0.2)
                                 : hovered ? Theme.mix(Theme.accent, Theme.text, 0.12) : Theme.accent)
     : kind === "fill" ? (selected ? Theme.fill22 : hovered ? Theme.fill22 : Theme.fill18)
     : kind === "outline" || kind === "danger" ? (hovered ? Theme.fill8 : Theme.fill4)
@@ -64,9 +70,12 @@ Rectangle {
       id: label
       anchors.verticalCenter: parent.verticalCenter
       text: pill.text
+      width: pill.labelMaximumWidth > 0 ? Math.min(implicitWidth, pill.labelMaximumWidth) : implicitWidth
+      elide: Text.ElideRight
       font.pixelSize: pill.size
       weight: pill.bold ? Font.DemiBold : Font.Normal
-      color: pill.kind === "primary" ? Theme.onAccent
+      color: pill.quietPrimary ? Theme.secondary
+        : pill.kind === "primary" ? Theme.onAccent
         : pill.kind === "link" ? Theme.accentText
         : pill.kind === "danger" ? Theme.redText
         : Theme.text
@@ -76,7 +85,9 @@ Rectangle {
       visible: pill.shortcut.length > 0
       text: pill.shortcut
       font.pixelSize: pill.size
-      color: pill.kind === "primary" ? Theme.alpha(Theme.onAccent, 0.7) : Theme.secondary
+      // On the accent the label's own colour, since a faded one would not
+      // read there; the lighter weight keeps it quieter than the label.
+      color: pill.kind === "primary" && !pill.quietPrimary ? Theme.onAccent : Theme.secondary
     }
     Loader { sourceComponent: pill.trailing; anchors.verticalCenter: parent.verticalCenter; active: pill.trailing !== null }
   }
@@ -89,12 +100,12 @@ Rectangle {
     onClicked: if (pill.enabled) pill.clicked()
   }
 
-  Keys.onReturnPressed: pill.clicked()
-  Keys.onEnterPressed: pill.clicked()
-  Keys.onSpacePressed: pill.clicked()
+  Keys.onReturnPressed: if (pill.enabled) pill.clicked()
+  Keys.onEnterPressed: if (pill.enabled) pill.clicked()
+  Keys.onSpacePressed: if (pill.enabled) pill.clicked()
 
   Accessible.role: Accessible.Button
   Accessible.name: pill.text
   Accessible.description: pill.hint
-  Accessible.onPressAction: pill.clicked()
+  Accessible.onPressAction: if (pill.enabled) pill.clicked()
 }

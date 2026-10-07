@@ -102,19 +102,53 @@ function addDays(isoDate, days) {
   return iso(date)
 }
 
-// The dates to offer for a to-do: today, tomorrow, the rest of the week by
-// name, and next Monday.
-function dueChoices(todayIso) {
-  var today = parse(todayIso)
-  var choices = [{ label: "Today", value: todayIso }, { label: "Tomorrow", value: addDays(todayIso, 1) }]
-  for (var d = 2; d < 7; d++) {
-    var value = addDays(todayIso, d)
-    var date = parse(value)
-    choices.push({ label: WEEKDAYS[date.getDay()], detail: date.getDate() + " " + MONTHS[date.getMonth()].slice(0, 3), value: value })
-  }
-  var toMonday = (8 - today.getDay()) % 7 || 7
-  if (toMonday >= 7) choices.push({ label: "Next week", detail: "Monday", value: addDays(todayIso, toMonday) })
-  return choices
+// What "when" can be in one choice, at the moment NOW ("YYYY-MM-DD HH:MM"):
+// the moments that remind you, then days alone, whose time is "". Later
+// today is gone by 15:00 and becomes This evening until 18:00; Monday
+// morning is left out when it is tomorrow morning or next week.
+function moments(now, todayIso) {
+  var clock = String(now).slice(11, 16)
+  var tomorrow = addDays(todayIso, 1)
+  var monday = addDays(todayIso, (8 - parse(todayIso).getDay()) % 7 || 7)
+  var nextWeek = addDays(todayIso, 7)
+  var out = []
+  if (clock < "15:00") out.push({ key: "later", label: "Later today", date: todayIso, time: "18:00" })
+  else if (clock < "18:00") out.push({ key: "evening", label: "This evening", date: todayIso, time: "20:00" })
+  out.push({ key: "tomorrow-morning", label: "Tomorrow morning", date: tomorrow, time: "09:00" })
+  if (monday !== tomorrow && monday !== nextWeek) out.push({ key: "monday", label: "Monday morning", date: monday, time: "09:00" })
+  out.push({ key: "next-week", label: "Next week", date: nextWeek, time: "09:00" })
+  out.push({ key: "today", label: "Today", date: todayIso, time: "" })
+  out.push({ key: "tomorrow", label: "Tomorrow", date: tomorrow, time: "" })
+  return out
+}
+
+// What a moment means, beside its name: "18:00", "Sat 09:00",
+// "Fri 2 Oct, 09:00", or for a day alone, "Fri 25 Sep".
+function momentAside(entry, todayIso) {
+  var date = parse(entry.date)
+  var day = WEEKDAYS[date.getDay()].slice(0, 3)
+  var dated = day + " " + date.getDate() + " " + MONTHS[date.getMonth()].slice(0, 3)
+  if (!entry.time) return dated
+  var days = Math.round((date - parse(todayIso)) / 86400000)
+  return days === 0 ? entry.time : days < 7 ? day + " " + entry.time : dated + ", " + entry.time
+}
+
+// The Monday on or before a day, and the fortnight from it.
+function weekStart(isoDate) {
+  return addDays(isoDate, -((parse(isoDate).getDay() + 6) % 7))
+}
+function fortnight(mondayIso) {
+  var days = []
+  for (var d = 0; d < 14; d++) days.push(addDays(mondayIso, d))
+  return days
+}
+// "September 2026", or across two months, "Sep – Oct 2026".
+function fortnightTitle(mondayIso) {
+  var first = parse(mondayIso)
+  var last = parse(addDays(mondayIso, 13))
+  if (first.getMonth() === last.getMonth()) return MONTHS[first.getMonth()] + " " + first.getFullYear()
+  return MONTHS[first.getMonth()].slice(0, 3) + (first.getFullYear() !== last.getFullYear() ? " " + first.getFullYear() : "")
+    + " \u2013 " + MONTHS[last.getMonth()].slice(0, 3) + " " + last.getFullYear()
 }
 
 // "Today", or with a time, "Today 15:00" and "Friday 09:30".
@@ -137,4 +171,79 @@ function clockTime(text) {
   }
   if (hours > 23 || minutes > 59) return null
   return String(hours).padStart(2, "0") + ":" + String(minutes).padStart(2, "0")
+}
+
+// A moment, "YYYY-MM-DD HH:MM", as a local Date, and back.
+function moment(text) {
+  var parts = String(text).split(" ")
+  var date = parse(parts[0])
+  var clock = String(parts[1] || "00:00").split(":")
+  date.setHours(Number(clock[0]), Number(clock[1]))
+  return date
+}
+function momentText(date) {
+  return iso(date) + " " + String(date.getHours()).padStart(2, "0") + ":" + String(date.getMinutes()).padStart(2, "0")
+}
+
+// `minutes` after a moment, which can be negative: earlier.
+function later(text, minutes) {
+  var date = moment(text)
+  date.setMinutes(date.getMinutes() + minutes)
+  return momentText(date)
+}
+
+// Minutes from one moment to another.
+function minutesBetween(from, to) {
+  return Math.round((moment(to) - moment(from)) / 60000)
+}
+
+// When a reminder goes off, said next to the to-do's date: only the time on
+// the same day, "Yesterday 18:00" or "Friday 09:30" on another.
+function remindAt(text, isoDate, todayIso) {
+  var parts = String(text).split(" ")
+  return parts[0] === isoDate ? parts[1] : dueAt(parts[0], parts[1], todayIso)
+}
+
+// The same, as a sentence goes on: "at 16:30", "yesterday at 18:00",
+// "Friday at 09:30".
+function remindSaid(text, isoDate, todayIso) {
+  var parts = String(text).split(" ")
+  if (parts[0] === isoDate) return "at " + parts[1]
+  var day = due(parts[0], todayIso)
+  if (["Today", "Tomorrow", "Yesterday"].indexOf(day) >= 0) day = day.toLowerCase()
+  return day + " at " + parts[1]
+}
+
+// When a reminder can go off for a to-do at AT: at its time, then 5, 15,
+// 30 and 60 minutes earlier, each as the clock reads then.
+var EARLIER = [0, 5, 15, 30, 60]
+// Each with the clock time it means, and how far ahead as people say it:
+// "5 min" reads at a glance where 12:17 next to 12:22 has to be worked out.
+function remindChoices(at, isoDate) {
+  return EARLIER.map(function(minutes) {
+    var clock = clockOn(later(at, -minutes), isoDate)
+    return { minutes: minutes, label: clock, ahead: ahead(minutes), before: minutes === 0 ? "On time" : ahead(minutes) + " before",
+             means: minutes === 0 ? "On time, at " + clock : ahead(minutes) + " before, at " + clock,
+             said: minutes === 0 ? "On time, at " + clock : spokenAhead(minutes) + " before, at " + clock }
+  })
+}
+function ahead(minutes) {
+  return minutes === 0 ? "On time" : minutes % 60 === 0 ? minutes / 60 + (minutes === 60 ? " hour" : " hours") : minutes + " min"
+}
+function spokenAhead(minutes) {
+  return minutes % 60 === 0 ? minutes / 60 + (minutes === 60 ? " hour" : " hours") : minutes + " minutes"
+}
+
+// When a to-do reminds you, "YYYY-MM-DD HH:MM", with BEFORE minutes as the
+// default; "" for one with no time or no reminder.
+function reminderOf(todo, before) {
+  if (!todo.due || !todo.time || todo.reminder === "off") return ""
+  return todo.reminder ? String(todo.reminder) : later(todo.due + " " + todo.time, -before)
+}
+
+// A moment as a short choice next to a day: "16:45", or with the weekday
+// when it falls on another day, "Thu 23:30".
+function clockOn(text, isoDate) {
+  var parts = String(text).split(" ")
+  return parts[0] === isoDate ? parts[1] : WEEKDAYS[parse(parts[0]).getDay()].slice(0, 3) + " " + parts[1]
 }

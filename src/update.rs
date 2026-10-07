@@ -126,6 +126,9 @@ pub fn check_remote() -> Result<RemoteStatus, String> {
 
 pub fn check() -> Result<UpdateOffer, String> {
     let _lock = UpdateLock::acquire()?;
+    // Best effort: a folder that is not on the installed version shows as
+    // changed outside OmaFlow below, which says what to do.
+    let _ = set_aside_unreadable_transaction();
     let checked_at_ms = now_ms();
     let previous: Option<UpdateOffer> = store::read(&store::offer_path(), STATE_LIMIT)?;
     let installed = read_installed();
@@ -139,7 +142,7 @@ pub fn check() -> Result<UpdateOffer, String> {
         (Some(root), Ok(installed)) => head(&root)
             .ok()
             .filter(|head| *head != installed.commit)
-            .map(|_| "The plugin checkout changed outside OmaFlow. Updates are paused until that checkout is reviewed.".into()),
+            .map(|_| external_change_warning(&root, installed)),
         _ => None,
     };
     let (target, error) = match result {
@@ -179,6 +182,24 @@ pub fn check() -> Result<UpdateOffer, String> {
     Ok(offer)
 }
 
+/// What to do when the OmaFlow folder is on another commit than the one
+/// installed, in the words the Updates and app page uses, with the exact
+/// command that goes back.
+fn external_change_warning(root: &Path, installed: &InstalledRelease) -> String {
+    let folder = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .map(|base| base.join("omarchy/plugins/entroit.omaflow"))
+        .unwrap_or_else(|| root.to_path_buf());
+    format!(
+        "Updates are paused. Review the changes in {} with git, then choose Check now. To go back to OmaFlow {}, run: git -C {} checkout {}",
+        folder.display(),
+        installed.version,
+        folder.display(),
+        &installed.commit[..12]
+    )
+}
+
 fn discover_verified_snapshot() -> Result<VerifiedSnapshot, String> {
     discover_verified_snapshot_for(None)?
         .ok_or_else(|| "the marketplace release is older than the installed release".to_string())
@@ -190,7 +211,7 @@ fn discover_verified_snapshot_for(
     let catalog = download(CATALOG_URL, verified_snapshot::CATALOG_LIMIT)?;
     let (commit, method) =
         parse_catalog(&catalog)?.ok_or("the marketplace has no verified OmaFlow release")?;
-    let root = repo_root().ok_or("could not locate the OmaFlow checkout")?;
+    let root = repo_root().ok_or("could not find the OmaFlow folder")?;
     require_canonical_checkout(&root)?;
     fetch_exact(&root, &commit)?;
     let manifest_bytes = git_bytes(&root, &["show", &format!("{commit}:manifest.json")])?;
@@ -223,14 +244,17 @@ fn release_metadata_required(marketplace_version: &str, installed_version: Optio
         .is_some_and(|installed| compare_versions(marketplace_version, installed).is_lt())
 }
 
+/// Says once that an update is ready, and once more when a "Later" for it
+/// runs out, so a deferral is a delay rather than a way to lose the update.
 fn notify_once(target: &VerifiedSnapshot) -> Result<(), String> {
     let path = store::notification_path();
-    if !claim_notification(&path, &target.commit)? {
+    if !claim_notification(&path, &target.commit)? && !deferral_ran_out(&target.commit)? {
         return Ok(());
     }
-    let body = format!("OmaFlow {} is ready in OmaFlow.", target.version);
+    let title = format!("OmaFlow {} is ready to install", target.version);
+    let body = "Click to see what changed. Nothing changes until you choose Update and restart.";
     let _ = Command::new(NOTIFY)
-        .args(notification_args("OmaFlow update available", &body))
+        .args(notification_args(&title, body))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -268,10 +292,77 @@ fn claim_notification(path: &Path, commit: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-pub fn later() -> Result<(), String> {
+/// True once for a "Later" on `commit` whose day has passed: the deferral is
+/// removed, so the reminder comes only once.
+fn deferral_ran_out(commit: &str) -> Result<bool, String> {
+    let path = store::deferral_path();
+    let deferral: Option<DeferralState> = store::read(&path, STATE_LIMIT)?;
+    let ran_out = deferral.is_some_and(|deferral| {
+        deferral.commit.as_deref() == Some(commit)
+            && deferral.until_ms.is_some_and(|until| until <= now_ms())
+    });
+    if ran_out {
+        fs::remove_file(&path).map_err(|error| error.to_string())?;
+    }
+    Ok(ran_out)
+}
+
+/// An update error the window knows, as one sentence with the next step.
+fn known_sentence(error: &str) -> Option<&'static str> {
+    Some(match error {
+        "check for updates first" | "no update is available" => {
+            "Check for updates first, then choose Update and restart."
+        }
+        "no verified update is available" => "There is no update to install right now.",
+        "the last marketplace check failed; check again before updating" => {
+            "The last update check failed. Check again, then choose Update and restart."
+        }
+        "the OmaFlow folder changed outside OmaFlow; review it before updating"
+        | "the OmaFlow folder does not match the installed verified release" => {
+            "The OmaFlow folder changed outside OmaFlow. Choose Check now to see what to do."
+        }
+        "the OmaFlow folder has local changes" => {
+            "The OmaFlow folder has local changes. Commit or remove them, then try again."
+        }
+        "another OmaFlow update is already queued" => {
+            "Another update is already on its way. Let it finish first."
+        }
+        "the verified marketplace release changed; check again" => {
+            "A newer release came out meanwhile. Check for updates, then try again."
+        }
+        "could not start the updated OmaFlow service" => "The new version did not start.",
+        _ => return None,
+    })
+}
+
+/// Any update error as a sentence: the known ones with their next step, the
+/// rest capitalised and closed with a period.
+pub fn sentence(error: &str) -> String {
+    if let Some(known) = known_sentence(error) {
+        return known.into();
+    }
+    let mut text = error.trim().trim_end_matches('.').to_string();
+    if let Some(first) = text.get(..1) {
+        text.replace_range(..1, &first.to_uppercase());
+    }
+    if text.is_empty() { text } else { text + "." }
+}
+
+/// Why Update and restart did not start, as one sentence with the next
+/// step, for the window to show.
+pub fn refusal(error: &str) -> String {
+    match known_sentence(error) {
+        Some(known) => known.into(),
+        None => format!("The update did not start: {}", sentence(error)),
+    }
+}
+
+/// Puts the offered update off until tomorrow; returns its version.
+pub fn later() -> Result<String, String> {
     let offer: UpdateOffer =
         store::read(&store::offer_path(), STATE_LIMIT)?.ok_or("no update is available")?;
     let target = offer.target.ok_or("no update is available")?;
+    let version = target.version;
     store::replace(
         &store::deferral_path(),
         &DeferralState {
@@ -280,8 +371,11 @@ pub fn later() -> Result<(), String> {
             until_ms: Some(now_ms().saturating_add(24 * 60 * 60 * 1000)),
         },
     )
+    .map(|()| version)
 }
 
+/// Starts the update, or goes on with one already on its way. Returns what
+/// is happening now, as a sentence for a person.
 pub fn request() -> Result<String, String> {
     let offer: UpdateOffer =
         store::read(&store::offer_path(), STATE_LIMIT)?.ok_or("check for updates first")?;
@@ -289,30 +383,47 @@ pub fn request() -> Result<String, String> {
         return Err("the last marketplace check failed; check again before updating".into());
     }
     let target = offer.target.ok_or("no verified update is available")?;
-    if offer.external_checkout_warning.is_some() {
-        return Err(
-            "the plugin checkout changed outside OmaFlow; review it before updating".into(),
-        );
+    set_aside_unreadable_transaction()?;
+    // An update already on its way goes on from where it stopped, whatever
+    // its install left in the checkout: the runner checks or recovers it. If
+    // the runner cannot start, the transaction stays as it is, to resume later.
+    // One that needs recovery is put right first: Try again starts the
+    // runner, which brings the previous version back.
+    let existing: Option<UpdateTransaction> = store::read(&store::transaction_path(), STATE_LIMIT)?;
+    if let Some(existing) = existing.filter(UpdateTransaction::needs_reconciliation) {
+        if existing.is_active()
+            && existing.identity().target_commit != target.commit
+            && current_interruption(&existing).is_none()
+        {
+            return Err("another OmaFlow update is already queued".into());
+        }
+        start_update_service()?;
+        let identity = existing.identity();
+        let puts_back = matches!(existing, UpdateTransaction::NeedsRecovery(_))
+            || current_interruption(&existing) == Some(Interruption::Partway);
+        return Ok(if puts_back {
+            format!(
+                "Putting back OmaFlow {}. A notification says when it is done.",
+                identity.original_release.version
+            )
+        } else {
+            format!(
+                "Updating to OmaFlow {}. A notification says when it is done.",
+                identity.target_version
+            )
+        });
     }
-    let root = repo_root().ok_or("could not locate the OmaFlow checkout")?;
+    if offer.external_checkout_warning.is_some() {
+        return Err("the OmaFlow folder changed outside OmaFlow; review it before updating".into());
+    }
+    let root = repo_root().ok_or("could not find the OmaFlow folder")?;
     require_canonical_checkout(&root)?;
     require_clean(&root)?;
     let original_commit = head(&root)?;
     let original_release = read_installed()?;
     validate_retained_release(&original_release)?;
     if original_commit != original_release.commit {
-        return Err("the plugin checkout does not match the installed verified release".into());
-    }
-    let existing: Option<UpdateTransaction> = store::read(&store::transaction_path(), STATE_LIMIT)?;
-    if let Some(existing) = existing.filter(UpdateTransaction::is_active) {
-        if existing.identity().target_commit == target.commit {
-            if let Err(error) = start_update_service() {
-                mark_retryable_start_failure(existing.identity(), &error)?;
-                return Err(error);
-            }
-            return Ok(existing.identity().id.clone());
-        }
-        return Err("another OmaFlow update is already queued".into());
+        return Err("the OmaFlow folder does not match the installed verified release".into());
     }
     let identity = TransactionIdentity {
         schema_version: 1,
@@ -329,10 +440,13 @@ pub fn request() -> Result<String, String> {
     )?;
     let _ = fs::remove_file(store::deferral_path());
     if let Err(error) = start_update_service() {
-        mark_retryable_start_failure(&identity, &error)?;
+        mark_retryable_start_failure(&identity)?;
         return Err(error);
     }
-    Ok(identity.id)
+    Ok(format!(
+        "Updating to OmaFlow {}. A notification says when it is done.",
+        identity.target_version
+    ))
 }
 
 fn start_update_service() -> Result<(), String> {
@@ -348,14 +462,13 @@ fn start_update_service() -> Result<(), String> {
     )
 }
 
-fn mark_retryable_start_failure(identity: &TransactionIdentity, error: &str) -> Result<(), String> {
+fn mark_retryable_start_failure(identity: &TransactionIdentity) -> Result<(), String> {
     store::replace(
         &store::transaction_path(),
         &UpdateTransaction::RolledBack(UpdateFailure {
             identity: identity.clone(),
-            message: format!(
-                "The update could not start. Retry when user services are available. {error}"
-            ),
+            // Why is what request() answers, which the window shows.
+            message: "The update could not start. Try again in a moment.".into(),
             failed_at_ms: now_ms(),
         }),
     )
@@ -371,10 +484,8 @@ pub fn run() -> Result<(), String> {
             let identity = transaction.identity().clone();
             validate_transaction_identity(&identity)?;
             let message = match &transaction {
-                UpdateTransaction::NeedsRecovery(_) => {
-                    "Recovery of the interrupted update is still required."
-                }
-                _ => "The updater was interrupted after activation began.",
+                UpdateTransaction::NeedsRecovery(_) => "An earlier try stopped partway.",
+                _ => "It was interrupted while installing.",
             };
             return finish_recovery(&identity, message, true).map(|_| ());
         }
@@ -421,29 +532,168 @@ fn recovery_may_restart_daemon(transaction: &UpdateTransaction) -> bool {
     )
 }
 
-fn transaction_blocks_dictation(transaction: &UpdateTransaction) -> bool {
-    transaction.is_active() || matches!(transaction, UpdateTransaction::NeedsRecovery(_))
+fn transaction_blocks_dictation(
+    transaction: &UpdateTransaction,
+    interruption: Option<Interruption>,
+) -> bool {
+    match interruption {
+        Some(Interruption::BeforeInstall) => false,
+        Some(Interruption::Partway) => true,
+        None => {
+            transaction.is_active() || matches!(transaction, UpdateTransaction::NeedsRecovery(_))
+        }
+    }
 }
 
-pub fn blocks_new_dictation() -> bool {
-    match store::read::<UpdateTransaction>(&store::transaction_path(), STATE_LIMIT) {
-        Ok(Some(transaction)) => transaction_blocks_dictation(&transaction),
-        Ok(None) => false,
-        Err(_) => true,
+/// Why new dictation waits on an update: one that is running ends by itself,
+/// the others wait for the person to put them right.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DictationPause {
+    Updating,
+    /// With the version that comes back, as the Updates page's button names it.
+    Failed(String),
+    Unreadable,
+}
+
+impl DictationPause {
+    /// What the card says when a take is refused.
+    pub fn notice(&self) -> String {
+        match self {
+            Self::Updating => "OmaFlow is finishing an update. Try again in a minute.".into(),
+            Self::Failed(version) => format!(
+                "An update did not finish, so dictation is paused. Open OmaFlow and choose Put back {version} in Settings, Advanced, Updates and app."
+            ),
+            Self::Unreadable => {
+                "OmaFlow could not read where the last update stopped, so dictation is paused. Open OmaFlow and choose Check now in Settings, Advanced, Updates and app.".into()
+            }
+        }
     }
+}
+
+pub fn dictation_pause() -> Option<DictationPause> {
+    match store::read::<UpdateTransaction>(&store::transaction_path(), STATE_LIMIT) {
+        Ok(Some(transaction)) => {
+            let interruption = current_interruption(&transaction);
+            transaction_blocks_dictation(&transaction, interruption).then(|| {
+                if transaction.is_active() && interruption.is_none() {
+                    DictationPause::Updating
+                } else {
+                    DictationPause::Failed(transaction.identity().original_release.version.clone())
+                }
+            })
+        }
+        Ok(None) => None,
+        Err(_) => Some(DictationPause::Unreadable),
+    }
+}
+
+/// A transaction file that cannot be read pauses dictation. When the
+/// checkout is clean on the installed release, no update is half done, so
+/// the file is set aside and nothing waits on it any more.
+fn set_aside_unreadable_transaction() -> Result<(), String> {
+    let path = store::transaction_path();
+    if !path.exists() || store::read::<UpdateTransaction>(&path, STATE_LIMIT).is_ok() {
+        return Ok(());
+    }
+    let root = repo_root().ok_or("could not find the OmaFlow folder")?;
+    let installed = read_installed()?;
+    if head(&root)? != installed.commit || require_clean(&root).is_err() {
+        return Err("the saved update progress is unreadable and the OmaFlow folder is not on the installed version".into());
+    }
+    fs::rename(&path, path.with_extension("json.unreadable"))
+        .map_err(|error| format!("could not set aside the unreadable update progress: {error}"))
+}
+
+/// How long a running update may sit with no runner before it counts as
+/// stopped: long enough for systemd to restart a runner that crashed, and
+/// for a queued one to start.
+const RUNNER_GRACE: Duration = Duration::from_secs(30);
+
+/// An update whose runner is gone. The transaction file still says running,
+/// and nothing will move it until the update is tried again or OmaFlow
+/// starts, which recovers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Interruption {
+    /// Stopped before anything was installed: the running version is untouched.
+    BeforeInstall,
+    /// Stopped while installing: recovery puts the previous version back.
+    Partway,
+}
+
+impl Interruption {
+    /// `previous` is the version that was running before the update.
+    fn message(self, previous: &str) -> String {
+        match self {
+            Self::BeforeInstall => {
+                "The update stopped before it installed anything. Your current version still works. Try again to install it.".into()
+            }
+            Self::Partway => format!(
+                "The update stopped partway through. Put back {previous} to dictate again, then update."
+            ),
+        }
+    }
+}
+
+/// `quiet` is how long the transaction file has gone unchanged.
+fn interruption(
+    transaction: &UpdateTransaction,
+    runner_alive: bool,
+    quiet: Duration,
+) -> Option<Interruption> {
+    if runner_alive || quiet < RUNNER_GRACE {
+        return None;
+    }
+    match transaction {
+        UpdateTransaction::Queued(_)
+        | UpdateTransaction::Preparing(_)
+        | UpdateTransaction::WaitingForIdle(_) => Some(Interruption::BeforeInstall),
+        UpdateTransaction::Activating(_) | UpdateTransaction::Verifying(_) => {
+            Some(Interruption::Partway)
+        }
+        _ => None,
+    }
+}
+
+fn current_interruption(transaction: &UpdateTransaction) -> Option<Interruption> {
+    let quiet = fs::metadata(store::transaction_path())
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .unwrap_or_default();
+    interruption(transaction, store::runner_alive(), quiet)
+}
+
+/// The update as the window shows it: the saved transaction, except that a
+/// running one whose runner is gone reads "interrupted", with what to do.
+pub fn transaction_json() -> Result<serde_json::Value, String> {
+    let Some(transaction): Option<UpdateTransaction> =
+        store::read(&store::transaction_path(), STATE_LIMIT)?
+    else {
+        return Ok(serde_json::json!({}));
+    };
+    let mut value = serde_json::to_value(&transaction).map_err(|error| error.to_string())?;
+    if let Some(interruption) = current_interruption(&transaction) {
+        value["state"] = "interrupted".into();
+        value["message"] = interruption
+            .message(&transaction.identity().original_release.version)
+            .into();
+        value["blocksDictation"] =
+            transaction_blocks_dictation(&transaction, Some(interruption)).into();
+    }
+    Ok(value)
 }
 
 fn run_inner(identity: &TransactionIdentity) -> Result<(), String> {
     progress(
         identity,
         UpdateStage::Preparing,
-        "Downloading verified release",
+        "Downloading the verified release",
     )?;
     let snapshot = discover_verified_snapshot()?;
     if snapshot.commit != identity.target_commit || snapshot.version != identity.target_version {
         return Err("the verified marketplace release changed; check again".into());
     }
-    let root = repo_root().ok_or("could not locate the OmaFlow checkout")?;
+    let root = repo_root().ok_or("could not find the OmaFlow folder")?;
     require_canonical_checkout(&root)?;
     require_clean_at(&root, &identity.original_commit)?;
     require_fast_forward(&root, &identity.original_commit, &snapshot.commit)?;
@@ -472,7 +722,7 @@ fn run_inner(identity: &TransactionIdentity) -> Result<(), String> {
         wait_for_daemon_exit(Duration::from_secs(30))?;
     }
 
-    progress(identity, UpdateStage::Activating, "Installing update")?;
+    progress(identity, UpdateStage::Activating, "Installing the update")?;
     require_clean_at(&root, &identity.original_commit)?;
     git_text(&root, &["merge", "--ff-only", &snapshot.commit])?;
     validate_plugin(&root)?;
@@ -571,7 +821,7 @@ fn restore_original(
     restart_service: bool,
 ) -> Result<RecoveryOutcome, String> {
     validate_transaction_identity(identity)?;
-    let root = repo_root().ok_or("could not locate the OmaFlow checkout during recovery")?;
+    let root = repo_root().ok_or("could not find the OmaFlow folder during recovery")?;
     require_canonical_checkout(&root)?;
     let observed = head(&root)?;
     if observed == identity.target_commit || observed == identity.original_commit {
@@ -582,7 +832,7 @@ fn restore_original(
             git_text(&root, &["reset", "--hard", &identity.original_commit]).map(|_| ())
         })?;
     } else {
-        return Err("the checkout changed during recovery".into());
+        return Err("the OmaFlow folder changed during recovery".into());
     }
     validate_retained_release(&identity.original_release)?;
     let original_directory = release_root().join(&identity.original_release.commit);
@@ -635,6 +885,13 @@ fn finish_recovery(
     let outcome = restore_original(identity, restart_service);
     let (transaction, result) = recovery_record(identity, update_error, outcome);
     store::replace(&store::transaction_path(), &transaction)?;
+    // Awaiting the daemon ends in a moment, when it starts and recovery is
+    // finished; that is when it is said.
+    match result {
+        Ok(RecoveryOutcome::Running) => notify_failure(false),
+        Err(_) => notify_failure(true),
+        Ok(RecoveryOutcome::AwaitingDaemon) => {}
+    }
     result
 }
 
@@ -643,12 +900,13 @@ fn recovery_record(
     update_error: &str,
     outcome: Result<RecoveryOutcome, String>,
 ) -> (UpdateTransaction, Result<RecoveryOutcome, String>) {
+    let reason = sentence(update_error);
     match outcome {
         Ok(RecoveryOutcome::Running) => (
             UpdateTransaction::RolledBack(UpdateFailure {
                 identity: identity.clone(),
                 message: format!(
-                    "The update did not finish. Your previous version is still running. {update_error}"
+                    "The update did not finish. Your previous version is still running. {reason}"
                 ),
                 failed_at_ms: now_ms(),
             }),
@@ -658,7 +916,8 @@ fn recovery_record(
             UpdateTransaction::NeedsRecovery(UpdateFailure {
                 identity: identity.clone(),
                 message: format!(
-                    "The previous release was restored. Recovery will finish when its daemon starts. {update_error}"
+                    "The update did not finish. OmaFlow puts {} back when it starts. {reason}",
+                    identity.original_release.version
                 ),
                 failed_at_ms: now_ms(),
             }),
@@ -667,12 +926,34 @@ fn recovery_record(
         Err(recovery_error) => (
             UpdateTransaction::NeedsRecovery(UpdateFailure {
                 identity: identity.clone(),
-                message: format!("{update_error}. Recovery also failed: {recovery_error}"),
+                message: format!(
+                    "The update did not finish and {} could not be put back, so dictation is paused. {reason} {} Choose Put back {} to try again.",
+                    identity.original_release.version,
+                    sentence(&recovery_error),
+                    identity.original_release.version
+                ),
                 failed_at_ms: now_ms(),
             }),
             Err(recovery_error),
         ),
     }
+}
+
+/// Says that an update failed, as success is said, for someone who chose
+/// Update and restart and closed the window. A click opens Settings, Updates
+/// and app, where the reason and Try again are.
+fn notify_failure(paused: bool) {
+    let body = if paused {
+        "Dictation is paused until your previous version is back. Click to put it back."
+    } else {
+        "Your previous version is still running. Click to see why and try again."
+    };
+    let _ = Command::new(NOTIFY)
+        .args(notification_args("OmaFlow did not update", body))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .bounded_status_for(Duration::from_secs(10));
 }
 
 pub fn reconcile() -> Result<(), String> {
@@ -688,7 +969,7 @@ pub fn reconcile() -> Result<(), String> {
     };
     let identity = transaction.identity().clone();
     validate_transaction_identity(&identity)?;
-    finish_recovery(&identity, "An interrupted update was recovered.", false).map(|_| ())
+    finish_recovery(&identity, "It was interrupted.", false).map(|_| ())
 }
 
 fn validate_transaction_identity(identity: &TransactionIdentity) -> Result<(), String> {
@@ -1028,7 +1309,7 @@ fn require_clean(root: &Path) -> Result<(), String> {
     if git_text(root, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty() {
         Ok(())
     } else {
-        Err("the OmaFlow checkout has local changes".into())
+        Err("the OmaFlow folder has local changes".into())
     }
 }
 
@@ -1038,14 +1319,14 @@ fn require_canonical_checkout(root: &Path) -> Result<(), String> {
     if origin == CANONICAL_REPOSITORY || origin == format!("{CANONICAL_REPOSITORY}.git") {
         Ok(())
     } else {
-        Err("the OmaFlow checkout does not use the canonical repository".into())
+        Err("the OmaFlow folder does not use the canonical repository".into())
     }
 }
 
 fn require_safe_git_config(root: &Path) -> Result<(), String> {
     let dot_git = root.join(".git");
     let metadata = fs::symlink_metadata(&dot_git)
-        .map_err(|_| "the checkout Git directory is invalid".to_string())?;
+        .map_err(|_| "the OmaFlow folder's Git directory is invalid".to_string())?;
     if !metadata.file_type().is_dir() {
         return Err("linked Git worktrees are not supported for trusted updates".into());
     }
@@ -1072,7 +1353,9 @@ fn require_safe_git_config(root: &Path) -> Result<(), String> {
             "receivepack",
         ] {
             if lower.contains(unsafe_token) {
-                return Err("the checkout has unsafe repository-local Git configuration".into());
+                return Err(
+                    "the OmaFlow folder has unsafe repository-local Git configuration".into(),
+                );
             }
         }
     }
@@ -1095,7 +1378,7 @@ fn require_safe_target_attributes(root: &Path, commit: &str) -> Result<(), Strin
 fn require_clean_at(root: &Path, expected: &str) -> Result<(), String> {
     require_clean(root)?;
     if head(root)? != expected {
-        return Err("the OmaFlow checkout changed while the update was waiting".into());
+        return Err("the OmaFlow folder changed while the update was waiting".into());
     }
     Ok(())
 }
@@ -1163,7 +1446,7 @@ pub fn finalize_recovery_for_running_daemon() -> Result<(), String> {
     if running_release_commit().as_deref() != Some(&identity.original_commit) {
         return Ok(());
     }
-    let root = repo_root().ok_or("could not locate the OmaFlow checkout during recovery")?;
+    let root = repo_root().ok_or("could not find the OmaFlow folder during recovery")?;
     require_clean_at(&root, &identity.original_commit)?;
     validate_retained_release(&identity.original_release)?;
     let current =
@@ -1183,6 +1466,7 @@ pub fn finalize_recovery_for_running_daemon() -> Result<(), String> {
             failed_at_ms: now_ms(),
         }),
     )?;
+    notify_failure(false);
     // Recovery is complete once the prior daemon is live and the durable
     // checkout/release state agrees. A shell that is still starting must not
     // leave dictation blocked behind NeedsRecovery.
@@ -1569,6 +1853,62 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_update_says_why_in_a_sentence_with_the_next_step() {
+        let message = |outcome| match recovery_record(
+            &identity(),
+            "the OmaFlow folder has local changes",
+            outcome,
+        )
+        .0
+        {
+            UpdateTransaction::RolledBack(failure) | UpdateTransaction::NeedsRecovery(failure) => {
+                failure.message
+            }
+            other => panic!("not a failure: {other:?}"),
+        };
+        assert_eq!(
+            message(Ok(RecoveryOutcome::Running)),
+            "The update did not finish. Your previous version is still running. The OmaFlow folder has local changes. Commit or remove them, then try again."
+        );
+        assert!(
+            message(Err("could not restart OmaFlow during recovery".into())).ends_with(
+                "so dictation is paused. The OmaFlow folder has local changes. Commit or remove them, then try again. Could not restart OmaFlow during recovery. Choose Put back 0.17.0 to try again."
+            )
+        );
+        assert_eq!(
+            sentence("a git error: bad object"),
+            "A git error: bad object."
+        );
+        assert_eq!(
+            refusal("could not find the OmaFlow folder"),
+            "The update did not start: Could not find the OmaFlow folder."
+        );
+        assert_eq!(
+            refusal("the OmaFlow folder has local changes"),
+            "The OmaFlow folder has local changes. Commit or remove them, then try again."
+        );
+    }
+
+    #[test]
+    fn a_paused_take_says_whether_to_wait_or_what_to_fix() {
+        assert!(
+            DictationPause::Updating
+                .notice()
+                .ends_with("Try again in a minute.")
+        );
+        assert!(
+            DictationPause::Failed("0.19.0".into())
+                .notice()
+                .contains("choose Put back 0.19.0 in Settings, Advanced, Updates and app")
+        );
+        assert!(
+            DictationPause::Unreadable
+                .notice()
+                .contains("choose Check now")
+        );
+    }
+
+    #[test]
     fn prestart_reconcile_records_awaiting_daemon_without_failing() {
         let (transaction, result) = recovery_record(
             &identity(),
@@ -1577,7 +1917,68 @@ mod tests {
         );
         assert_eq!(result, Ok(RecoveryOutcome::AwaitingDaemon));
         assert!(matches!(transaction, UpdateTransaction::NeedsRecovery(_)));
-        assert!(transaction_blocks_dictation(&transaction));
+        assert!(transaction_blocks_dictation(&transaction, None));
+    }
+
+    #[test]
+    fn a_running_update_whose_runner_died_reads_interrupted() {
+        let quiet = Duration::from_secs(31);
+        let preparing = UpdateTransaction::Preparing(progress());
+        assert_eq!(
+            interruption(&preparing, true, quiet),
+            None,
+            "the runner is alive"
+        );
+        assert_eq!(
+            interruption(&preparing, false, Duration::from_secs(5)),
+            None,
+            "systemd may still restart it"
+        );
+        assert_eq!(
+            interruption(&preparing, false, quiet),
+            Some(Interruption::BeforeInstall)
+        );
+        assert_eq!(
+            interruption(&UpdateTransaction::Queued(identity()), false, quiet),
+            Some(Interruption::BeforeInstall)
+        );
+        assert_eq!(
+            interruption(&UpdateTransaction::Verifying(progress()), false, quiet),
+            Some(Interruption::Partway)
+        );
+        let failure = UpdateFailure {
+            identity: identity(),
+            message: "recover".into(),
+            failed_at_ms: 3,
+        };
+        assert_eq!(
+            interruption(&UpdateTransaction::RolledBack(failure), false, quiet),
+            None,
+            "a finished update is not running"
+        );
+        assert_eq!(
+            Interruption::BeforeInstall.message("0.19.0"),
+            "The update stopped before it installed anything. Your current version still works. Try again to install it."
+        );
+        assert_eq!(
+            Interruption::Partway.message("0.19.0"),
+            "The update stopped partway through. Put back 0.19.0 to dictate again, then update."
+        );
+    }
+
+    #[test]
+    fn dictation_waits_only_for_an_update_that_installed_something() {
+        let preparing = UpdateTransaction::Preparing(progress());
+        assert!(transaction_blocks_dictation(&preparing, None));
+        assert!(!transaction_blocks_dictation(
+            &preparing,
+            Some(Interruption::BeforeInstall)
+        ));
+        let activating = UpdateTransaction::Activating(progress());
+        assert!(transaction_blocks_dictation(
+            &activating,
+            Some(Interruption::Partway)
+        ));
     }
 
     #[test]
@@ -1621,7 +2022,7 @@ mod tests {
         fs::write(directory.join("manifest.json"), "two").unwrap();
         assert_eq!(
             require_clean(&directory).unwrap_err(),
-            "the OmaFlow checkout has local changes"
+            "the OmaFlow folder has local changes"
         );
         git(&["add", "manifest.json"]);
         git(&["commit", "-qm", "two"]);
@@ -1636,7 +2037,7 @@ mod tests {
         ]);
         assert_eq!(
             require_canonical_checkout(&directory).unwrap_err(),
-            "the OmaFlow checkout does not use the canonical repository"
+            "the OmaFlow folder does not use the canonical repository"
         );
         git(&["remote", "set-url", "origin", CANONICAL_REPOSITORY]);
         git(&[
@@ -1646,7 +2047,7 @@ mod tests {
         ]);
         assert_eq!(
             require_canonical_checkout(&directory).unwrap_err(),
-            "the checkout has unsafe repository-local Git configuration"
+            "the OmaFlow folder has unsafe repository-local Git configuration"
         );
         fs::remove_dir_all(directory).unwrap();
     }

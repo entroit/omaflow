@@ -44,12 +44,34 @@ QtObject {
   readonly property color fill8: mix(background, text, 0.08)
   readonly property color fill18: mix(background, text, 0.18)
   readonly property color fill22: mix(background, text, 0.22)
+  // A row under the pointer: the theme's own lighter surface, so it keeps the
+  // theme's tint instead of a grey mixed from the text, taken only as far as a
+  // gentle step (1.12:1) so even a theme whose lighter surface is a full grey
+  // only lifts the row. Where that surface is fainter, it carries on from it
+  // toward the text.
+  property color lighterBackground: background
+  readonly property color hover: contrast(background, lighterBackground) >= 1.12
+    ? stepToward(background, background, lighterBackground, 1.12)
+    : stepToward(background, lighterBackground, text, 1.12)
+  // From `from` toward `to` until it stands `target` apart from `base`.
+  function stepToward(base, from, to, target) {
+    for (var step = 1; step <= 100; step++) {
+      var c = mix(from, to, step / 100)
+      if (contrast(c, base) >= target) return c
+    }
+    return to
+  }
   readonly property color divider: mix(background, text, 0.12)
   readonly property color outline: mix(background, text, 0.40)
-  readonly property color secondary: mix(background, text, 0.71)
+  // Also on fill22, where a hovered button shows its shortcut.
+  readonly property color secondary: readable(mix(background, text, 0.71), 4.5, fill22)
 
   // Colours used as text or marks are checked against the background and
-  // pulled toward the text colour until they read (WCAG 4.5:1 for words).
+  // against fill18, the selected row or pressed control furthest from it, and
+  // darkened or lightened until they read on both (WCAG 4.5:1 for words).
+  // Every fill in between then reads too. A light theme darkens toward black,
+  // which keeps the hue; mixing toward its grey text would turn yellow and
+  // green into more grey.
   function luminance(c) {
     function channel(v) { return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4) }
     return 0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b)
@@ -58,22 +80,33 @@ QtObject {
     var la = luminance(a), lb = luminance(b)
     return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05)
   }
-  function readable(c, ground, minimum) {
+  // `darkest` is a fill past fill18 the colour must also read on.
+  function readable(c, minimum, darkest) {
     var step = 0
     var result = c
-    while (contrast(result, ground) < minimum && step < 10) {
+    var toward = light ? Qt.rgba(0, 0, 0, 1) : text
+    while ((contrast(result, background) < minimum || contrast(result, fill18) < minimum
+        || (darkest !== undefined && contrast(result, darkest) < minimum)) && step < 20) {
       step++
-      result = mix(c, text, step / 10)
+      result = mix(c, toward, step / 20)
     }
     return result
   }
-  readonly property color accentText: readable(accent, background, 4.5)
-  readonly property color redText: readable(red, background, 4.5)
-  readonly property color greenText: readable(green, background, 4.5)
-  readonly property color yellowText: readable(yellow, background, 4.5)
-  // Words drawn on an accent fill: the background colour when it reads,
-  // otherwise the text colour.
-  readonly property color onAccent: contrast(background, accent) >= 4.5 ? background : text
+  readonly property color accentText: readable(accent, 4.5)
+  readonly property color redText: readable(red, 4.5)
+  readonly property color greenText: readable(green, 4.5)
+  readonly property color yellowText: readable(yellow, 4.5)
+  // Words drawn on an accent fill: the background colour when it reads, else
+  // the text colour, else black or white for an accent that is neither light
+  // nor dark enough for the theme's own colours.
+  readonly property color accentInk: contrast(background, accent) >= 4.5 ? background
+    : contrast(text, accent) >= 4.5 ? text
+    : contrast(Qt.rgba(0, 0, 0, 1), accent) >= contrast(Qt.rgba(1, 1, 1, 1), accent) ? Qt.rgba(0, 0, 0, 1) : Qt.rgba(1, 1, 1, 1)
+  // QML reads "onAccent: …" as a signal handler, so the name every screen
+  // uses cannot hold a binding; it is copied over instead.
+  property color onAccent
+  onAccentInkChanged: theme.onAccent = accentInk
+  Component.onCompleted: theme.onAccent = accentInk
 
   // ------------------------------------------------------------------- type
   readonly property FontLoader grotesk: FontLoader { source: Qt.resolvedUrl("fonts/SchibstedGrotesk.ttf") }
@@ -111,6 +144,7 @@ QtObject {
     red = pick(["red", "color1"], red)
     green = pick(["green", "color2"], green)
     yellow = pick(["yellow", "color3"], yellow)
+    lighterBackground = pick(["lighter_background"], background)
     light = values.mode === "light" || luminance(background) > 0.5
   }
 }

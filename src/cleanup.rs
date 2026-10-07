@@ -61,15 +61,38 @@ fn cleanup_candidate(
     Ok(cleaned)
 }
 
-/// A user-facing explanation for a cleanup failure, kept short for the result card.
-pub fn cleanup_warning_text(error: &str) -> String {
-    if error.starts_with("Cleanup reached")
-        || error.starts_with("Cleanup ended")
-        || error.starts_with("Text exceeds")
-    {
-        format!("{}.", error.trim_end_matches('.'))
+/// What a cleanup warning is about: the words were pasted, copied, saved to
+/// the journal, or split into to-dos without the model.
+#[derive(Debug, Clone, Copy)]
+pub enum Fallback {
+    Pasted,
+    Copied,
+    Journal,
+    Todos,
+}
+
+/// A user-facing explanation for a cleanup failure, kept short for the
+/// result card: what you got instead, and what to do about it.
+pub fn cleanup_warning_text(error: &str, fallback: Fallback) -> String {
+    let unfinished = error.starts_with("Cleanup reached") || error.starts_with("Cleanup ended");
+    let too_long = error.starts_with("Text exceeds");
+    let kept = match fallback {
+        Fallback::Pasted => "Pasted as you said it.",
+        Fallback::Copied => "Copied as you said it.",
+        Fallback::Journal => "Saved as you said it, lightly tidied.",
+        Fallback::Todos => {
+            return "Cleanup was unavailable, so these were split by sentence. Check them above."
+                .into();
+        }
+    };
+    if unfinished {
+        format!("{kept} Cleanup did not finish.")
+    } else if too_long {
+        format!("{kept} Shorter passages get cleaned up.")
+    } else if let Fallback::Journal = fallback {
+        "Cleanup did not answer, so this was saved lightly tidied. Check Settings, Cleanup.".into()
     } else {
-        "Cleanup was unavailable. Original transcription kept.".into()
+        "Cleanup did not answer, so this is the raw text. Check Settings, Cleanup.".into()
     }
 }
 
@@ -182,7 +205,7 @@ fn cleanup_context(
         append_context_tag(
             &mut context,
             "CURRENT_WINDOW_CONTEXT",
-            &format!("{class} — {title}"),
+            &format!("{class}: {title}"),
         );
     }
     if config.cleanup.use_clipboard_context && !clipboard.trim().is_empty() {

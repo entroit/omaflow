@@ -93,9 +93,26 @@ pub struct UpdateLock {
     path: PathBuf,
 }
 
+fn lock_path() -> PathBuf {
+    update_dir().join("runner.lock")
+}
+
+/// Whether an updater holds the lock now. The lock file names its pid, and
+/// a runner that was killed leaves the file behind.
+pub fn runner_alive() -> bool {
+    holder_alive(&lock_path())
+}
+
+fn holder_alive(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .is_some_and(|pid| Path::new("/proc").join(pid.to_string()).exists())
+}
+
 impl UpdateLock {
     pub fn acquire() -> Result<Self, String> {
-        let path = update_dir().join("runner.lock");
+        let path = lock_path();
         fs::create_dir_all(update_dir()).map_err(|error| error.to_string())?;
         fs::set_permissions(update_dir(), fs::Permissions::from_mode(0o700))
             .map_err(|error| error.to_string())?;
@@ -111,11 +128,7 @@ impl UpdateLock {
                     return Ok(Self { path });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
-                    let stale = fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|value| value.trim().parse::<u32>().ok())
-                        .is_none_or(|pid| !Path::new("/proc").join(pid.to_string()).exists());
-                    if stale {
+                    if !holder_alive(&path) {
                         fs::remove_file(&path).map_err(|error| {
                             format!("could not remove stale update lock: {error}")
                         })?;
@@ -157,6 +170,25 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_lock_left_by_a_dead_runner_has_no_holder() {
+        let directory = std::env::temp_dir().join(format!("omaflow-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("runner.lock");
+        assert!(!holder_alive(&path), "no lock file");
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        fs::write(&path, format!("{dead}\n")).unwrap();
+        assert!(!holder_alive(&path), "the runner exited");
+        fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+        assert!(holder_alive(&path), "the runner is this process");
+        fs::write(&path, "not a pid\n").unwrap();
+        assert!(!holder_alive(&path));
         fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -28,9 +28,12 @@ Rectangle {
   signal cancelled()
   signal cleared()
   property bool finished: false
+  // Set when Esc, Backspace or the keys themselves ended it, so the caller
+  // can put focus back on the button that opened it.
+  property bool endedByKey: false
 
-  function start() { problem = ""; finished = false; forceActiveFocus() }
-  function stop() { focus = false }
+  function start() { problem = ""; finished = false; endedByKey = false; forceActiveFocus() }
+  function stop() { endedByKey = true; focus = false }
 
   implicitHeight: 34
   radius: height / 2
@@ -142,6 +145,14 @@ Rectangle {
 
   // ------------------------------------------------------------- listening
   Keys.onPressed: function(event) {
+    // Tab and Shift+Tab, with nothing else held, leave the recorder as they
+    // leave any control; leaving cancels, like Esc.
+    var shiftOnly = held.every(function(key) { return key.indexOf("Shift") === 0 })
+    if ((event.key === Qt.Key_Tab && event.modifiers === Qt.NoModifier && held.length === 0)
+        || (event.key === Qt.Key_Backtab && (event.modifiers & ~Qt.ShiftModifier) === 0 && shiftOnly)) {
+      event.accepted = false
+      return
+    }
     event.accepted = true
     if (event.isAutoRepeat) return
     problem = ""
@@ -180,7 +191,7 @@ Rectangle {
     }
     if (modifiers.length === 0 && !(allowBare && typesNothing(key))) {
       problem = allowBare
-        ? key + " alone would stop typing " + key + " in every app. Hold Super, Shift, Ctrl or Alt with it, or use a key that types nothing, such as F13."
+        ? "On its own, the " + KeyNames.label(key) + " key would stop typing in every app. Hold Super, Shift, Ctrl or Alt with it, or use a key that types nothing, such as F13."
         : "Hold Super, Shift, Ctrl or Alt with the key."
       return
     }
@@ -231,6 +242,7 @@ Rectangle {
   MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: if (!recorder.listening) recorder.start() }
 
   Row {
+    id: caps
     x: 10
     anchors.verticalCenter: parent.verticalCenter
     spacing: 6
@@ -238,23 +250,33 @@ Rectangle {
       model: recorder.labels
       Keycap { required property string modelData; anchors.verticalCenter: parent.verticalCenter; compact: true; text: modelData }
     }
-    UiText {
-      anchors.verticalCenter: parent.verticalCenter
-      visible: recorder.labels.length === 0 || recorder.listening
-      leftPadding: recorder.labels.length > 0 ? 4 : 0
-      font.pixelSize: 13
-      text: !recorder.listening ? "Click, then press the keys"
-        : recorder.mode === "chord" ? (recorder.held.length > 0 ? "Let go to finish" : "Hold the keys together, then let go")
-        : recorder.pending.length > 0 ? "…and one more key" : "Press the shortcut"
-      muted: true
-    }
   }
   UiText {
+    id: prompt
+    anchors.left: caps.right
+    anchors.leftMargin: recorder.labels.length > 0 ? 10 : 0
+    anchors.verticalCenter: parent.verticalCenter
+    width: Math.max(0, Math.min(implicitWidth, (keysHintText.visible ? keysHintText.x - 12 : recorder.width - 14) - x))
+    elide: Text.ElideRight
+    visible: recorder.labels.length === 0 || recorder.listening
+    font.pixelSize: 13
+    text: !recorder.listening ? "Click, then press the keys"
+      : recorder.mode === "chord" ? (recorder.held.length > 0 ? "Let go to finish" : "Hold the keys together, then let go")
+      : recorder.pending.length > 0 ? "…and one more key" : "Press the shortcut"
+    muted: true
+  }
+  // Where the first prompt and this hint don't both fit, the hint is left to
+  // the caller to show under the recorder, rather than covering the prompt.
+  readonly property string keysHint: allowClear ? "Esc to cancel, Backspace to turn off" : "Esc to cancel"
+  readonly property bool keysHintFits: firstPrompt.advanceWidth + keysHintText.implicitWidth + 36 <= width
+  TextMetrics { id: firstPrompt; font: prompt.font; text: recorder.mode === "chord" ? "Hold the keys together, then let go" : "Press the shortcut" }
+  UiText {
+    id: keysHintText
     anchors.right: parent.right
     anchors.rightMargin: 14
     anchors.verticalCenter: parent.verticalCenter
-    visible: recorder.listening
-    text: recorder.allowClear ? "Esc to cancel, Backspace to turn off" : "Esc to cancel"
+    visible: recorder.listening && recorder.keysHintFits
+    text: recorder.keysHint
     muted: true
     font.pixelSize: 12
   }

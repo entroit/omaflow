@@ -13,10 +13,19 @@ Rectangle {
   width: parent ? parent.width - (parent.leftPadding || 0) - (parent.rightPadding || 0) : 164
   height: nested ? 28 : 32
   radius: height / 2
-  color: selected ? Theme.fill18 : mouse.containsMouse ? Theme.fill8 : "transparent"
+  color: selected ? Theme.fill18 : mouse.containsMouse ? Theme.hover : "transparent"
   activeFocusOnTab: true
-  border.width: activeFocus ? 2 : 0
-  border.color: Theme.accent
+
+  // The focus ring sits outside, as on every button.
+  Rectangle {
+    anchors.fill: parent
+    anchors.margins: -3
+    radius: height / 2
+    color: "transparent"
+    border.width: 2
+    border.color: Theme.accent
+    visible: item.activeFocus
+  }
 
   UiText {
     x: item.nested ? 24 : 12
@@ -38,7 +47,9 @@ Rectangle {
   MouseArea { id: mouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: item.clicked() }
   Keys.onReturnPressed: item.clicked()
   Keys.onSpacePressed: item.clicked()
-  Accessible.role: Accessible.PageTab
-  Accessible.name: item.text
+  // Advanced opens and closes a group; the rest are pages.
+  Accessible.role: item.expander ? Accessible.Button : Accessible.PageTab
+  Accessible.name: item.text + (item.expander ? (item.expanded ? ", expanded" : ", collapsed") : "")
   Accessible.selected: item.selected
+  Accessible.onPressAction: item.clicked()
 }

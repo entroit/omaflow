@@ -9,6 +9,8 @@ Rectangle {
   property string current: ""
   property int size: 13
   property real horizontalPadding: 16
+  // What the choice is about, read out before the options: "Cleanup".
+  property string name: ""
   signal picked(string value)
 
   implicitWidth: row.implicitWidth + 6
@@ -17,6 +19,8 @@ Rectangle {
   color: "transparent"
   border.width: 1
   border.color: Theme.outline
+  Accessible.role: Accessible.Grouping
+  Accessible.name: name
 
   Row {
     id: row

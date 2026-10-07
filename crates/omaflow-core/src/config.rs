@@ -32,13 +32,29 @@ pub struct Config {
 /// at the end, where the date reader looks. Benchmarked by tools/todo_bench.py.
 pub const TODO_PROMPT: &str = include_str!("todo_prompt.txt");
 
-/// The to-do prompt shipped before, added after the dictation prompt; a
-/// personal copy of it exactly is replaced by the current one.
-const PREVIOUS_TODO_PROMPT: &str = "To-do mode: the speaker is listing things to do. After editing, write \
+/// Every to-do prompt shipped before the current one. A personal config holds
+/// a full copy of the defaults, so an exact copy of one of these is replaced
+/// by the current prompt, while a prompt you wrote yourself is kept. Add the
+/// old text here whenever todo_prompt.txt changes.
+const PREVIOUS_TODO_PROMPTS: [&str; 2] = [
+    // Before 0.19: added after the dictation prompt.
+    "To-do mode: the speaker is listing things to do. After editing, write \
 one task per line, each starting with \"- \". Split only where the speaker names separate actions; \
 keep each task in the speaker's own words, with its names, numbers and timing such as \"before \
 Friday\". Never add a task, a step, a detail or a heading, and never answer or do the tasks. One \
-task is one line.";
+task is one line.",
+    // 0.19.0: split well, cleaned numbers, addresses and terms poorly.
+    include_str!("todo_prompt_0_19_0.txt"),
+];
+
+/// The lead times offered for to-do reminders, in minutes.
+pub const REMIND_BEFORE_CHOICES: [u64; 5] = [0, 5, 15, 30, 60];
+
+fn is_previous_todo_prompt(prompt: &str) -> bool {
+    PREVIOUS_TODO_PROMPTS
+        .iter()
+        .any(|previous| previous.trim() == prompt.trim())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
@@ -47,6 +63,8 @@ pub struct Todos {
     pub folder: String,
     /// The cleanup model's whole prompt for a to-do take.
     pub prompt: String,
+    /// How many minutes before a to-do's time to remind you; 0 is at the time.
+    pub remind_before: u32,
 }
 
 impl Default for Todos {
@@ -54,6 +72,7 @@ impl Default for Todos {
         Self {
             folder: "~/Documents/To-dos".into(),
             prompt: TODO_PROMPT.into(),
+            remind_before: 0,
         }
     }
 }
@@ -171,6 +190,9 @@ pub struct Behavior {
     pub training_log_enabled: bool,
     pub max_recording_seconds: u64,
     pub meter_gate_db: i32,
+    /// Follow the room's noise to place the meter's voice threshold, instead
+    /// of `meter_gate_db`, which is kept as the manual value.
+    pub meter_gate_auto: bool,
     pub duck_audio_percent: u8,
     pub paste_mode: PasteMode,
     pub paste_shortcut: PasteShortcut,
@@ -380,6 +402,7 @@ impl Default for Behavior {
             keep_models_loaded: true,
             keep_dictation_audio: false,
             meter_gate_db: -60,
+            meter_gate_auto: true,
             duck_audio_percent: 70,
             paste_mode: PasteMode::Auto,
             paste_shortcut: PasteShortcut::default(),
@@ -396,7 +419,7 @@ impl Default for Backend {
             model: "parakeet-tdt-0.6b-v3".into(),
             language: "auto".into(),
             health_endpoint: String::new(),
-            device: "cuda".into(),
+            device: "auto".into(),
             api_key: String::new(),
         }
     }
@@ -480,8 +503,12 @@ impl Config {
         if path.exists() {
             let text = fs::read_to_string(&path)
                 .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-            let overrides: toml::Value =
-                toml::from_str(&text).map_err(|e| format!("invalid {}: {e}", path.display()))?;
+            let overrides: toml::Value = toml::from_str(&text).map_err(|e| {
+                format!(
+                    "{} is not valid. Fix it and save the file: {e}",
+                    path.display()
+                )
+            })?;
             merge_toml(&mut merged, overrides);
         }
         let mut config: Self = merged
@@ -490,7 +517,7 @@ impl Config {
         if is_previous_bundled_cleanup_prompt(&config.cleanup.system_prompt) {
             config.cleanup.system_prompt = bundled_prompt;
         }
-        if config.todos.prompt.trim() == PREVIOUS_TODO_PROMPT {
+        if is_previous_todo_prompt(&config.todos.prompt) {
             config.todos.prompt = TODO_PROMPT.trim().to_string();
         }
         if config.cleanup.engine == "ollama"
@@ -622,6 +649,18 @@ impl Config {
             Self::write_values(&updates)?;
             return Self::load();
         }
+        if key == "todos_remind_before" {
+            let minutes = value
+                .as_u64()
+                .filter(|minutes| REMIND_BEFORE_CHOICES.contains(minutes))
+                .ok_or("Remind at the time, or 5, 15, 30 or 60 minutes before")?;
+            Self::write_values(&[(
+                "todos",
+                "remind_before",
+                toml::Value::Integer(minutes as i64),
+            )])?;
+            return Self::load();
+        }
         if key == "todos_folder" {
             let folder = value.as_str().ok_or("Enter a folder")?.trim();
             if folder.is_empty()
@@ -687,7 +726,8 @@ impl Config {
             | "history_limit"
             | "duck_audio_percent"
             | "keep_models_loaded"
-            | "keep_dictation_audio" => "behavior",
+            | "keep_dictation_audio"
+            | "meter_gate_auto" => "behavior",
             "enabled" | "use_window_context" | "use_clipboard_context" | "style" => "cleanup",
             _ => return Err("Unknown setting".into()),
         };
@@ -744,6 +784,9 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if !REMIND_BEFORE_CHOICES.contains(&u64::from(self.todos.remind_before)) {
+            return Err("[todos] remind_before must be 0, 5, 15, 30 or 60".into());
+        }
         self.behavior.paste_shortcut.validate()?;
         let keys = &self.shortcut.keys;
         if keys.is_empty()
@@ -969,7 +1012,7 @@ fn complete_config(text: &str) -> Result<String, String> {
         && todos
             .get("prompt")
             .and_then(toml_edit::Item::as_str)
-            .is_some_and(|prompt| prompt.trim() == PREVIOUS_TODO_PROMPT)
+            .is_some_and(is_previous_todo_prompt)
     {
         todos["prompt"] = defaults["todos"]["prompt"].clone();
     }
@@ -1018,7 +1061,7 @@ fn replace_toml_key(text: &str, section: &str, key: &str, value: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, PREVIOUS_TODO_PROMPT, PasteModifier, PasteShortcut, TODO_PROMPT, complete_config,
+        Config, PREVIOUS_TODO_PROMPTS, PasteModifier, PasteShortcut, TODO_PROMPT, complete_config,
         replace_toml_key,
     };
 
@@ -1143,10 +1186,12 @@ mod tests {
 
     #[test]
     fn the_shipped_to_do_prompt_replaces_the_old_one_but_never_a_custom_one() {
-        let old = format!("[todos]\nprompt = {:?}\n", PREVIOUS_TODO_PROMPT);
-        let completed = complete_config(&old).unwrap();
-        let config: Config = toml::from_str(&completed).unwrap();
-        assert_eq!(config.todos.prompt.trim(), TODO_PROMPT.trim());
+        for previous in PREVIOUS_TODO_PROMPTS {
+            let old = format!("[todos]\nprompt = {:?}\n", previous);
+            let completed = complete_config(&old).unwrap();
+            let config: Config = toml::from_str(&completed).unwrap();
+            assert_eq!(config.todos.prompt.trim(), TODO_PROMPT.trim());
+        }
         let custom = complete_config("[todos]\nprompt = 'My own to-do rules'\n").unwrap();
         let config: Config = toml::from_str(&custom).unwrap();
         assert_eq!(config.todos.prompt, "My own to-do rules");
@@ -1187,6 +1232,20 @@ mod tests {
                 .unwrap()
                 .contains("[section-like prompt]")
         );
+    }
+
+    #[test]
+    fn existing_configs_get_the_automatic_voice_threshold() {
+        // A config written before the setting existed has no key for it, so
+        // filling in the defaults turns it on and keeps the manual value.
+        let completed = complete_config("[behavior]\nmeter_gate_db = -52\n").unwrap();
+        let config: Config = toml::from_str(&completed).unwrap();
+        assert!(config.behavior.meter_gate_auto);
+        assert_eq!(config.behavior.meter_gate_db, -52);
+        assert!(Config::default().behavior.meter_gate_auto);
+        let behavior: super::Behavior = toml::from_str("meter_gate_auto = false").unwrap();
+        assert!(!behavior.meter_gate_auto);
+        assert!(toml::from_str::<super::Behavior>("meter_gate_auto = 'yes'").is_err());
     }
 
     #[test]

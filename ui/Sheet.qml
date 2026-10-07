@@ -47,5 +47,17 @@ Item {
     }
   }
 
-  onOpenChanged: if (open) scope.forceActiveFocus()
+  // Closed, the keyboard goes back to what opened it, as for a menu, so the
+  // page's own keys work again at once.
+  property Item returnFocus: null
+  onOpenChanged: {
+    if (open) {
+      returnFocus = Window.activeFocusItem
+      scope.forceActiveFocus()
+    } else if (returnFocus) {
+      var item = returnFocus
+      returnFocus = null
+      if (item.visible) item.forceActiveFocus()
+    }
+  }
 }

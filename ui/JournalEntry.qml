@@ -14,6 +14,8 @@ Rectangle {
   property var playback: null      // the daemon's journal_playback, if any
   property real nowMs: Date.now()
   property bool editing: false
+  // Words typed in the editor before the row was rebuilt, or "".
+  property string draft: ""
   property bool spoken: false      // showing the words as spoken
   property bool current: false     // keyboard cursor
   signal editRequested()
@@ -36,6 +38,13 @@ Rectangle {
   readonly property bool note: String(entry.written || "").length > 0
   property bool openedEarly: false
   readonly property bool sealed: note && today.length > 0 && date > today && !openedEarly
+  // Added later to a past day: the day it was really written, or "".
+  readonly property string added: String(entry.added || "")
+  readonly property string addedDay: added ? Dates.long(added, today || added) : ""
+  readonly property string addedText: added ? (entry.typed ? "Typed, added " : "Added ") + addedDay : ""
+  // How the entry's buttons name it: "entry from 12:15", or for a note the
+  // day it was written.
+  readonly property string named: note ? "note from " + Dates.full(entry.written) : "entry from " + entry.time
 
   width: ListView.view ? ListView.view.width : implicitWidth
   implicitHeight: body.implicitHeight + 28
@@ -107,17 +116,22 @@ Rectangle {
       wrapMode: TextEdit.Wrap
       selectByMouse: true
       selectionColor: Theme.alpha(Theme.accent, 0.4)
+      selectedTextColor: Theme.text
       padding: 10
       background: Rectangle { radius: Theme.radiusInput; color: Theme.background; border.width: 1; border.color: Theme.accent }
+      // As in the composer: Enter saves, Shift+Enter starts a new line.
       Keys.onEscapePressed: row.cancelRequested()
       Keys.onPressed: function(event) {
-        if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && (event.modifiers & Qt.ControlModifier)) {
+        if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && !(event.modifiers & Qt.ShiftModifier)) {
           row.saveRequested(editor.text)
           event.accepted = true
         }
       }
-      onVisibleChanged: if (visible) { text = row.entry.text; forceActiveFocus(); cursorPosition = length }
-      Accessible.name: "Edit entry"
+      function begin() { text = row.draft || row.entry.text; forceActiveFocus(); cursorPosition = length }
+      onVisibleChanged: if (visible) begin()
+      // Rebuilt while editing, such as after a failed save: the words come back.
+      Component.onCompleted: if (row.editing) Qt.callLater(begin)
+      Accessible.name: "Edit " + row.named
     }
 
     UiText {
@@ -127,21 +141,25 @@ Rectangle {
       font.pixelSize: 12
     }
     UiText {
-      visible: row.entry.typed && !row.editing && !row.note
-      text: "Typed"
+      visible: (row.entry.typed || row.added) && !row.editing && !row.note
+      text: row.addedText || "Typed"
       muted: true
       font.pixelSize: 12
     }
 
     Item {
+      id: controls
       width: parent.width
-      height: 26
+      // Where the actions would cover the recording, such as while it plays
+      // or in a narrow window, they move to a line of their own under it.
+      readonly property bool stacked: player.visible && actionsRow.visible && player.width + actionsRow.width + 6 > width
+      height: stacked ? 26 + 8 + 26 : 26
       visible: !row.sealed && (!row.entry.typed || row.editing || row.showActions)
 
       Row {
         id: player
         visible: !row.editing && !row.entry.typed
-        anchors.verticalCenter: parent.verticalCenter
+        y: (26 - height) / 2
         spacing: 10
 
         Rectangle {
@@ -169,7 +187,7 @@ Rectangle {
           Keys.onSpacePressed: row.togglePlay()
           Keys.onReturnPressed: row.togglePlay()
           Accessible.role: Accessible.Button
-          Accessible.name: row.playing ? "Pause recording" : "Play recording"
+          Accessible.name: (row.playing ? "Pause the recording of " : "Play the recording of ") + row.named
         }
 
         Waveform {
@@ -198,27 +216,41 @@ Rectangle {
           // Figures only stop jittering where they count up.
           font.features: row.playing ? { "tnum": 1 } : {}
         }
+        // The waveform is kept, the sound is not: say why there is no play.
+        UiText {
+          visible: !row.entry.audio
+          anchors.verticalCenter: parent.verticalCenter
+          text: "Recording not kept"
+          muted: true
+          font.pixelSize: 12
+        }
       }
 
       Row {
         id: actionsRow
         anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
+        y: (controls.stacked ? 26 + 8 : 0) + (26 - height) / 2
         spacing: 6
         opacity: row.showActions ? 1 : 0
         visible: opacity > 0
         Behavior on opacity { NumberAnimation { duration: 120 } }
 
-        Pill { visible: !row.editing; kind: "fill"; text: "Edit"; verticalPadding: 4; horizontalPadding: 11; onClicked: row.editRequested() }
-        Pill { visible: !row.editing; kind: "fill"; text: "Copy"; verticalPadding: 4; horizontalPadding: 11; onClicked: row.copyRequested() }
+        Pill { visible: !row.editing; kind: "fill"; text: "Edit"; Accessible.name: "Edit " + row.named; verticalPadding: 4; horizontalPadding: 11; onClicked: row.editRequested() }
+        Pill { visible: !row.editing; kind: "fill"; text: "Copy"; Accessible.name: "Copy " + row.named; verticalPadding: 4; horizontalPadding: 11; onClicked: row.copyRequested() }
         Pill {
           visible: !row.editing && !row.entry.typed && Boolean(row.entry.raw_text) && row.entry.raw_text !== row.entry.text
           kind: "fill"; text: "As spoken"; verticalPadding: 4; horizontalPadding: 11
+          Accessible.name: "Show " + row.named + " as spoken"
+          Accessible.checkable: true
+          Accessible.checked: row.spoken
           selected: row.spoken
           onClicked: row.spoken = !row.spoken
         }
-        Pill { visible: !row.editing; kind: "danger"; text: "Delete"; verticalPadding: 4; horizontalPadding: 11; onClicked: row.deleteRequested() }
-        Pill { visible: row.editing; kind: "fill"; text: "Cancel"; verticalPadding: 4; horizontalPadding: 11; onClicked: row.cancelRequested() }
+        Pill { visible: !row.editing; kind: "danger"; text: "Delete"; Accessible.name: "Delete " + row.named; verticalPadding: 4; horizontalPadding: 11; onClicked: row.deleteRequested() }
+        // Enter saves, so say how to start a new paragraph, as the composer does.
+        UiText { visible: row.editing; anchors.verticalCenter: parent.verticalCenter; rightPadding: 6; text: "Shift+Enter for a new line"; muted: true; font.pixelSize: 12 }
+        // Throws the changes away, as Discard does for a dictation in History.
+        Pill { visible: row.editing; kind: "fill"; text: "Discard"; shortcut: "Esc"; verticalPadding: 4; horizontalPadding: 11; onClicked: row.cancelRequested() }
         Pill { visible: row.editing; kind: "primary"; text: "Save"; verticalPadding: 4; horizontalPadding: 11; onClicked: row.saveRequested(editor.text) }
       }
     }
@@ -238,5 +270,8 @@ Rectangle {
   onPlayingChanged: if (playing) pausedAt = 0
 
   Accessible.role: Accessible.ListItem
-  Accessible.name: row.entry.time + ". " + row.entry.text
+  // A sealed note keeps its words to itself here too.
+  Accessible.name: row.sealed ? "Sealed note, opens " + Dates.long(row.date, row.today)
+    : row.note ? "Note from " + Dates.full(row.entry.written) + ". " + row.entry.text
+    : row.entry.time + (row.added ? (row.entry.typed ? ", typed, added " : ", added ") + row.addedDay : "") + ". " + row.entry.text
 }

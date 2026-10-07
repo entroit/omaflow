@@ -7,6 +7,9 @@ import "../ui"
 Item {
   width: 400; height: 100
   KeyRecorder { id: rec; width: 400; mode: "binding" }
+  // Where Tab goes from the recorder.
+  Rectangle { id: next; y: 50; width: 40; height: 20; activeFocusOnTab: true }
+  SignalSpy { id: cancelled; target: rec; signalName: "cancelled" }
   TestCase {
     name: "KeyRecorder"; when: windowShown
     function test_binding() {
@@ -63,6 +66,39 @@ Item {
       keyClick(Qt.Key_J, Qt.MetaModifier)
       compare(rec.value, "SUPER + J")
       keyRelease(Qt.Key_Meta)
+    }
+    function test_tab_leaves_and_cancels() {
+      rec.value = ""; rec.start()
+      cancelled.clear()
+      keyClick(Qt.Key_Tab)
+      verify(next.activeFocus, "Tab moves on, as from any control")
+      compare(rec.value, "")
+      compare(cancelled.count, 1, "leaving cancels, like Esc")
+      verify(!rec.endedByKey, "the caller does not pull focus back")
+      rec.start()
+      keyClick(Qt.Key_Tab, Qt.MetaModifier)
+      compare(rec.value, "SUPER + Tab", "with a modifier it is still a shortcut")
+      verify(rec.endedByKey, "a recorded shortcut hands focus back")
+    }
+    function test_esc_hands_focus_back() {
+      rec.start()
+      verify(!rec.endedByKey)
+      keyClick(Qt.Key_Escape)
+      verify(rec.endedByKey)
+    }
+    function test_a_bare_key_is_named_as_the_table_shows_it() {
+      rec.value = ""; rec.allowBare = true; rec.start()
+      keyClick(Qt.Key_Minus)
+      compare(rec.value, "")
+      verify(rec.problem.indexOf("the - key") >= 0, rec.problem)
+      keyClick(Qt.Key_Escape)
+    }
+    function test_the_esc_hint_leaves_room_for_the_prompt() {
+      rec.allowClear = false
+      verify(rec.keysHintFits, "beside the prompt at 400 px")
+      rec.width = 200
+      verify(!rec.keysHintFits, "left to the caller where both don't fit")
+      rec.width = 400
     }
     function test_needs_a_modifier() {
       rec.value = ""; rec.start()

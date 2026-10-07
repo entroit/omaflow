@@ -1,18 +1,18 @@
 {
   "schemaVersion": 1,
   "pluginId": "entroit.omaflow",
-  "version": "0.19.0",
-  "summary": "A new window, a journal you can talk to, and spoken to-dos.",
+  "version": "0.20.0",
+  "summary": "Reminders in one click, a calmer to-do list, and nothing you say gets lost.",
   "changes": [
-    "Browse history, the journal and to-dos in one window that follows your theme",
-    "Talk to your journal, and speak to-dos into lists with dates, times and reminders",
-    "Try a failed transcription again from the same recording"
+    "Choose when each to-do reminds you in one click, and finish or push back a reminder right from Today",
+    "Add journal entries to past days, and if turning speech into text fails, your recording waits in History so you never say it twice",
+    "Works on computers without an NVIDIA graphics card, with clearer messages on every screen"
   ],
   "binary": {
     "target": "x86_64-unknown-linux-gnu",
     "path": "dist/bin/x86_64-unknown-linux-gnu/omaflow",
-    "bytes": 2561384,
-    "sha256": "35f10b4c94db810085f8d46393879ff25ae8266d0390e28ddaa598de65d3fac3"
+    "bytes": 2780704,
+    "sha256": "4b0df6b971988ac42725ef274cdb059bf2d0db64eb72c3c6235dc231d16809e8"
   },
   "stateSchemaVersion": 4
 }

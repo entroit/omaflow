@@ -9,6 +9,9 @@ Item {
   property string caption: ""
   property bool last: false
   property bool alignTop: false
+  // A switch in the slot: its title and caption flip it too, so the words
+  // are a click target and not only the small switch.
+  property Item toggle: null
   default property alias control: slot.data
 
   width: parent ? parent.width : 600
@@ -21,6 +24,12 @@ Item {
     spacing: 3
     UiText { width: parent.width; text: row.title; font.pixelSize: 14; weight: Font.DemiBold; wrapMode: Text.Wrap }
     UiText { width: parent.width; visible: row.caption.length > 0; text: row.caption; muted: true; font.pixelSize: 12; wrapMode: Text.Wrap }
+  }
+  MouseArea {
+    anchors.fill: labels
+    enabled: row.toggle !== null && row.toggle.visible
+    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+    onClicked: row.toggle.toggled()
   }
 
   Item {

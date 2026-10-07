@@ -1,7 +1,7 @@
-use crate::cleanup::cleanup;
+use crate::cleanup::{Fallback, cleanup};
 pub use crate::cleanup::{cleanup_text, evaluate_text};
 use crate::{
-    config::{Config, JournalCleanup, PasteDelivery, PasteMode},
+    config::{Config, JournalCleanup, PasteDelivery, PasteMode, PasteShortcut},
     vocabulary,
 };
 use omaflow_core::{journal, todos};
@@ -9,7 +9,7 @@ use omaflow_platform::desktop::{
     ClipboardSnapshot, DELIVERY_LOCK, active_window, active_window_matches, paste, read_clipboard,
     set_clipboard,
 };
-pub use omaflow_platform::desktop::{copy_text, paste_text_now};
+pub use omaflow_platform::desktop::{copy_text, paste_shortcut, paste_text_now};
 use omaflow_platform::process::CommandExt;
 use serde_json::Value;
 use std::{
@@ -36,12 +36,30 @@ const METER_BARS: usize = 13;
 const METER_SILENCE: &[u8] =
     b"0.000 -96.0 0 0.000 0.000 0.000 0.000 0.000 0.000 0.000 0.000 0.000 0.000 0.000 0.000 0.000\n";
 const METER_FLOOR_DBFS: f32 = -72.0;
+/// The range a voice threshold may take, manual or automatic.
+const GATE_MIN_DB: f32 = -70.0;
+const GATE_MAX_DB: f32 = -35.0;
+/// How far above the room's noise a sound must reach to count as a voice.
+/// Steady noise wobbles about 5 dB either way from one short frame to the
+/// next, which needs a margin above 9 dB to stay off; soft speech, 15 dB above
+/// the room, needs one below 13 dB to light the meter. 12 dB leaves the most
+/// room for noisier rooms, and the tests below check both ends.
+const AUTO_GATE_MARGIN_DB: f32 = 12.0;
+/// The floor rises this slowly, so words, which last well under a second,
+/// barely move it, while a fan switched on is learned in a few seconds.
+const FLOOR_RISE_DB_PER_SECOND: f32 = 3.0;
+/// The floor falls to a quieter level within about this long. Every pause
+/// between words pulls it back down to the room.
+const FLOOR_FALL_SECONDS: f32 = 0.15;
 
 #[derive(Debug)]
 pub struct Transcript {
     pub text: String,
     pub raw_text: String,
     pub pasted: bool,
+    /// The shortcut that pastes into the window the take was for, which
+    /// the card names when the paste did not get there. None when only copied.
+    pub paste_shortcut: Option<PasteShortcut>,
     pub delivery_error: String,
     pub cleanup_warning: String,
     /// The recording as a WAV file, when dictation audio is kept.
@@ -62,7 +80,7 @@ pub struct JournalTranscript {
 
 /// How a journal take is finished: tidied to the journal's own level and
 /// written down rather than pasted.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct JournalTake {
     pub cleanup: JournalCleanup,
     pub keep_recording: bool,
@@ -75,10 +93,14 @@ pub struct TodoTranscript {
     pub cleanup_warning: String,
 }
 
-/// Where a finished take goes: pasted, the journal, or the to-do list.
-#[derive(Debug, Clone, Copy)]
+/// Where a finished take goes: pasted, the journal, the to-do list, or only
+/// History.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Take {
     Paste,
+    /// A dictation transcribed again from History: cleaned up the same way,
+    /// but neither pasted nor copied, since the window it was for is gone.
+    History,
     Journal(JournalTake),
     Todos,
 }
@@ -88,7 +110,12 @@ pub enum StopOutcome {
     Transcript(Transcript),
     Journal(JournalTranscript),
     Todos(TodoTranscript),
-    NoSpeech,
+    /// No words came of the take. `heard` is true when the meter caught a
+    /// voice all the same, so the card can say to come closer rather than to
+    /// check the microphone.
+    NoSpeech {
+        heard: bool,
+    },
 }
 
 pub struct ProcessingSession {
@@ -110,7 +137,7 @@ impl ProcessingSession {
 
 pub struct Runtime {
     config: Config,
-    meter_gate_db: Arc<AtomicI32>,
+    meter_gate: MeterGate,
     recording: Option<CaptureSession>,
     completed_recording: Option<CapturedAudio>,
     /// A recording whose transcription failed, kept in memory (never on
@@ -134,9 +161,74 @@ const IDLE_RELEASE: Duration = Duration::from_secs(5 * 60);
 /// Wait between release attempts when Ollama or systemd did not comply.
 const RELEASE_RETRY: Duration = Duration::from_secs(30);
 
+/// The meter's voice threshold, shared with the capture threads so Settings
+/// can change it while the microphone is open.
+#[derive(Clone)]
+struct MeterGate {
+    manual_db: Arc<AtomicI32>,
+    auto: Arc<AtomicBool>,
+    /// The room's noise floor in hundredths of a dB, kept from one recording
+    /// to the next so each starts from the room it last heard.
+    floor_centi_db: Arc<AtomicI32>,
+}
+
+impl MeterGate {
+    fn new(manual_db: i32, auto: bool) -> Self {
+        let manual_db = manual_db.clamp(GATE_MIN_DB as i32, GATE_MAX_DB as i32);
+        // The manual threshold was set just above the room's noise, so taken
+        // as the floor it starts the gate a little high, where a quieter room
+        // pulls it down within a fraction of a second.
+        let floor = NoiseFloor::new(manual_db as f32);
+        Self {
+            manual_db: Arc::new(AtomicI32::new(manual_db)),
+            auto: Arc::new(AtomicBool::new(auto)),
+            floor_centi_db: Arc::new(AtomicI32::new((floor.db * 100.0).round() as i32)),
+        }
+    }
+}
+
+/// An estimate of the room's noise: it follows the level down quickly and
+/// rises slowly, so speech does not drag it up.
+#[derive(Clone, Copy)]
+struct NoiseFloor {
+    db: f32,
+}
+
+impl NoiseFloor {
+    fn new(db: f32) -> Self {
+        Self {
+            db: db.clamp(
+                GATE_MIN_DB - AUTO_GATE_MARGIN_DB,
+                GATE_MAX_DB - AUTO_GATE_MARGIN_DB,
+            ),
+        }
+    }
+
+    fn update(&mut self, dbfs: f32, seconds: f32) {
+        // Exact digital silence, from a muted or just-opened stream, says
+        // nothing about the room.
+        if dbfs <= -96.0 {
+            return;
+        }
+        let db = if dbfs < self.db {
+            self.db + (dbfs - self.db) * (seconds / FLOOR_FALL_SECONDS).min(1.0)
+        } else {
+            (self.db + FLOOR_RISE_DB_PER_SECOND * seconds).min(dbfs)
+        };
+        *self = Self::new(db);
+    }
+
+    fn gate_db(self) -> f32 {
+        (self.db + AUTO_GATE_MARGIN_DB).clamp(GATE_MIN_DB, GATE_MAX_DB)
+    }
+}
+
 struct AudioMeter {
     file: fs::File,
-    gate_db: Arc<AtomicI32>,
+    gate: MeterGate,
+    floor: NoiseFloor,
+    /// The threshold in use, manual or automatic, written for the marker.
+    gate_db: f32,
     smoothed: f32,
     bars: [f32; METER_BARS],
     display_dbfs: f32,
@@ -151,6 +243,8 @@ struct AudioMeter {
 pub struct CapturedAudio {
     file: fs::File,
     pcm_bytes: usize,
+    /// The meter caught a voice at some point in the recording.
+    heard: bool,
 }
 
 const BYTES_PER_SECOND: usize = 32_000;
@@ -177,7 +271,11 @@ impl CapturedAudio {
         let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
         file.write_all(&[0; 44])
             .map_err(|error| format!("could not initialize recording memory: {error}"))?;
-        Ok(Self { file, pcm_bytes: 0 })
+        Ok(Self {
+            file,
+            pcm_bytes: 0,
+            heard: false,
+        })
     }
 
     fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -201,7 +299,7 @@ impl CapturedAudio {
     }
 
     /// The whole recording as a WAV file, header included.
-    fn wav_bytes(&self) -> Result<Vec<u8>, String> {
+    pub fn wav_bytes(&self) -> Result<Vec<u8>, String> {
         let mut file = &self.file;
         let mut bytes = Vec::with_capacity(44 + self.pcm_bytes);
         file.seek(SeekFrom::Start(0))
@@ -219,7 +317,7 @@ impl CapturedAudio {
 }
 
 impl AudioMeter {
-    fn open(gate_db: Arc<AtomicI32>) -> Result<Self, String> {
+    fn open(gate: MeterGate) -> Result<Self, String> {
         let path = meter_path();
         let file = fs::OpenOptions::new()
             .create(true)
@@ -229,8 +327,16 @@ impl AudioMeter {
             .mode(0o600)
             .open(&path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
+        let floor = NoiseFloor::new(gate.floor_centi_db.load(Ordering::Relaxed) as f32 / 100.0);
+        let gate_db = if gate.auto.load(Ordering::Relaxed) {
+            floor.gate_db()
+        } else {
+            gate.manual_db.load(Ordering::Relaxed) as f32
+        };
         let mut meter = Self {
             file,
+            gate,
+            floor,
             gate_db,
             smoothed: 0.0,
             bars: [0.0; METER_BARS],
@@ -260,9 +366,18 @@ impl AudioMeter {
             })
             .sum::<f32>();
         let dbfs = rms_dbfs((sum_squares / count as f32).sqrt());
-        let gate_db = self.gate_db.load(Ordering::Relaxed);
+        self.floor
+            .update(dbfs, pcm.len() as f32 / BYTES_PER_SECOND as f32);
+        self.gate
+            .floor_centi_db
+            .store((self.floor.db * 100.0).round() as i32, Ordering::Relaxed);
+        self.gate_db = if self.gate.auto.load(Ordering::Relaxed) {
+            self.floor.gate_db()
+        } else {
+            self.gate.manual_db.load(Ordering::Relaxed) as f32
+        };
         let target = meter_level(dbfs);
-        let above_threshold = voice_above_threshold(dbfs, gate_db);
+        let above_threshold = voice_above_threshold(dbfs, self.gate_db);
         if above_threshold {
             self.voice_hold_frames = 3;
         } else {
@@ -315,10 +430,11 @@ impl AudioMeter {
         for bar in self.bars {
             payload.push_str(&format!(" {bar:.3}"));
         }
-        payload.push('\n');
+        payload.push_str(&format!(" {:.0}\n", self.gate_db));
         self.file
             .seek(SeekFrom::Start(0))
             .and_then(|_| self.file.write_all(payload.as_bytes()))
+            .and_then(|_| self.file.set_len(payload.len() as u64))
             .map_err(|error| error.to_string())?;
         self.last_published = level;
         self.last_published_bars = self.bars;
@@ -332,6 +448,7 @@ impl Drop for AudioMeter {
     fn drop(&mut self) {
         let _ = self.file.seek(SeekFrom::Start(0));
         let _ = self.file.write_all(METER_SILENCE);
+        let _ = self.file.set_len(METER_SILENCE.len() as u64);
     }
 }
 
@@ -346,8 +463,8 @@ fn meter_level(dbfs: f32) -> f32 {
     ((dbfs - METER_FLOOR_DBFS) / -METER_FLOOR_DBFS).clamp(0.0, 1.0)
 }
 
-fn voice_above_threshold(dbfs: f32, gate_db: i32) -> bool {
-    dbfs > gate_db.clamp(-70, -35) as f32
+fn voice_above_threshold(dbfs: f32, gate_db: f32) -> bool {
+    dbfs > gate_db.clamp(GATE_MIN_DB, GATE_MAX_DB)
 }
 
 fn meter_path() -> PathBuf {
@@ -391,8 +508,8 @@ struct MeterPreviewSession {
 impl Runtime {
     pub fn new(config: Config, meter_gate_db: i32) -> Self {
         Self {
+            meter_gate: MeterGate::new(meter_gate_db, config.behavior.meter_gate_auto),
             config,
-            meter_gate_db: Arc::new(AtomicI32::new(meter_gate_db.clamp(-70, -35))),
             recording: None,
             completed_recording: None,
             kept: Arc::default(),
@@ -451,8 +568,10 @@ impl Runtime {
     }
 
     pub fn set_meter_gate(&self, gate_db: i32) {
-        self.meter_gate_db
-            .store(gate_db.clamp(-70, -35), Ordering::Relaxed);
+        self.meter_gate.manual_db.store(
+            gate_db.clamp(GATE_MIN_DB as i32, GATE_MAX_DB as i32),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn set_paste_delivery(&mut self, delivery: PasteDelivery) {
@@ -476,6 +595,9 @@ impl Runtime {
         let was_managed = self.config.backend.managed() && self.config.behavior.models_configured;
         let managed = config.backend.managed() && config.behavior.models_configured;
         self.set_meter_gate(config.behavior.meter_gate_db);
+        self.meter_gate
+            .auto
+            .store(config.behavior.meter_gate_auto, Ordering::Relaxed);
         self.config = config;
         if keep_turned_on {
             self.touch();
@@ -532,7 +654,7 @@ impl Runtime {
         if self.preview.is_some() || self.recording.is_some() {
             return Ok(());
         }
-        self.preview = Some(start_meter_preview(Arc::clone(&self.meter_gate_db))?);
+        self.preview = Some(start_meter_preview(self.meter_gate.clone())?);
         Ok(())
     }
 
@@ -562,10 +684,7 @@ impl Runtime {
                 self.config.backend.engine
             ));
         }
-        self.recording = Some(start_recording(
-            &self.config,
-            Arc::clone(&self.meter_gate_db),
-        )?);
+        self.recording = Some(start_recording(&self.config, self.meter_gate.clone())?);
         self.completed_recording = None;
         Ok(())
     }
@@ -591,7 +710,25 @@ impl Runtime {
         self.stop(take)
     }
 
+    /// Transcribes a recording saved in History. It is on disk already, so
+    /// a failure leaves the in-memory slot to the take that owns it.
+    pub fn retry_saved(
+        &mut self,
+        path: &std::path::Path,
+        take: Take,
+    ) -> Result<ProcessingSession, String> {
+        if fake_transcript_override().is_none() {
+            self.completed_recording = Some(captured_audio_from_wav(path)?);
+        }
+        self.process(take, KeptRecording::default())
+    }
+
     pub fn stop(&mut self, take: Take) -> Result<ProcessingSession, String> {
+        let kept = Arc::clone(&self.kept);
+        self.process(take, kept)
+    }
+
+    fn process(&mut self, take: Take, kept: KeptRecording) -> Result<ProcessingSession, String> {
         let fake = fake_transcript_override();
         let recording = if fake.is_some() {
             None
@@ -603,7 +740,6 @@ impl Runtime {
             )?))
         };
         let config = self.config.clone();
-        let kept = Arc::clone(&self.kept);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
@@ -624,12 +760,13 @@ impl Runtime {
                     finish_todos(&config, text.to_string_lossy().into_owned(), &worker_cancel)
                 } else {
                     let raw_text = text.to_string_lossy().into_owned();
-                    let previous = if config.cleanup.use_clipboard_context {
+                    let pasting = take == Take::Paste;
+                    let previous = if pasting && config.cleanup.use_clipboard_context {
                         read_clipboard().unwrap_or_default()
                     } else {
                         ClipboardSnapshot::Empty
                     };
-                    let window = active_window();
+                    let window = if pasting { active_window() } else { None };
                     finish_transcript(
                         &config,
                         raw_text,
@@ -637,6 +774,7 @@ impl Runtime {
                         window.as_ref(),
                         (Duration::ZERO, Instant::now()),
                         &worker_cancel,
+                        pasting,
                     )
                 }
             } else {
@@ -707,10 +845,7 @@ pub fn warm_cleanup(config: &Config) {
     }
 }
 
-fn start_recording(
-    config: &Config,
-    meter_gate_db: Arc<AtomicI32>,
-) -> Result<CaptureSession, String> {
+fn start_recording(config: &Config, meter_gate: MeterGate) -> Result<CaptureSession, String> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (result_tx, result_rx) = mpsc::sync_channel(1);
     let control = Arc::new(AtomicU8::new(0));
@@ -718,7 +853,7 @@ fn start_recording(
     let config = config.clone();
 
     let worker = thread::spawn(move || {
-        let result = capture_audio(&config, &worker_control, &ready_tx, meter_gate_db);
+        let result = capture_audio(&config, &worker_control, &ready_tx, meter_gate);
         if let Err(error) = &result {
             let _ = ready_tx.send(Err(error.clone()));
         }
@@ -748,7 +883,7 @@ fn capture_audio(
     config: &Config,
     control: &AtomicU8,
     ready: &mpsc::SyncSender<Result<(), String>>,
-    meter_gate_db: Arc<AtomicI32>,
+    meter_gate: MeterGate,
 ) -> Result<CapturedAudio, String> {
     let mut capture = start_audio_capture()?;
     let mut audio = match capture.stdout.take() {
@@ -762,7 +897,7 @@ fn capture_audio(
         stop_audio_capture(&mut capture);
         return Err(format!("could not configure microphone capture: {error}"));
     }
-    let mut meter = match AudioMeter::open(meter_gate_db) {
+    let mut meter = match AudioMeter::open(meter_gate) {
         Ok(meter) => meter,
         Err(error) => {
             stop_audio_capture(&mut capture);
@@ -817,7 +952,7 @@ fn capture_audio(
                 return Err(format!("could not read microphone audio: {error}"));
             }
         };
-        meter.update(&buffer[..count]);
+        captured.heard |= meter.update(&buffer[..count]);
         if captured.pcm_bytes.saturating_add(count) > maximum_bytes {
             stop_audio_capture(&mut capture);
             return Err("microphone recording exceeded its configured size limit".into());
@@ -832,12 +967,12 @@ fn capture_audio(
     Ok(captured)
 }
 
-fn start_meter_preview(meter_gate_db: Arc<AtomicI32>) -> Result<MeterPreviewSession, String> {
+fn start_meter_preview(meter_gate: MeterGate) -> Result<MeterPreviewSession, String> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let control = Arc::new(AtomicU8::new(0));
     let worker_control = Arc::clone(&control);
     let worker = thread::spawn(move || {
-        if let Err(error) = capture_meter_preview(&worker_control, &ready_tx, meter_gate_db) {
+        if let Err(error) = capture_meter_preview(&worker_control, &ready_tx, meter_gate) {
             eprintln!("omaflow: microphone preview stopped: {error}");
         }
     });
@@ -860,7 +995,7 @@ fn start_meter_preview(meter_gate_db: Arc<AtomicI32>) -> Result<MeterPreviewSess
 fn capture_meter_preview(
     control: &AtomicU8,
     ready: &mpsc::SyncSender<Result<(), String>>,
-    meter_gate_db: Arc<AtomicI32>,
+    meter_gate: MeterGate,
 ) -> Result<(), String> {
     let mut capture = match start_audio_capture() {
         Ok(capture) => capture,
@@ -884,7 +1019,7 @@ fn capture_meter_preview(
         let _ = ready.send(Err(message.clone()));
         return Err(message);
     }
-    let mut meter = match AudioMeter::open(meter_gate_db) {
+    let mut meter = match AudioMeter::open(meter_gate) {
         Ok(meter) => meter,
         Err(error) => {
             stop_audio_capture(&mut capture);
@@ -1144,19 +1279,20 @@ fn stop_recording(
         }
     };
     if captured.is_empty() {
-        return Ok(StopOutcome::NoSpeech);
+        return Ok(StopOutcome::NoSpeech { heard: false });
     }
     if cancel.load(Ordering::Acquire) {
         return Err("dictation cancelled".into());
     }
+    let heard = captured.heard;
     // The recording is complete; if the speech engine fails it, keep it for
     // Try again.
     let raw_text = match ensure_speech_server(config)
         .and_then(|()| transcribe_audio(config, &captured, cancel))
     {
-        Ok(text) if text.trim().is_empty() => return Ok(StopOutcome::NoSpeech),
+        Ok(text) if text.trim().is_empty() => return Ok(StopOutcome::NoSpeech { heard }),
         Ok(text) => text,
-        Err(error) if error == EMPTY_TRANSCRIPT => return Ok(StopOutcome::NoSpeech),
+        Err(error) if error == EMPTY_TRANSCRIPT => return Ok(StopOutcome::NoSpeech { heard }),
         Err(error) => {
             if worth_retrying(&error)
                 && !cancel.load(Ordering::Acquire)
@@ -1168,26 +1304,30 @@ fn stop_recording(
         }
     };
     let backend_elapsed = backend_started.elapsed();
-    match take {
+    let mut outcome = match take {
         Take::Journal(journal) => {
-            return finish_journal(config, raw_text, Some(&captured), journal, cancel);
+            finish_journal(config, raw_text, Some(&captured), journal, cancel)?
         }
-        Take::Todos => return finish_todos(config, raw_text, cancel),
-        Take::Paste => {}
-    }
-
-    let mut outcome = finish_transcript(
-        config,
-        raw_text,
-        previous,
-        window.as_ref(),
-        (backend_elapsed, total_started),
-        cancel,
-    )?;
+        Take::Todos => finish_todos(config, raw_text, cancel)?,
+        Take::Paste | Take::History => finish_transcript(
+            config,
+            raw_text,
+            previous,
+            window.as_ref(),
+            (backend_elapsed, total_started),
+            cancel,
+            pasting,
+        )?,
+    };
     if config.behavior.keep_dictation_audio
         && let StopOutcome::Transcript(transcript) = &mut outcome
     {
         transcript.wav = captured.wav_bytes().ok();
+    }
+    // Cleanup that leaves nothing, or no to-dos in what was said, still
+    // heard a voice.
+    if let StopOutcome::NoSpeech { .. } = outcome {
+        outcome = StopOutcome::NoSpeech { heard };
     }
     Ok(outcome)
 }
@@ -1527,7 +1667,7 @@ fn finish_journal(
 ) -> Result<StopOutcome, String> {
     let spoken = vocabulary::apply(&raw_text, &config.cleanup.custom_vocabulary);
     if spoken.trim().is_empty() {
-        return Ok(StopOutcome::NoSpeech);
+        return Ok(StopOutcome::NoSpeech { heard: false });
     }
     let mut cleanup_warning = String::new();
     let text = match take.cleanup {
@@ -1541,7 +1681,8 @@ fn finish_journal(
                 Ok(_) => journal::tidy(&spoken),
                 Err(error) => {
                     eprintln!("omaflow: journal cleanup unavailable, using light cleanup: {error}");
-                    cleanup_warning = crate::cleanup::cleanup_warning_text(&error);
+                    cleanup_warning =
+                        crate::cleanup::cleanup_warning_text(&error, Fallback::Journal);
                     journal::tidy(&spoken)
                 }
             }
@@ -1581,7 +1722,7 @@ fn finish_todos(
 ) -> Result<StopOutcome, String> {
     let spoken = vocabulary::apply(&raw_text, &config.cleanup.custom_vocabulary);
     if spoken.trim().is_empty() {
-        return Ok(StopOutcome::NoSpeech);
+        return Ok(StopOutcome::NoSpeech { heard: false });
     }
     let mut cleanup_warning = String::new();
     let mut items = Vec::new();
@@ -1597,7 +1738,7 @@ fn finish_todos(
             Ok(cleaned) => items = todos::split(&cleaned),
             Err(error) => {
                 eprintln!("omaflow: to-do cleanup unavailable, splitting by sentence: {error}");
-                cleanup_warning = crate::cleanup::cleanup_warning_text(&error);
+                cleanup_warning = crate::cleanup::cleanup_warning_text(&error, Fallback::Todos);
             }
         }
     }
@@ -1608,7 +1749,7 @@ fn finish_todos(
         return Err("dictation cancelled".into());
     }
     if items.is_empty() {
-        return Ok(StopOutcome::NoSpeech);
+        return Ok(StopOutcome::NoSpeech { heard: false });
     }
     Ok(StopOutcome::Todos(TodoTranscript {
         items,
@@ -1635,6 +1776,7 @@ fn finish_transcript(
     window: Option<&Value>,
     timing: (Duration, Instant),
     cancel: &AtomicBool,
+    deliver: bool,
 ) -> Result<StopOutcome, String> {
     let (backend_elapsed, total_started) = timing;
     if cancel.load(Ordering::Acquire) {
@@ -1643,17 +1785,18 @@ fn finish_transcript(
     let prepare_started = Instant::now();
     let mut text = vocabulary::apply(&raw_text, &config.cleanup.custom_vocabulary);
     let prepare_elapsed = prepare_started.elapsed();
+    // The vocabulary pass can leave nothing, the same as hearing nothing.
     if text.trim().is_empty() {
-        return Err("transcription contained no text".into());
+        return Ok(StopOutcome::NoSpeech { heard: false });
     }
     let cleanup_started = Instant::now();
-    let mut cleanup_warning = String::new();
+    let mut cleanup_error = None;
     if config.cleanup.enabled {
         match cleanup(config, &text, previous.text_context(), window, cancel) {
             Ok(cleaned) => text = cleaned,
             Err(error) => {
                 eprintln!("omaflow: cleanup unavailable, using raw transcript: {error}");
-                cleanup_warning = crate::cleanup::cleanup_warning_text(&error);
+                cleanup_error = Some(error);
             }
         }
     }
@@ -1662,12 +1805,63 @@ fn finish_transcript(
     }
     let cleanup_elapsed = cleanup_started.elapsed();
     if text.trim().is_empty() {
-        return Ok(StopOutcome::NoSpeech);
+        return Ok(StopOutcome::NoSpeech { heard: false });
     }
     if cancel.load(Ordering::Acquire) {
         return Err("dictation cancelled".into());
     }
     let output_started = Instant::now();
+    let (pasted, delivery_error) = if deliver {
+        deliver_text(config, &text, window, cancel)?
+    } else {
+        (false, String::new())
+    };
+    // Worded once the paste is known: the card says what you got.
+    let cleanup_warning = cleanup_error
+        .map(|error| {
+            let fallback = if pasted {
+                Fallback::Pasted
+            } else {
+                Fallback::Copied
+            };
+            let warning = crate::cleanup::cleanup_warning_text(&error, fallback);
+            if deliver {
+                warning
+            } else {
+                // Transcribed again from History: kept there, not copied.
+                warning.replacen("Copied as you said it.", "Saved as you said it.", 1)
+            }
+        })
+        .unwrap_or_default();
+    let output_elapsed = output_started.elapsed();
+    eprintln!(
+        "omaflow: timing words={} backend={}ms prepare={}ms cleanup={}ms output={}ms total={}ms",
+        raw_text.split_whitespace().count(),
+        backend_elapsed.as_millis(),
+        prepare_elapsed.as_millis(),
+        cleanup_elapsed.as_millis(),
+        output_elapsed.as_millis(),
+        total_started.elapsed().as_millis(),
+    );
+    Ok(StopOutcome::Transcript(Transcript {
+        text,
+        raw_text,
+        pasted,
+        paste_shortcut: paste_shortcut(&config.behavior.paste_delivery(), window),
+        delivery_error,
+        cleanup_warning,
+        wav: None,
+    }))
+}
+
+/// Puts the text on the clipboard and pastes it: whether the paste was sent,
+/// and why the clipboard did not take it, if it did not.
+fn deliver_text(
+    config: &Config,
+    text: &str,
+    window: Option<&Value>,
+    cancel: &AtomicBool,
+) -> Result<(bool, String), String> {
     let delivery_guard = DELIVERY_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1687,24 +1881,7 @@ fn finish_transcript(
         && active_window_matches(window)
         && paste(&config.behavior.paste_delivery(), window).is_ok();
     drop(delivery_guard);
-    let output_elapsed = output_started.elapsed();
-    eprintln!(
-        "omaflow: timing words={} backend={}ms prepare={}ms cleanup={}ms output={}ms total={}ms",
-        raw_text.split_whitespace().count(),
-        backend_elapsed.as_millis(),
-        prepare_elapsed.as_millis(),
-        cleanup_elapsed.as_millis(),
-        output_elapsed.as_millis(),
-        total_started.elapsed().as_millis(),
-    );
-    Ok(StopOutcome::Transcript(Transcript {
-        text,
-        raw_text,
-        pasted,
-        delivery_error,
-        cleanup_warning,
-        wav: None,
-    }))
+    Ok((pasted, delivery_error))
 }
 
 // Resolve only files already on disk. Passing a repository name to NeMo can
@@ -1806,8 +1983,8 @@ pub fn unload_cleanup(config: &Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CapturedAudio, EMPTY_TRANSCRIPT, captured_audio_from_wav, meter_level, rms_dbfs,
-        voice_above_threshold, wav_header, worth_retrying,
+        AUTO_GATE_MARGIN_DB, CapturedAudio, EMPTY_TRANSCRIPT, NoiseFloor, captured_audio_from_wav,
+        meter_level, rms_dbfs, voice_above_threshold, wav_header, worth_retrying,
     };
 
     fn rms_at(dbfs: f32) -> f32 {
@@ -2222,9 +2399,100 @@ mod tests {
     fn sensitivity_threshold_is_separate_from_meter_level() {
         let quiet = -62.0;
         let level = meter_level(quiet);
-        assert!(!voice_above_threshold(quiet, -60));
-        assert!(voice_above_threshold(quiet, -65));
+        assert!(!voice_above_threshold(quiet, -60.0));
+        assert!(voice_above_threshold(quiet, -65.0));
         assert_eq!(meter_level(quiet), level);
+    }
+
+    /// One 32 ms read from the recorder, the size the capture loop gets.
+    const FRAME_SECONDS: f32 = 0.032;
+
+    /// A repeatable wobble of up to `spread` dB either way, the way steady
+    /// noise varies from one short frame to the next.
+    fn wobble(seed: &mut u32, spread: f32) -> f32 {
+        *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (*seed >> 8) as f32 / (1 << 24) as f32 * 2.0 * spread - spread
+    }
+
+    /// Feeds `seconds` of frames and returns how many counted as a voice.
+    fn feed(floor: &mut NoiseFloor, seconds: f32, mut level: impl FnMut(usize) -> f32) -> usize {
+        let frames = (seconds / FRAME_SECONDS) as usize;
+        (0..frames)
+            .filter(|frame| {
+                let dbfs = level(*frame);
+                floor.update(dbfs, FRAME_SECONDS);
+                voice_above_threshold(dbfs, floor.gate_db())
+            })
+            .count()
+    }
+
+    #[test]
+    fn automatic_threshold_settles_above_a_quiet_room_and_hears_speech() {
+        let mut floor = NoiseFloor::new(-60.0);
+        let mut seed = 1;
+        feed(&mut floor, 1.0, |_| -66.0 + wobble(&mut seed, 5.0));
+        assert!((-71.0..=-65.0).contains(&floor.db), "{}", floor.db);
+        assert_eq!(floor.gate_db(), floor.db + AUTO_GATE_MARGIN_DB);
+        // The room itself, wobble included, never counts as a voice.
+        assert_eq!(feed(&mut floor, 5.0, |_| -66.0 + wobble(&mut seed, 5.0)), 0);
+        // Soft speech 15 dB above the room does.
+        let frames = (1.0 / FRAME_SECONDS) as usize;
+        assert_eq!(
+            feed(&mut floor, 1.0, |_| -51.0 + wobble(&mut seed, 2.0)),
+            frames
+        );
+    }
+
+    #[test]
+    fn automatic_threshold_learns_a_fan_within_seconds_but_not_from_speech() {
+        let mut floor = NoiseFloor::new(-60.0);
+        let mut seed = 7;
+        feed(&mut floor, 2.0, |_| -66.0 + wobble(&mut seed, 5.0));
+        let quiet = floor.db;
+
+        // Ten seconds of talking: 220 ms syllables with short pauses between
+        // them. The pauses keep the floor at the room.
+        let spoken = feed(&mut floor, 10.0, |frame| {
+            if frame % 9 < 7 {
+                -32.0 + wobble(&mut seed, 6.0)
+            } else {
+                -66.0 + wobble(&mut seed, 5.0)
+            }
+        });
+        assert!(floor.db - quiet < 3.0, "{} rose from {quiet}", floor.db);
+        assert!(spoken > (10.0 / FRAME_SECONDS) as usize * 7 / 9 * 9 / 10);
+
+        // A fan at -50 dB: the floor climbs no faster than 3 dB a second,
+        // then the fan stops counting as a voice.
+        let before = floor.db;
+        feed(&mut floor, 1.0, |_| -50.0 + wobble(&mut seed, 5.0));
+        assert!(floor.db - before <= 3.01, "{} rose from {before}", floor.db);
+        feed(&mut floor, 8.0, |_| -50.0 + wobble(&mut seed, 5.0));
+        assert_eq!(feed(&mut floor, 5.0, |_| -50.0 + wobble(&mut seed, 5.0)), 0);
+        // Speech 15 dB above the fan still counts.
+        let frames = (1.0 / FRAME_SECONDS) as usize;
+        assert_eq!(
+            feed(&mut floor, 1.0, |_| -35.0 + wobble(&mut seed, 2.0)),
+            frames
+        );
+
+        // The fan stops: the gate is back down within a fraction of a second.
+        feed(&mut floor, 0.3, |_| -66.0 + wobble(&mut seed, 5.0));
+        assert!(floor.db < -64.0, "{}", floor.db);
+    }
+
+    #[test]
+    fn automatic_threshold_stays_in_the_manual_range() {
+        let mut floor = NoiseFloor::new(-60.0);
+        // Digital silence from a muted stream leaves the floor alone.
+        feed(&mut floor, 2.0, |_| rms_dbfs(0.0));
+        assert_eq!(floor.db, -60.0);
+        feed(&mut floor, 2.0, |_| -90.0);
+        assert_eq!(floor.gate_db(), -70.0);
+        // The floor stops where the gate does, so it climbs back from there.
+        assert_eq!(floor.db, -70.0 - AUTO_GATE_MARGIN_DB);
+        feed(&mut floor, 30.0, |_| -20.0);
+        assert_eq!(floor.gate_db(), -35.0);
     }
 
     #[test]

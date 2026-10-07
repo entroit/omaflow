@@ -7,6 +7,9 @@ Column {
   property string title: ""
   property string body: ""
   property string footnote: ""
+  // Words after the footnote that open where it can be changed.
+  property string footnoteLink: ""
+  signal footnoteClicked()
   default property alias actions: actionRow.data
   spacing: 0
 
@@ -26,5 +29,16 @@ Column {
   Item { width: 1; height: actionRow.children.length > 0 ? 20 : 0 }
   Row { id: actionRow; spacing: 8 }
   Item { width: 1; height: empty.footnote.length > 0 ? 28 : 0 }
-  UiText { visible: empty.footnote.length > 0; width: empty.width; text: empty.footnote; muted: true; font.pixelSize: 12; wrapMode: Text.Wrap }
+  Flow {
+    visible: empty.footnote.length > 0
+    width: empty.width
+    spacing: 4
+    UiText { width: Math.min(implicitWidth, empty.width); text: empty.footnote; muted: true; font.pixelSize: 12; wrapMode: Text.Wrap }
+    Pill {
+      visible: empty.footnoteLink.length > 0
+      kind: "link"; text: empty.footnoteLink; size: 12
+      horizontalPadding: 2; verticalPadding: 0
+      onClicked: empty.footnoteClicked()
+    }
+  }
 }

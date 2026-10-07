@@ -66,7 +66,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
         return result.stdout
     plan = run('install', '--skip-preflight', '--dry-run')
     assert not (config/'omaflow/config.toml').exists()
-    assert 'download no models' in plan
+    assert 'Download no models' in plan
     output = run('install', '--skip-preflight', '--yes')
     personal = config/'omaflow/config.toml'
     assert tomllib.loads(personal.read_text())['behavior']['models_configured'] is False
@@ -80,8 +80,8 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     assert 'F13' in (config/'omaflow/shortcut.lua').read_text()
 
     assert not (home/'.local/state/omaflow-install/receipt.json').exists()
-    assert 'no model configured yet' in output
-    assert 'Settings -> Advanced -> Models' in output
+    assert 'no speech model yet' in output
+    assert 'choose a speech model in the OmaFlow window' in output
     assert not any(word in log.read_text() for word in ['ollama ', 'nemo-speech', 'curl ']), log.read_text()
     assert (home/'.local/bin/omaflow').is_symlink()
     for unit in ['omaflow.service', 'omaflow-update.service', 'omaflow-update-reconcile.service', 'omaflow-update-check.service', 'omaflow-update-check.timer']:
@@ -119,6 +119,17 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
             if daemon.poll() is None:
                 daemon.terminate(); daemon.wait(timeout=5)
     print('PASS agent TOML edits reload into the daemon and generated Hyprland shortcut')
+
+    # With OmaFlow stopped a valid file waits for its next start, so the shell
+    # has nothing to warn about; a broken one says why on one line.
+    run('target/release/omaflow', 'reload-config')
+    good = personal.read_text()
+    personal.write_text(good + '\n[cleanup]\nmodel = "unclosed\n')
+    broken = subprocess.run([str(repo/'target/release/omaflow'), 'reload-config'], env=env, capture_output=True, text=True, timeout=30)
+    personal.write_text(good)
+    reason = broken.stderr.strip()
+    assert broken.returncode != 0 and '\n' not in reason and 'TOML parse error at line' in reason, broken.stderr
+    print('PASS reload-config with OmaFlow stopped succeeds, and a broken file says why')
 
 
     saved = personal.read_text()
@@ -182,7 +193,11 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     sudo.write_text('#!/usr/bin/bash\nprintf "%s\\n" "sudo $*" >> "$TEST_LOG"\n')
     sudo.chmod(0o755)
     assert repo.exists() and owned_cache.exists() and receipt.exists()
-    run('uninstall')
+    # Without --yes it lists what goes and asks; no answer removes nothing.
+    declined = subprocess.run([str(repo/'uninstall')], env=env, capture_output=True, text=True, input='', timeout=30)
+    assert declined.returncode == 0 and 'Nothing was removed.' in declined.stdout, declined.stdout + declined.stderr
+    assert repo.exists() and owned_cache.exists() and receipt.exists() and personal.exists()
+    run('uninstall', '--yes')
     assert not repo.exists() and not owned_cache.exists() and not nemo.exists()
     assert not personal.exists() and not receipt.exists() and not state.exists()
     assert (config/'hypr/bindings.lua').read_text() == '-- unrelated settings\n'

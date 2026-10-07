@@ -32,7 +32,13 @@ pub struct CatalogEntry {
     /// What the download actually transfers, measured rather than copied off a
     /// model page: the q8_0 GGUF for speech, the sum of an Ollama tag's layers.
     pub size_mb: u32,
+    /// What it needs on an NVIDIA GPU, or for cleanup, wherever Ollama runs it.
     pub hardware: &'static str,
+    /// What it costs when speech runs on the CPU, published in place of
+    /// `hardware` on such a computer. Measured on a 6-core desktop CPU, where
+    /// the runtime computes on four threads.
+    #[serde(skip)]
+    pub cpu_hardware: &'static str,
     pub license: &'static str,
     pub tier: &'static str,
 }
@@ -68,9 +74,10 @@ const SPEECH: &[CatalogEntry] = &[
     CatalogEntry {
         id: "nvidia/parakeet-tdt-0.6b-v3",
         label: "Parakeet TDT 0.6B v3",
-        detail: "25 European languages, detected automatically. The most accurate of these on English and by far the fastest, which is why it is the default.",
+        detail: "25 European languages, detected automatically. The most accurate of these on English and the fastest, which is why it is the default.",
         size_mb: 714,
-        hardware: "Under 1 GB of GPU memory idle, about 2 GB after a long recording. Runs on CPU.",
+        hardware: "Under 1 GB of GPU memory idle, about 1.2 GB while it works.",
+        cpu_hardware: "About 2 seconds per 30 seconds of speech, and 1 GB of memory.",
         license: "CC-BY-4.0",
         tier: "recommended",
     },
@@ -79,7 +86,8 @@ const SPEECH: &[CatalogEntry] = &[
         label: "Nemotron 3.5 Streaming 0.6B",
         detail: "35 languages, including Japanese, Korean, Chinese, Arabic, Hindi and Turkish. Choose it for a language Parakeet does not cover; its English error rate is materially worse.",
         size_mb: 742,
-        hardware: "About the same as Parakeet. Runs on CPU.",
+        hardware: "About 1 GB of GPU memory idle, about 2.2 GB while it works.",
+        cpu_hardware: "About 5 seconds per 30 seconds of speech, and 2 GB of memory.",
         license: "OpenMDW-1.1",
         tier: "quality",
     },
@@ -88,16 +96,18 @@ const SPEECH: &[CatalogEntry] = &[
         label: "Parakeet CTC 1.1B",
         detail: "English only, and the largest model here at nearly twice the parameters. Worth trying if English accuracy matters more to you than speed or memory.",
         size_mb: 1178,
-        hardware: "Roughly twice Parakeet TDT. Runs on CPU, slowly.",
+        hardware: "About 1.7 GB of GPU memory.",
+        cpu_hardware: "About 3.5 seconds per 30 seconds of speech, and 1.4 GB of memory.",
         license: "CC-BY-4.0",
         tier: "quality",
     },
     CatalogEntry {
         id: "nvidia/nemotron-speech-streaming-en-0.6b",
         label: "Nemotron Streaming English 0.6B",
-        detail: "English only, built for streaming. The smallest download here, and the one to try on a machine without a usable GPU.",
+        detail: "English only, built for streaming, and the smallest download here.",
         size_mb: 700,
-        hardware: "The lightest of these. Runs on CPU.",
+        hardware: "About 1 GB of GPU memory idle, about 2.2 GB while it works.",
+        cpu_hardware: "About 2.5 seconds per 30 seconds of speech, and 2 GB of memory.",
         license: "NVIDIA Open Model License",
         tier: "light",
     },
@@ -112,6 +122,7 @@ const CLEANUP: &[CatalogEntry] = &[
         detail: "The recommended multilingual cleanup model. It balances reliable editing with low cleanup latency on a 16 GB GPU.",
         size_mb: 9163,
         hardware: "About 10 GB of GPU memory",
+        cpu_hardware: "",
         license: "Gemma Terms of Use",
         tier: "recommended",
     },
@@ -121,6 +132,7 @@ const CLEANUP: &[CatalogEntry] = &[
         detail: "The previous Gemma generation at a third of E4B's size. A reasonable middle ground for German, French, Spanish, Italian and Dutch.",
         size_mb: 3184,
         hardware: "About 5 GB of GPU memory",
+        cpu_hardware: "",
         license: "Gemma Terms of Use",
         tier: "quality",
     },
@@ -130,6 +142,7 @@ const CLEANUP: &[CatalogEntry] = &[
         detail: "NVIDIA's small reasoning model, with a 256K context. English is well covered; its support for other languages is not documented.",
         size_mb: 2706,
         hardware: "About 5 GB of GPU memory",
+        cpu_hardware: "",
         license: "NVIDIA Open Model License",
         tier: "quality",
     },
@@ -139,6 +152,7 @@ const CLEANUP: &[CatalogEntry] = &[
         detail: "A compact Apache-licensed option. It is capable of punctuation and filler removal, but mixed-language cleanup is less reliable.",
         size_mb: 2382,
         hardware: "About 5 GB of GPU memory",
+        cpu_hardware: "",
         license: "Apache-2.0",
         tier: "light",
     },
@@ -148,6 +162,7 @@ const CLEANUP: &[CatalogEntry] = &[
         detail: "Lighter and faster. Punctuation and fillers are reliable; it misses more of the harder self-corrections.",
         size_mb: 1296,
         hardware: "About 3 GB of GPU memory, or CPU",
+        cpu_hardware: "",
         license: "Apache-2.0",
         tier: "light",
     },
@@ -157,6 +172,7 @@ const CLEANUP: &[CatalogEntry] = &[
         detail: "The smallest option, for machines without a usable GPU. Expect punctuation and filler removal, not spoken formatting commands.",
         size_mb: 498,
         hardware: "Runs on CPU",
+        cpu_hardware: "",
         license: "Apache-2.0",
         tier: "light",
     },
@@ -316,6 +332,52 @@ pub fn ollama_on_path() -> bool {
     env::split_paths(&path).any(|directory| directory.join("ollama").is_file())
 }
 
+/// The build of the NeMo-Speech runtime that runs speech on this computer.
+/// scripts/install-nemo.sh chooses it and records it in the install marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpeechRuntime {
+    Cuda,
+    Cpu,
+}
+
+impl SpeechRuntime {
+    /// The installed build, or before there is one, the build the installer
+    /// would choose. Only the installer checks for NVIDIA's driver library;
+    /// the kernel driver alone is enough to pick which hardware lines to show.
+    fn here() -> Self {
+        let marker = speech_runtime_prefix().map(|prefix| prefix.join(".nemo-speech-install"));
+        marker
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|text| Self::from_marker(&text))
+            .unwrap_or(if nvidia_gpu_present() {
+                Self::Cuda
+            } else {
+                Self::Cpu
+            })
+    }
+
+    /// Reads "0.1.0 linux x86_64 cpu", the line the installer writes.
+    fn from_marker(text: &str) -> Option<Self> {
+        match text.split_whitespace().last()? {
+            "cuda" => Some(Self::Cuda),
+            "cpu" => Some(Self::Cpu),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cuda => "cuda",
+            Self::Cpu => "cpu",
+        }
+    }
+}
+
+/// The NVIDIA kernel driver is loaded, which it only is with an NVIDIA GPU.
+fn nvidia_gpu_present() -> bool {
+    Path::new("/proc/driver/nvidia/version").exists()
+}
+
 /// The catalog as the panel sees it: every entry, plus whether the weights are
 /// on disk and whether it is the model the config currently points at.
 pub fn to_json(
@@ -323,14 +385,37 @@ pub fn to_json(
     installed_speech: &[String],
     installed_cleanup: &[String],
 ) -> Value {
+    catalog_json(
+        config,
+        installed_speech,
+        installed_cleanup,
+        SpeechRuntime::here(),
+        nvidia_gpu_present(),
+    )
+}
+
+fn catalog_json(
+    config: &Config,
+    installed_speech: &[String],
+    installed_cleanup: &[String],
+    runtime: SpeechRuntime,
+    nvidia_gpu: bool,
+) -> Value {
     let selected_cleanup = config.cleanup.model.trim_end_matches(":latest");
     json!({
-        "speech": serialize(SPEECH, installed_speech, config.backend.nemo_model()),
-        "cleanup": serialize(CLEANUP, installed_cleanup, selected_cleanup),
+        "speech": serialize(SPEECH, installed_speech, config.backend.nemo_model(), runtime),
+        "cleanup": serialize(CLEANUP, installed_cleanup, selected_cleanup, runtime),
+        "speech_runtime": runtime.as_str(),
+        "nvidia_gpu": nvidia_gpu,
     })
 }
 
-fn serialize(entries: &[CatalogEntry], installed: &[String], selected: &str) -> Value {
+fn serialize(
+    entries: &[CatalogEntry],
+    installed: &[String],
+    selected: &str,
+    runtime: SpeechRuntime,
+) -> Value {
     Value::Array(
         entries
             .iter()
@@ -342,6 +427,9 @@ fn serialize(entries: &[CatalogEntry], installed: &[String], selected: &str) -> 
                         json!(installed.iter().any(|id| id == entry.id)),
                     );
                     object.insert("selected".into(), json!(selected == entry.id));
+                    if runtime == SpeechRuntime::Cpu && !entry.cpu_hardware.is_empty() {
+                        object.insert("hardware".into(), json!(entry.cpu_hardware));
+                    }
                 }
                 value
             })
@@ -361,15 +449,19 @@ pub fn download(
         Kind::Speech => {
             let binary = speech_downloader()?;
             // Nothing installs the runtime ahead of us any more: the user may
-            // be pressing Download on a machine where it was never set up.
+            // be pressing Download on a machine where it was never set up, or
+            // one that gained or lost its NVIDIA driver since. The installer
+            // picks the build and does nothing when the right one is in place.
+            // A runtime that still works is good enough to download with,
+            // even if switching builds failed.
+            let installed = install_speech_runtime(&mut report);
             if !speech_runtime_ready(&binary) {
-                install_speech_runtime(&mut report)?;
-                if !speech_runtime_ready(&binary) {
-                    return Err(format!(
-                        "The speech runtime is still not usable at {}; run ./install from the OmaFlow checkout.",
+                return Err(installed.err().unwrap_or_else(|| {
+                    format!(
+                        "The speech runtime is still not usable at {}. Run scripts/install-nemo.sh in the OmaFlow folder.",
                         binary.display()
-                    ));
-                }
+                    )
+                }));
             }
             let mut command = Command::new(binary);
             command.args(["pull", entry.id]);
@@ -429,13 +521,30 @@ pub fn record_receipt(kind: Kind, entry: &CatalogEntry) {
         .bounded_status();
 }
 
+/// Removes a cancelled speech download's files. Only ever a directory
+/// inside the model cache, never the cache itself.
+pub fn remove_partial_speech(id: &str) {
+    let cache = cache_dir().join("nemo-speech/models");
+    let directory = speech_cache_directory(id);
+    if id.is_empty() || id.split('/').any(|part| part == ".." || part.is_empty()) {
+        return;
+    }
+    if directory.starts_with(&cache) && directory != cache {
+        let _ = fs::remove_dir_all(directory);
+    }
+}
+
 fn speech_cache_directory(id: &str) -> PathBuf {
     cache_dir().join("nemo-speech/models").join(id)
 }
 
+fn speech_runtime_prefix() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/lib/nemo-speech"))
+}
+
 fn speech_downloader() -> Result<PathBuf, String> {
-    let home = env::var_os("HOME").ok_or("HOME is not set, so the download cannot start")?;
-    Ok(PathBuf::from(home).join(".local/lib/nemo-speech/bin/nemo-speech"))
+    let prefix = speech_runtime_prefix().ok_or("HOME is not set, so the download cannot start")?;
+    Ok(prefix.join("bin/nemo-speech"))
 }
 
 /// The binary existing is not enough: a half-finished install leaves a file
@@ -449,20 +558,20 @@ fn speech_runtime_ready(binary: &Path) -> bool {
 }
 
 fn install_speech_runtime(report: &mut impl FnMut(Option<u8>, &str)) -> Result<(), String> {
-    report(None, "Installing the speech runtime");
+    report(None, "Setting up the speech runtime");
     let root = crate::update::repo_root().ok_or(
-        "The OmaFlow checkout could not be found, so the speech runtime cannot be installed.",
+        "The OmaFlow folder could not be found, so the speech runtime cannot be installed.",
     )?;
     let script = root.join("scripts/install-nemo.sh");
     if !script.is_file() {
         return Err(format!(
-            "The speech runtime installer is missing at {}; update your OmaFlow checkout.",
+            "The speech runtime installer is missing at {}. Update OmaFlow, then try again.",
             script.display()
         ));
     }
     let mut command = Command::new(&script);
     command.current_dir(&root);
-    stream(command, "Installing the speech runtime", report, None)
+    stream(command, "Setting up the speech runtime", report, None)
 }
 
 /// Progress read off the disk, for a downloader that reports none itself.
@@ -570,7 +679,7 @@ fn stream(
     }
     let reason = last.trim();
     if reason.is_empty() {
-        Err(format!("{label} failed ({status})."))
+        Err(format!("{label} stopped before it finished."))
     } else {
         Err(format!("{label} failed: {reason}"))
     }
@@ -793,7 +902,13 @@ mod tests {
         let mut config = Config::default();
         config.backend.model = chosen.into();
         config.cleanup.model = "gemma4:e4b".into();
-        let value = to_json(&config, &[chosen.to_string()], &[]);
+        let value = catalog_json(
+            &config,
+            &[chosen.to_string()],
+            &[],
+            SpeechRuntime::Cuda,
+            true,
+        );
         let speech = value["speech"].as_array().unwrap();
         let entry = speech.iter().find(|entry| entry["id"] == chosen).unwrap();
         assert_eq!(entry["installed"], true);
@@ -801,5 +916,47 @@ mod tests {
         assert_eq!(speech[0]["selected"], false);
         assert_eq!(value["cleanup"][0]["selected"], true);
         assert_eq!(value["cleanup"][0]["installed"], false);
+    }
+
+    #[test]
+    fn reads_the_runtime_build_from_the_install_marker() {
+        assert_eq!(
+            SpeechRuntime::from_marker("0.1.0 linux x86_64 cpu\n"),
+            Some(SpeechRuntime::Cpu)
+        );
+        assert_eq!(
+            SpeechRuntime::from_marker("0.1.0 linux x86_64 cuda\n"),
+            Some(SpeechRuntime::Cuda)
+        );
+        assert_eq!(
+            SpeechRuntime::from_marker("0.1.0 linux x86_64 vulkan"),
+            None
+        );
+        assert_eq!(SpeechRuntime::from_marker(""), None);
+    }
+
+    #[test]
+    fn speech_hardware_lines_follow_the_runtime_build() {
+        let config = Config::default();
+        let cpu = catalog_json(&config, &[], &[], SpeechRuntime::Cpu, false);
+        assert_eq!(cpu["speech_runtime"], "cpu");
+        assert_eq!(cpu["nvidia_gpu"], false);
+        assert_eq!(
+            cpu["speech"][0]["hardware"],
+            "About 2 seconds per 30 seconds of speech, and 1 GB of memory."
+        );
+        assert_eq!(cpu["cleanup"][0]["hardware"], "About 10 GB of GPU memory");
+        assert!(cpu["speech"][0].get("cpu_hardware").is_none());
+
+        let cuda = catalog_json(&config, &[], &[], SpeechRuntime::Cuda, true);
+        assert_eq!(cuda["speech_runtime"], "cuda");
+        assert_eq!(cuda["nvidia_gpu"], true);
+        assert_eq!(
+            cuda["speech"][0]["hardware"],
+            "Under 1 GB of GPU memory idle, about 1.2 GB while it works."
+        );
+        for entry in SPEECH {
+            assert!(entry.cpu_hardware.ends_with("of memory."), "{}", entry.id);
+        }
     }
 }

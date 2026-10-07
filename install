@@ -5,8 +5,8 @@
 # It deliberately installs no models. Weights and the ASR runtime are about
 # 10 GB and used to stand between a fresh clone and the first screen. Which
 # speech model to fetch, and whether this machine can run it, is the user's
-# decision: Settings -> Advanced -> Models lists size, hardware need and licence, and the
-# runtime is installed with the first model actually downloaded.
+# decision: the OmaFlow window lists size, hardware need and licence under
+# Models, and the runtime is installed with the first model actually downloaded.
 #
 # Safe to re-run. Every step checks before it acts, so a run that failed
 # halfway can simply be started again.
@@ -100,6 +100,20 @@ run() {
   fi
   "$@"
 }
+# Keysyms as the window names them: ISO_Level3_Shift,Menu is AltGr+Menu.
+key_label() {
+  local key label=""
+  for key in ${1//,/ }; do
+    case $key in
+      ISO_Level3_Shift) key=AltGr ;;
+      Control_L | Control_R) key=Ctrl ;;
+      Shift_L | Shift_R) key=Shift ;;
+      Super_L | Super_R) key=Super ;;
+    esac
+    label+="${label:++}$key"
+  done
+  printf '%s' "$label"
+}
 
 if [[ $EUID -eq 0 ]]; then
   printf 'Run ./install as your normal user, not with sudo. It asks for the\n' >&2
@@ -146,20 +160,30 @@ bindings="$config_home/hypr/bindings.lua"
 need_bindings=0
 if [[ ! -f $bindings ]] || ! grep -q 'require("omaflow")' "$bindings"; then need_bindings=1; fi
 
+# The install copies this folder's own release, so a changed folder would
+# stop it after the password and the packages; say so before anything runs.
+folder_changed=0
+if ! "$repo_dir/scripts/install-release" --check-folder; then
+  ((dry_run)) || exit 1
+  folder_changed=1
+fi
+
 # --- 3. Show the plan and confirm once --------------------------------------
 say 'Plan'
-((${#packages[@]})) && step "install packages: ${packages[*]}"
-((need_hotkey)) && step "write the hotkey to $hotkey_file"
-((need_bindings)) && step "add require(\"omaflow\") to $bindings"
-step 'install the bundled OmaFlow binary and desktop integration'
+((${#packages[@]})) && step "Install packages: ${packages[*]}"
+((need_hotkey)) && step "Set the dictation key to $(key_label "${hotkey:-ISO_Level3_Shift,Menu}") in $hotkey_file"
+((need_bindings)) && step "Add require(\"omaflow\") to $bindings"
+step 'Install the bundled OmaFlow app and its services'
+step 'Restart the Omarchy shell and add the OmaFlow icon to the top bar'
 if ((first_install)); then
-  step 'download no models; choose a speech model afterwards in Settings -> Advanced -> Models'
+  step 'Download no models. You choose a speech model in the OmaFlow window afterwards.'
 else
-  step 'preserve the existing model configuration and download no models'
+  step 'Keep your model settings and download no models'
 fi
 
 if ((dry_run)); then
   printf '\nDry run, nothing changed.\n'
+  ((folder_changed)) && printf 'A real run stops before the plan until the OmaFlow folder is unchanged.\n'
   exit 0
 fi
 
@@ -196,7 +220,7 @@ if ((need_hotkey)); then
     consume="Menu"
   fi
   python3 "$repo_dir/tools/set_hotkey.py" --keys "$hotkey" --consumed "$consume" --write-only
-  step "hotkey: $hotkey"
+  step "dictation key: $(key_label "$hotkey")"
 fi
 
 if ((need_bindings)); then
@@ -241,7 +265,7 @@ else
 fi
 
 if ((first_install)); then
-  step 'no model configured yet; choose one in Settings -> Advanced -> Models'
+  step 'no speech model yet; you choose one in the OmaFlow window next'
 else
   step 'the existing model configuration is preserved'
 fi
@@ -251,13 +275,17 @@ if ((problems)); then
   exit 1
 fi
 
-hotkey_display="$(sed -n 's/^local omaflow_hotkey = { //p' "$hotkey_file" 2>/dev/null |
-  tr -d '",' | sed 's/ }//' | sed 's/ / + /g')"
+hotkey_display="$(key_label "$(sed -n 's/^local omaflow_hotkey = { //p' "$hotkey_file" 2>/dev/null |
+  tr -d '",}')")"
 say 'Done'
-printf 'OmaFlow is installed. Your hotkey is %s.\n' "${hotkey_display:-your hotkey}"
+if [[ -n $hotkey_display ]]; then
+  printf 'OmaFlow is installed. Your dictation key is %s.\n' "$hotkey_display"
+else
+  printf 'OmaFlow is installed.\n'
+fi
 if ((first_install)); then
-  printf 'Next step: open the OmaFlow window and pick a speech model in Settings -> Advanced -> Models.\n'
-  printf 'It downloads there, with its size and hardware needs shown before you commit.\n'
+  printf 'Next: choose a speech model in the OmaFlow window. Click the OmaFlow icon in the top bar or press Super+Shift+V.\n'
+  printf 'It downloads there, with its size and hardware needs shown before anything starts.\n'
 else
   printf 'OmaFlow is ready with your existing settings.\n'
 fi

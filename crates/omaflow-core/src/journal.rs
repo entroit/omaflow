@@ -10,7 +10,7 @@
 //! so notes apps that open the journal folder skip them.
 use crate::{
     date::Date,
-    fsutil::{owned_dir, write_owned},
+    fsutil::{Made, copy_all, owned_dir, remove_moved, same_folder, write_owned},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -49,6 +49,9 @@ pub struct Entry {
     /// For a note written ahead to this day, the day it was written
     /// (YYYY-MM-DD). Empty for an ordinary entry.
     pub written: String,
+    /// For an entry added to a past day, the day it was really written
+    /// (YYYY-MM-DD). Empty for an entry written on its own day.
+    pub added: String,
 }
 
 /// The heading of a note written today for a later day: it says when it was
@@ -60,6 +63,38 @@ pub fn note_heading(written: Date, time: &str) -> String {
 /// The day a note was written, from its heading; None for an ordinary entry.
 pub fn written_on(heading: &str) -> Option<Date> {
     heading.strip_prefix("Note from ")?.get(..10)?.parse().ok()
+}
+
+/// The heading of an entry added later to a past day: its time, and the day
+/// it was really written, in the file itself. "21:53, added 2026-10-06".
+pub fn added_heading(time: &str, added: Date) -> String {
+    format!("{time}, added {added}")
+}
+
+/// The day an entry was added to a past day, and the time before it; None
+/// for an entry written on its own day.
+pub fn added_on(heading: &str) -> Option<(&str, Date)> {
+    let (time, added) = heading.rsplit_once(", added ")?;
+    Some((time, added.parse().ok()?))
+}
+
+/// What the page shows as an entry's time: the heading without the day an
+/// added entry was written, which shows under its words instead.
+fn shown_time(heading: &str) -> String {
+    added_on(heading)
+        .map_or(heading, |(time, _)| time)
+        .to_string()
+}
+
+/// The minutes past midnight of a heading that starts with a time, such as
+/// "07:42" or "21:53, added 2026-10-06".
+fn minutes(heading: &str) -> Option<u32> {
+    let clock = heading.get(..5)?;
+    let (hours, minutes) = clock.split_once(':')?;
+    if hours.len() != 2 || !clock.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+        return None;
+    }
+    Some(hours.parse::<u32>().ok()? * 60 + minutes.parse::<u32>().ok()?)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,9 +118,13 @@ pub struct SearchHit {
     pub time: String,
     pub id: u64,
     /// The entry, or the sentence around the first match when it is long.
+    /// Empty for a sealed note.
     pub snippet: String,
     /// `[start, length]` in characters of `snippet`, one pair per match.
     pub matches: Vec<[usize; 2]>,
+    /// A note for a day that has not come yet: it stays sealed until then,
+    /// so search says it is there but not what it says.
+    pub sealed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -192,6 +231,19 @@ impl Journal {
             .join(format!("{id}.wav"))
     }
 
+    /// How many entries have a kept recording, so turning recordings off
+    /// can say what it deletes.
+    pub fn recording_count(&self) -> usize {
+        let Ok(days) = fs::read_dir(self.folder.join(".recordings")) else {
+            return 0;
+        };
+        days.flatten()
+            .filter_map(|day| fs::read_dir(day.path()).ok())
+            .flat_map(|files| files.flatten())
+            .filter(|file| file.path().extension().is_some_and(|ext| ext == "wav"))
+            .count()
+    }
+
     /// Deletes every kept recording. The words and waveform outlines stay.
     pub fn delete_recordings(&self) -> Result<(), String> {
         let _ = fs::remove_file(self.trash_dir().join("recording.wav"));
@@ -226,7 +278,7 @@ impl Journal {
                     .unwrap_or_default();
                 Entry {
                     id: section.id,
-                    time: section.heading.clone(),
+                    time: shown_time(&section.heading),
                     text: unescape_body(&section.body),
                     typed: section.typed,
                     raw_text: meta.raw_text,
@@ -235,6 +287,9 @@ impl Journal {
                     audio: section.marked && self.recording_path(date, section.id).is_file(),
                     written: written_on(&section.heading)
                         .map(|day| day.to_string())
+                        .unwrap_or_default(),
+                    added: added_on(&section.heading)
+                        .map(|(_, day)| day.to_string())
                         .unwrap_or_default(),
                 }
             })
@@ -338,17 +393,30 @@ impl Journal {
             );
             self.write_sidecar(date, &sidecar)?;
         }
-        document.sections.push(Section {
-            heading: entry.time.to_string(),
-            id,
-            marked: true,
-            typed: entry.typed,
-            body: escape_body(text),
-        });
+        // An entry added to a past day goes in among that day's entries by
+        // its time; one written on its own day is the latest anyway.
+        let index = match (added_on(entry.time), minutes(entry.time)) {
+            (Some(_), Some(at)) => document
+                .sections
+                .iter()
+                .position(|section| minutes(&section.heading).is_some_and(|other| other > at))
+                .unwrap_or(document.sections.len()),
+            _ => document.sections.len(),
+        };
+        document.sections.insert(
+            index,
+            Section {
+                heading: entry.time.to_string(),
+                id,
+                marked: true,
+                typed: entry.typed,
+                body: escape_body(text),
+            },
+        );
         write_owned(&path, render(&document, date).as_bytes())?;
         Ok(Entry {
             id,
-            time: entry.time.to_string(),
+            time: shown_time(entry.time),
             text: text.to_string(),
             typed: entry.typed,
             raw_text: entry.raw_text.trim().to_string(),
@@ -357,6 +425,9 @@ impl Journal {
             audio,
             written: written_on(entry.time)
                 .map(|day| day.to_string())
+                .unwrap_or_default(),
+            added: added_on(entry.time)
+                .map(|(_, day)| day.to_string())
                 .unwrap_or_default(),
         })
     }
@@ -512,7 +583,8 @@ impl Journal {
     }
 
     /// Case-insensitive search through every entry, newest day first.
-    pub fn search(&self, query: &str) -> Result<SearchResult, String> {
+    /// Notes for days after `today` are found but their words stay out.
+    pub fn search(&self, query: &str, today: Date) -> Result<SearchResult, String> {
         let query = query.trim();
         let mut result = SearchResult {
             query: query.to_string(),
@@ -542,14 +614,20 @@ impl Journal {
                     }
                     return Ok(result);
                 }
-                let (snippet, matches) = snippet(&haystack, &matches, needle.len());
+                let sealed = date > today && written_on(&section.heading).is_some();
+                let (snippet, matches) = if sealed {
+                    (String::new(), Vec::new())
+                } else {
+                    snippet(&haystack, &matches, needle.len())
+                };
                 matched_day = true;
                 result.hits.push(SearchHit {
                     date: date.to_string(),
-                    time: section.heading,
+                    time: shown_time(&section.heading),
                     id: section.id,
                     snippet,
                     matches,
+                    sealed,
                 });
             }
             if matched_day {
@@ -577,6 +655,85 @@ impl Journal {
         }
         write_owned(destination, out.trim_end().as_bytes())?;
         Ok(dates.len())
+    }
+
+    /// Moves every day OmaFlow keeps here, with its sidecar and recordings,
+    /// into `destination`. Nothing is ever overwritten: if a day is already
+    /// there, nothing moves. Each file is copied and read back first; the
+    /// originals go only once every copy is right, and any failure before
+    /// that removes the copies again. An original that will not go after
+    /// that is named in `left_behind`: the days have moved all the same.
+    /// Other files in the folder, such as notes or the to-do list, stay
+    /// where they are.
+    pub fn move_to(&self, destination: &Path) -> Result<Moved, MoveError> {
+        let failed = |error: String| MoveError::Failed(error);
+        // Nothing to move, and the lock would create the folder just left.
+        if same_folder(&self.folder, destination) || !self.folder.is_dir() {
+            return Ok(Moved::default());
+        }
+        let lock = self.lock().map_err(failed)?;
+        self.empty_trash();
+        let target = Journal::new(destination);
+        let days = self.dates().map_err(failed)?;
+        let mut files: Vec<(Date, PathBuf, PathBuf)> = days
+            .iter()
+            .map(|&date| (date, self.day_path(date), target.day_path(date)))
+            .collect();
+        for date in dated(&self.folder.join(".omaflow"), ".json") {
+            files.push((date, self.sidecar_path(date), target.sidecar_path(date)));
+        }
+        for date in dated(&self.folder.join(".recordings"), "") {
+            let folder = self.folder.join(".recordings").join(date.to_string());
+            let Ok(recordings) = fs::read_dir(&folder) else {
+                continue;
+            };
+            for recording in recordings.flatten() {
+                let name = recording.file_name();
+                let into = target.folder.join(".recordings").join(date.to_string());
+                files.push((date, recording.path(), into.join(name)));
+            }
+        }
+        let mut clashes: Vec<String> = files
+            .iter()
+            .filter(|(_, _, to)| to.symlink_metadata().is_ok())
+            .map(|(date, _, _)| date.to_string())
+            .collect();
+        clashes.sort();
+        clashes.dedup();
+        if !clashes.is_empty() {
+            return Err(MoveError::Clash(clashes));
+        }
+
+        let mut made = Made::default();
+        let pairs = files
+            .iter()
+            .map(|(_, from, to)| (from.as_path(), to.as_path()));
+        if let Err(error) = copy_all(pairs, destination, &mut made) {
+            made.undo();
+            return Err(failed(error));
+        }
+        // Every copy is in place and checked, so the originals can go.
+        let left_behind = remove_moved(
+            files.iter().map(|(_, from, _)| from.as_path()),
+            &self.folder,
+        );
+        for date in dated(&self.folder.join(".recordings"), "") {
+            let _ = fs::remove_dir(self.folder.join(".recordings").join(date.to_string()));
+        }
+        let _ = fs::remove_dir(self.folder.join(".recordings"));
+        // The lock is ours; the folder it is in may hold the to-do list's too.
+        drop(lock);
+        let own = self.folder.join(".omaflow");
+        let left = fs::read_dir(&own)
+            .map(|names| names.flatten().count())
+            .unwrap_or(0);
+        if left == 1 && fs::remove_file(own.join("lock")).is_ok() {
+            let _ = fs::remove_dir(&own);
+        }
+        Ok(Moved {
+            days: days.len(),
+            left_behind,
+        })
     }
 
     /// Held while a day is read, changed and written back. The daemon saves
@@ -611,6 +768,41 @@ impl Journal {
         let bytes = serde_json::to_vec(sidecar).map_err(|error| error.to_string())?;
         write_owned(&path, &bytes)
     }
+}
+
+/// A finished move: how many days moved, and the originals that could not
+/// be removed from the old folder, by their names there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Moved {
+    pub days: usize,
+    pub left_behind: Vec<String>,
+}
+
+/// Why the journal, or the to-do list, could not move to another folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveError {
+    /// These days (YYYY-MM-DD), or the to-do file, are already in the new
+    /// folder. Nothing moved.
+    Clash(Vec<String>),
+    /// A copy failed or did not read back the same. Nothing moved.
+    Failed(String),
+}
+
+/// Dates named by the entries of `folder` that end in `suffix`, such as the
+/// sidecars "2026-09-24.json" or the recording folders "2026-09-24".
+fn dated(folder: &Path, suffix: &str) -> Vec<Date> {
+    let Ok(names) = fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut dates: Vec<Date> = names
+        .flatten()
+        .filter_map(|name| {
+            let name = name.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(suffix)?.parse().ok()
+        })
+        .collect();
+    dates.sort();
+    dates
 }
 
 fn parse(text: &str) -> Document {
@@ -1056,6 +1248,7 @@ fn capitalize(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn temp_journal(name: &str) -> Journal {
         let folder =
@@ -1101,6 +1294,193 @@ mod tests {
         // An ordinary entry is not a note, whatever it says.
         assert_eq!(written_on("07:42"), None);
         assert_eq!(written_on("Note from nowhere"), None);
+    }
+
+    #[test]
+    fn an_entry_added_to_a_past_day_goes_in_by_time_and_says_when() {
+        let journal = temp_journal("added");
+        let day: Date = "2026-09-24".parse().unwrap();
+        let today: Date = "2026-10-06".parse().unwrap();
+        for (id, time) in [(1_758_700_000_000, "07:42"), (1_758_720_000_000, "18:30")] {
+            journal
+                .add(day, spoken(id, time, "Same day.", None))
+                .unwrap();
+        }
+        let heading = added_heading("12:15", today);
+        assert_eq!(heading, "12:15, added 2026-10-06");
+        let added = journal
+            .add(
+                day,
+                spoken(1_759_780_000_000, &heading, "Lunch with Mira.", None),
+            )
+            .unwrap();
+        assert_eq!(
+            (added.time.as_str(), added.added.as_str()),
+            ("12:15", "2026-10-06")
+        );
+
+        let entries = journal.day(day).unwrap().entries;
+        let times: Vec<&str> = entries.iter().map(|entry| entry.time.as_str()).collect();
+        assert_eq!(
+            times,
+            vec!["07:42", "12:15", "18:30"],
+            "filed in time order"
+        );
+        assert_eq!(entries[1].added, "2026-10-06");
+        assert!(entries[0].added.is_empty() && entries[1].written.is_empty());
+        let file = fs::read_to_string(journal.day_path(day)).unwrap();
+        assert!(
+            file.contains("## 12:15, added 2026-10-06\n<!-- omaflow:"),
+            "{file}"
+        );
+
+        // Like any entry: searched, counted, a year on, deleted and back.
+        assert_eq!(journal.search("mira", day).unwrap().hits[0].time, "12:15");
+        assert_eq!(journal.month(2026, 9).unwrap()[0].entries, 3);
+        let later = journal.a_year_ago("2027-09-24".parse().unwrap()).unwrap();
+        assert_eq!(later.unwrap().1.time, "07:42");
+        journal.delete(day, added.id).unwrap();
+        journal.restore(day, added.id).unwrap();
+        assert_eq!(journal.day(day).unwrap().entries, entries);
+        assert_eq!(added_on("Morning"), None);
+        let _ = fs::remove_dir_all(journal.folder());
+    }
+
+    /// Every file under `folder`, with its bytes, to compare a folder before
+    /// and after.
+    fn snapshot(folder: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        let mut folders = vec![folder.to_path_buf()];
+        while let Some(next) = folders.pop() {
+            for entry in fs::read_dir(&next).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    folders.push(path);
+                } else {
+                    let name = path.strip_prefix(folder).unwrap().to_path_buf();
+                    files.insert(name, fs::read(&path).unwrap());
+                }
+            }
+        }
+        files
+    }
+
+    fn journal_with_two_days(name: &str) -> Journal {
+        let journal = temp_journal(name);
+        for date in ["2026-09-24", "2026-09-25"] {
+            journal
+                .add(
+                    date.parse().unwrap(),
+                    spoken(1_758_700_000_000, "07:42", "Slept badly.", Some(b"RIFF")),
+                )
+                .unwrap();
+        }
+        // Not the journal's: a note of yours and the to-do list's own file.
+        fs::write(journal.folder().join("ideas.md"), "Mine.").unwrap();
+        fs::write(journal.folder().join(".omaflow/todos.lock"), "").unwrap();
+        journal
+    }
+
+    #[test]
+    fn moving_the_journal_takes_its_days_recordings_and_nothing_else() {
+        let journal = journal_with_two_days("move");
+        let destination = journal.folder().with_extension("moved");
+        let _ = fs::remove_dir_all(&destination);
+        let date: Date = "2026-09-25".parse().unwrap();
+        let before = journal.day(date).unwrap();
+
+        assert_eq!(
+            journal.move_to(&destination),
+            Ok(Moved {
+                days: 2,
+                left_behind: Vec::new()
+            })
+        );
+        let moved = Journal::new(&destination);
+        assert_eq!(moved.dates().unwrap().len(), 2);
+        assert_eq!(
+            moved.day(date).unwrap().entries,
+            before.entries,
+            "words, waveform and recording"
+        );
+        assert!(moved.recording_path(date, before.entries[0].id).is_file());
+        assert!(journal.dates().unwrap().is_empty());
+        assert_eq!(
+            snapshot(journal.folder()).into_keys().collect::<Vec<_>>(),
+            vec![
+                PathBuf::from(".omaflow/lock"),
+                PathBuf::from(".omaflow/todos.lock"),
+                PathBuf::from("ideas.md")
+            ],
+            "your own files stay"
+        );
+        assert_eq!(
+            moved.move_to(&destination),
+            Ok(Moved::default()),
+            "the same folder is no move"
+        );
+        let _ = fs::remove_dir_all(journal.folder());
+        let _ = fs::remove_dir_all(&destination);
+    }
+
+    #[test]
+    fn moving_onto_days_already_there_moves_nothing() {
+        let journal = journal_with_two_days("move-clash");
+        let destination = journal.folder().with_extension("clash");
+        let _ = fs::remove_dir_all(&destination);
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("2026-09-25.md"), "# Theirs\n").unwrap();
+        let (source, target) = (snapshot(journal.folder()), snapshot(&destination));
+
+        assert_eq!(
+            journal.move_to(&destination),
+            Err(MoveError::Clash(vec!["2026-09-25".into()]))
+        );
+        assert_eq!(snapshot(journal.folder()), source);
+        assert_eq!(snapshot(&destination), target);
+        let _ = fs::remove_dir_all(journal.folder());
+        let _ = fs::remove_dir_all(&destination);
+    }
+
+    #[test]
+    fn a_move_that_fails_halfway_takes_its_copies_back() {
+        let journal = journal_with_two_days("move-fails");
+        let destination = journal.folder().with_extension("fails");
+        let _ = fs::remove_dir_all(&destination);
+        fs::create_dir_all(&destination).unwrap();
+        // The day files copy, then the recordings cannot: a file is in the way.
+        fs::write(destination.join(".recordings"), "").unwrap();
+        let (source, target) = (snapshot(journal.folder()), snapshot(&destination));
+
+        let result = journal.move_to(&destination);
+        assert!(matches!(result, Err(MoveError::Failed(_))), "{result:?}");
+        assert_eq!(snapshot(journal.folder()), source, "the originals stay");
+        assert_eq!(snapshot(&destination), target, "and the copies are gone");
+        assert!(!destination.join(".omaflow").exists());
+        let _ = fs::remove_dir_all(journal.folder());
+        let _ = fs::remove_dir_all(&destination);
+    }
+
+    #[test]
+    fn a_move_whose_originals_will_not_go_still_moves_and_names_them() {
+        let journal = journal_with_two_days("move-stuck");
+        let destination = journal.folder().with_extension("stuck");
+        let _ = fs::remove_dir_all(&destination);
+        // The day files can be read and copied, but not removed from here.
+        fs::set_permissions(journal.folder(), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = journal.move_to(&destination);
+        fs::set_permissions(journal.folder(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            result,
+            Ok(Moved {
+                days: 2,
+                left_behind: vec!["2026-09-24.md".into(), "2026-09-25.md".into()]
+            })
+        );
+        assert_eq!(Journal::new(&destination).dates().unwrap().len(), 2);
+        let _ = fs::remove_dir_all(journal.folder());
+        let _ = fs::remove_dir_all(&destination);
     }
 
     #[test]
@@ -1175,8 +1555,10 @@ mod tests {
             .add(date, spoken(1, "07:42", "Slept badly.", Some(b"RIFF")))
             .unwrap();
         assert!(journal.recording_path(date, entry.id).is_file());
+        assert_eq!(journal.recording_count(), 1);
 
         journal.delete_recordings().unwrap();
+        assert_eq!(journal.recording_count(), 0);
         journal.delete_recordings().unwrap();
         let day = journal.day(date).unwrap();
         assert_eq!(day.entries[0].text, "Slept badly.");
@@ -1330,7 +1712,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        let result = journal.search("workshop").unwrap();
+        let result = journal
+            .search("workshop", "2026-09-20".parse().unwrap())
+            .unwrap();
         assert_eq!(result.days, vec!["2026-09-16", "2026-09-09"]);
         assert_eq!(result.hits[0].matches, vec![[15, 8]]);
         assert_eq!(
@@ -1338,6 +1722,32 @@ mod tests {
             3,
             "every day with an entry gets a dot"
         );
+        let _ = fs::remove_dir_all(journal.folder());
+    }
+
+    #[test]
+    fn search_finds_a_sealed_note_without_showing_its_words() {
+        let journal = temp_journal("sealed-search");
+        let today: Date = "2026-09-20".parse().unwrap();
+        let later: Date = "2026-10-02".parse().unwrap();
+        let heading = note_heading(today, "21:10");
+        journal
+            .add(
+                later,
+                spoken(
+                    1_758_000_000_000,
+                    &heading,
+                    "Ask Mira about the lease.",
+                    None,
+                ),
+            )
+            .unwrap();
+        let hit = &journal.search("mira", today).unwrap().hits[0];
+        assert!(hit.sealed && hit.snippet.is_empty() && hit.matches.is_empty());
+        assert_eq!(hit.date, "2026-10-02");
+        // Once the day comes, it reads like any entry.
+        let hit = &journal.search("mira", later).unwrap().hits[0];
+        assert!(!hit.sealed && hit.snippet.contains("Mira"));
         let _ = fs::remove_dir_all(journal.folder());
     }
 

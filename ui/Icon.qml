@@ -27,6 +27,8 @@ Item {
     "close": { box: [12, 12], stroke: "M2 2l8 8M10 2l-8 8", width: 1.6 },
     "return": { box: [14, 12], stroke: "M12.5 1.5v4.2a1.6 1.6 0 0 1-1.6 1.6H2M5 4.3L2 7.3l3 3", width: 1.5 },
     "search": { box: [14, 14], stroke: "M6 1.5a4.5 4.5 0 1 0 0 9a4.5 4.5 0 1 0 0-9ZM9.3 9.3l3.2 3.2", width: 1.5 },
+    "bell": { box: [14, 14], stroke: "M3.4 10.2V6.6a3.6 3.6 0 0 1 7.2 0v3.6l1.2 1.3H2.2ZM5.7 13a1.4 1.4 0 0 0 2.6 0", width: 1.3 },
+    "bell-off": { box: [14, 14], stroke: "M3.4 10.2V6.6a3.6 3.6 0 0 1 7.2 0v3.6l1.2 1.3H2.2ZM5.7 13a1.4 1.4 0 0 0 2.6 0M1.5 1.5l11 11", width: 1.3 },
     "dot": { box: [8, 8], fill: "M0 4a4 4 0 1 0 8 0a4 4 0 1 0-8 0Z" }
   })
   readonly property var glyph: glyphs[name] || glyphs["dot"]

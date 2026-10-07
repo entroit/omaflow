@@ -1,4 +1,5 @@
 import QtQuick
+import "Dates.js" as Dates
 
 // A deleted entry, still in its place for the ten seconds it can come back:
 // the whole entry greyed out, and under it Undo at full strength beside a
@@ -24,7 +25,7 @@ Item {
   Behavior on opacity { NumberAnimation { duration: 160 } }
 
   Accessible.role: Accessible.ListItem
-  Accessible.name: "Entry at " + entry.time + " deleted. Undo with Control Z."
+  Accessible.name: (String(entry.written || "") ? "Note from " + Dates.full(entry.written) : "Entry from " + entry.time) + " deleted. Undo with Control Z."
 
   JournalEntry {
     id: ghost
@@ -35,15 +36,17 @@ Item {
     opacity: 0.38
   }
 
-  // Under the entry, in its text column: Undo, and the time until it is
-  // gone, filling from one side to the other.
+  // Under the entry, in its text column: that it is deleted, Undo, and the
+  // time until it is gone, filling from one side to the other.
   Row {
     id: undoRow
     x: 16 + 40 + 16
     y: ghost.implicitHeight - 6
     spacing: 8
+    // Said in words too, as the to-do page's Undo bar does.
+    UiText { anchors.verticalCenter: parent.verticalCenter; text: "Deleted"; muted: true; rightPadding: 4 }
     Pill { anchors.verticalCenter: parent.verticalCenter; kind: "fill"; text: "Undo"; verticalPadding: 4; horizontalPadding: 12; onClicked: gone.undoRequested() }
-    Keycap { anchors.verticalCenter: parent.verticalCenter; compact: true; text: "Ctrl Z" }
+    Keycap { anchors.verticalCenter: parent.verticalCenter; compact: true; text: "Ctrl+Z" }
   }
   Rectangle {
     id: track

@@ -11,18 +11,36 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = ROOT / "target/release/omaflow"
+
+
+def binary():
+    """The installed OmaFlow first: a marketplace checkout has no build of its
+    own, so target/ only counts when a developer has built one."""
+    override = os.environ.get("OMAFLOW_BINARY")
+    if override:
+        return override
+    installed = Path.home() / ".local/lib/omaflow/current/omaflow"
+    if os.access(installed, os.X_OK):
+        return str(installed)
+    on_path = shutil.which("omaflow")
+    if on_path:
+        return on_path
+    built = ROOT / "target/release/omaflow"
+    if os.access(built, os.X_OK):
+        return str(built)
+    raise ValueError("OmaFlow is not installed yet. Run ./install in the OmaFlow folder.")
 
 def config_path():
     return Path(os.environ.get("OMAFLOW_CONFIG", str(Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home()/".config"))) / "omaflow/config.toml")))
 
 def config_command(*args):
-    result = subprocess.run([str(BINARY), *args], capture_output=True, text=True, timeout=8)
+    result = subprocess.run([binary(), *args], capture_output=True, text=True, timeout=8)
     if result.returncode != 0:
         # A mistake in config.toml: pass on what OmaFlow says about it.
         raise ValueError(result.stderr.strip() or result.stdout.strip() or "OmaFlow could not read its settings")
@@ -85,7 +103,7 @@ def parse_binding(value):
     if len(key) == 1:
         key = key.upper()
     if not names and not TYPES_NOTHING.fullmatch(key):
-        raise ValueError(f"{key} alone would stop typing {key} in every app. Add Super, Shift, Ctrl or Alt, or use a key that types nothing, such as F13.")
+        raise ValueError(f"{label(key)} alone would stop typing {label(key)} in every app. Add Super, Shift, Ctrl or Alt, or use a key that types nothing, such as F13.")
     order = ["SUPER", "CTRL", "ALT", "MOD5", "SHIFT"]
     return " + ".join(sorted(names, key=order.index) + [key])
 
@@ -97,12 +115,13 @@ LABELS = {"minus": "-", "equal": "=", "comma": ",", "period": ".", "slash": "/",
           "udiaeresis": "ü", "space": "Space", "Return": "Enter", "Prior": "Page Up", "Next": "Page Down",
           "Scroll_Lock": "Scroll Lock", "ISO_Level3_Shift": "AltGr", "Alt_R": "Right Alt",
           "Control_R": "Right Ctrl", "Super_R": "Right Super", "Shift_R": "Right Shift", "MOD5": "AltGr",
-          "periodcentered": "·", "endash": "–"}
+          "periodcentered": "·", "endash": "–", "Shift_L": "Shift", "Control_L": "Ctrl", "Alt_L": "Alt",
+          "Super_L": "Super"}
 
 
 def label(binding):
-    """"SUPER + ISO_Level3_Shift" -> "Super + AltGr"."""
-    return " + ".join(LABELS.get(part, part.title() if part.isupper() else part) for part in binding.split(" + "))
+    """"SUPER + ISO_Level3_Shift" -> "Super+AltGr", as the Hotkeys table writes it."""
+    return "+".join(LABELS.get(part, part.title() if part.isupper() else part) for part in binding.split(" + "))
 
 
 def base_keysym(keycode):
@@ -201,7 +220,7 @@ def save(keys, consumed, write_only=False):
         if key in consumed or (key in keys and binding.get("modmask", 0) == mask):
             raise ValueError(f"{key} already controls {binding.get('description') or 'another Hyprland action'}. Choose a different key.")
     apply({"keys": keys, "consumed": consumed}, write_only)
-    return "Shortcut saved: " + " + ".join(keys)
+    return "Hold to dictate: " + label(" + ".join(keys))
 
 
 def save_binding(action, value, write_only=False):

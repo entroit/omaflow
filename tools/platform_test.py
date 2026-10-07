@@ -14,7 +14,9 @@ import set_hotkey
 ROOT = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix="omaflow-platform-") as directory:
     base = Path(directory)
-    with patch.dict(os.environ, {"XDG_CONFIG_HOME":str(base), "OMAFLOW_CONFIG":str(base/"omaflow/config.toml")}):
+    # The checkout's own build, not whichever OmaFlow is installed here.
+    with patch.dict(os.environ, {"XDG_CONFIG_HOME":str(base), "OMAFLOW_CONFIG":str(base/"omaflow/config.toml"),
+                                 "OMAFLOW_BINARY":str(ROOT/"target/release/omaflow")}):
         def healthy(*args):
             return "[]" if args[-1] == "binds" else ""
         with patch.object(set_hotkey, "run", healthy):
@@ -132,7 +134,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-platform-") as directory:
         capture_output=True, text=True, timeout=10,
     )
     assert plan.returncode == 0, plan.stderr
-    assert 'download no models' in plan.stdout, plan.stdout
+    assert 'Download no models' in plan.stdout, plan.stdout
     assert 'ollama' not in plan.stdout.lower(), plan.stdout
     print("PASS the installer plans no model or Ollama work at all")
 
@@ -199,42 +201,53 @@ omarchy() {
 
     nemo_source = (ROOT/'scripts/install-nemo.sh').read_text()
     runtime_version = re.search(r'runtime_version="([0-9]+\.[0-9]+\.[0-9]+)"', nemo_source).group(1)
-    runtime_bytes = int(re.search(r'runtime_bytes=([0-9]+)', nemo_source).group(1))
-    runtime_sha256 = re.search(r'runtime_sha256="([0-9a-f]{64})"', nemo_source).group(1)
-    runtime_archive = f'nemo-speech-{runtime_version}-linux-x86_64-cuda.tar.gz'
-    runtime_root = runtime_archive.removesuffix('.tar.gz')
+    bytes_table = re.search(r'runtime_bytes=\(([^)]*)\)', nemo_source).group(1)
+    sha256_table = re.search(r'runtime_sha256=\(([^)]*)\)', nemo_source).group(1)
+    runtime_bytes = {name: int(value) for name, value in re.findall(r'\[(\w+)\]=([0-9]+)', bytes_table)}
+    runtime_sha256 = dict(re.findall(r'\[(\w+)\]="([0-9a-f]{64})"', sha256_table))
     assert runtime_version == '0.1.0'
-    assert runtime_bytes == 107310946
-    assert runtime_sha256 == 'e68628f396489c98fb353e070efaea5bc4977409ae7734fce56c251a79e29147'
+    assert runtime_bytes == {'cuda': 107310946, 'cpu': 4583913}
+    assert runtime_sha256 == {
+        'cuda': 'e68628f396489c98fb353e070efaea5bc4977409ae7734fce56c251a79e29147',
+        'cpu': '0f74131d631ad2c694cf0ec53490866bb6461147959589a69fb6fc231944065b',
+    }
     assert 'releases/download/v$runtime_version/$runtime_archive' in nemo_source
     for mutable_path in ['raw/main/', 'scripts/install.sh', 'git clone', '.tar.gz.sha256']:
         assert mutable_path not in nemo_source
 
-    fixture_source = base/'nemo-fixture-source'/runtime_root
-    fixture_binary = fixture_source/'bin/nemo-speech'
-    fixture_binary.parent.mkdir(parents=True)
-    fixture_binary.write_text(f'''#!/usr/bin/bash
-: > "$TEST_RUNTIME_EXECUTED"
-printf 'nemo-speech {runtime_version}\\n'
-''')
-    fixture_binary.chmod(0o755)
-    (fixture_source/'share').mkdir()
-    (fixture_source/'share/runtime.txt').write_text('verified fixture\n')
-    fixture_archive = base/'runtime.tar.gz'
-    with tarfile.open(fixture_archive, 'w:gz') as archive:
-        archive.add(fixture_source, arcname=runtime_root)
-    fixture_bytes = fixture_archive.stat().st_size
-    fixture_sha256 = hashlib.sha256(fixture_archive.read_bytes()).hexdigest()
+    def runtime_root(variant):
+        return f'nemo-speech-{runtime_version}-linux-x86_64-{variant}'
 
+    def fixture_archive(variant, reported_version):
+        source = base/f'nemo-fixture-source-{variant}-{reported_version}'/runtime_root(variant)
+        (source/'bin').mkdir(parents=True)
+        (source/'bin/nemo-speech').write_text(f'''#!/usr/bin/bash
+: > "$TEST_RUNTIME_EXECUTED"
+printf 'nemo-speech {reported_version}\\n'
+''')
+        (source/'bin/nemo-speech').chmod(0o755)
+        (source/'share').mkdir()
+        (source/'share/runtime.txt').write_text(f'verified {variant} fixture\n')
+        archive_path = base/f'runtime-{variant}-{reported_version}.tar.gz'
+        with tarfile.open(archive_path, 'w:gz') as archive:
+            archive.add(source, arcname=runtime_root(variant))
+        return archive_path
+
+    def pinned_to(archives, name):
+        script = fixture_repo/'scripts'/name
+        text = nemo_source
+        for variant, archive_path in archives.items():
+            text = (text
+                .replace(f'[{variant}]={runtime_bytes[variant]}', f'[{variant}]={archive_path.stat().st_size}')
+                .replace(runtime_sha256[variant], hashlib.sha256(archive_path.read_bytes()).hexdigest()))
+        script.write_text(text)
+        script.chmod(0o755)
+        return script
+
+    archives = {variant: fixture_archive(variant, runtime_version) for variant in ['cuda', 'cpu']}
     fixture_repo = base/'nemo-fixture-repo'
-    fixture_script = fixture_repo/'scripts/install-nemo.sh'
-    fixture_script.parent.mkdir(parents=True)
-    fixture_script.write_text(
-        nemo_source
-        .replace(f'runtime_bytes={runtime_bytes}', f'runtime_bytes={fixture_bytes}')
-        .replace(runtime_sha256, fixture_sha256)
-    )
-    fixture_script.chmod(0o755)
+    (fixture_repo/'scripts').mkdir(parents=True)
+    fixture_script = pinned_to(archives, 'install-nemo.sh')
     receipt_script = fixture_repo/'tools/install_receipt.py'
     receipt_script.parent.mkdir()
     receipt_script.write_text('''#!/usr/bin/env python3
@@ -245,24 +258,40 @@ Path(os.environ["TEST_RECEIPT"]).write_text(" ".join(sys.argv[1:]))
 ''')
 
     nemo_commands = base/'nemo-bin'; nemo_commands.mkdir()
+    # The archive served is the one the URL names, so a wrong choice of build
+    # shows up as a wrong marker rather than passing by accident.
     (nemo_commands/'curl').write_text(r'''#!/usr/bin/bash
 set -euo pipefail
 printf '%s\n' "$@" > "$TEST_CURL_ARGS"
 output=''
+url=''
 while (($#)); do
   case "$1" in
     -o|--output) output="$2"; shift 2 ;;
+    https://*) url="$1"; shift ;;
     *) shift ;;
   esac
 done
 [[ -n $output ]]
-cp "$TEST_RUNTIME_ARCHIVE" "$output"
+case "$url" in
+  *-cuda.tar.gz) cp "$TEST_RUNTIME_ARCHIVE_CUDA" "$output" ;;
+  *-cpu.tar.gz) cp "$TEST_RUNTIME_ARCHIVE_CPU" "$output" ;;
+  *) exit 22 ;;
+esac
 case "${TEST_CURL_MODE:-valid}" in
   valid) ;;
   tampered) printf X | dd of="$output" bs=1 seek=0 conv=notrunc status=none ;;
   oversized) printf X >> "$output" ;;
   fail) exit 7 ;;
 esac
+''')
+    # Stands in for the dynamic linker cache, the half of the NVIDIA check a
+    # test can control; the other half is this machine's own kernel driver.
+    (nemo_commands/'ldconfig').write_text(r'''#!/usr/bin/bash
+printf '1 libs found in cache `/etc/ld.so.cache'"'"'\n'
+if [[ ${TEST_LIBCUDA:-} == 1 ]]; then
+  printf '\tlibcuda.so.1 (libc6,x86-64) => /usr/lib/libcuda.so.1\n'
+fi
 ''')
     for path in nemo_commands.iterdir():
         path.chmod(0o755)
@@ -276,68 +305,74 @@ esac
         HOME=str(base),
         XDG_STATE_HOME=str(base/'state'),
         TEST_CURL_ARGS=str(curl_args),
-        TEST_RUNTIME_ARCHIVE=str(fixture_archive),
+        TEST_RUNTIME_ARCHIVE_CUDA=str(archives['cuda']),
+        TEST_RUNTIME_ARCHIVE_CPU=str(archives['cpu']),
         TEST_RUNTIME_EXECUTED=str(executed),
         TEST_RECEIPT=str(receipt),
     )
+    def install(prefix, script=fixture_script, **extra):
+        return subprocess.run(
+            [str(script), str(prefix)], env=dict(nemo_env, **extra),
+            capture_output=True, text=True, timeout=10,
+        )
+
+    # Without NVIDIA's driver library the CUDA build cannot even start, so a
+    # machine without it gets the CPU build.
     prefix = base/'nemo-runtime-good'
-    result = subprocess.run(
-        [str(fixture_script), str(prefix)], env=nemo_env,
-        capture_output=True, text=True, timeout=10,
-    )
+    result = install(prefix)
     assert result.returncode == 0, result.stderr
     assert executed.exists() and (prefix/'bin/nemo-speech').exists()
-    assert (prefix/'.nemo-speech-install').read_text() == f'{runtime_version} linux x86_64 cuda\n'
+    assert (prefix/'.nemo-speech-install').read_text() == '0.1.0 linux x86_64 cpu\n'
+    assert (prefix/'share/runtime.txt').read_text() == 'verified cpu fixture\n'
     assert receipt.read_text() == f'nemo-runtime {prefix}'
     arguments = curl_args.read_text().splitlines()
-    expected_url = f'https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v{runtime_version}/{runtime_archive}'
-    assert expected_url in arguments
-    assert arguments[arguments.index('--max-filesize')+1] == str(fixture_bytes)
+    assert 'https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v0.1.0/nemo-speech-0.1.0-linux-x86_64-cpu.tar.gz' in arguments
+    assert arguments[arguments.index('--max-filesize')+1] == str(archives['cpu'].stat().st_size)
     assert arguments[arguments.index('--proto')+1] == '=https'
     assert arguments[arguments.index('--proto-redir')+1] == '=https'
     assert '--tlsv1.2' in arguments
     assert arguments[arguments.index('--retry')+1] == '3'
 
+    # Running it again on the same machine downloads nothing.
+    curl_args.unlink(); receipt.unlink()
+    result = install(prefix)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f'NeMo-Speech runtime (cpu) already installed at {prefix}\n'
+    assert not curl_args.exists() and not receipt.exists()
+
+    # With the driver library present, the build follows the kernel driver:
+    # a machine with an NVIDIA GPU switches to the CUDA build, one without
+    # keeps the CPU build it has.
+    has_nvidia_kernel_driver = Path('/proc/driver/nvidia/version').exists()
+    result = install(prefix, TEST_LIBCUDA='1')
+    assert result.returncode == 0, result.stderr
+    if has_nvidia_kernel_driver:
+        assert (prefix/'.nemo-speech-install').read_text() == '0.1.0 linux x86_64 cuda\n'
+        assert (prefix/'share/runtime.txt').read_text() == 'verified cuda fixture\n'
+        assert 'https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v0.1.0/nemo-speech-0.1.0-linux-x86_64-cuda.tar.gz' in curl_args.read_text().splitlines()
+        assert not (base/'nemo-runtime-good.old').exists() and not (base/'nemo-runtime-good.new').exists()
+        # Losing the driver switches back.
+        result = install(prefix)
+        assert result.returncode == 0, result.stderr
+        assert (prefix/'.nemo-speech-install').read_text() == '0.1.0 linux x86_64 cpu\n'
+    else:
+        assert result.stdout == f'NeMo-Speech runtime (cpu) already installed at {prefix}\n'
+    # Switching builds keeps the prefix OmaFlow created, so no second receipt.
+    assert not receipt.exists()
+
     executed.unlink()
-    fixture_binary.write_text('''#!/usr/bin/bash
-: > "$TEST_RUNTIME_EXECUTED"
-printf 'nemo-speech 9.9.9\\n'
-''')
-    fixture_binary.chmod(0o755)
-    wrong_version_archive = base/'wrong-version.tar.gz'
-    with tarfile.open(wrong_version_archive, 'w:gz') as archive:
-        archive.add(fixture_source, arcname=runtime_root)
-    wrong_version_bytes = wrong_version_archive.stat().st_size
-    wrong_version_sha256 = hashlib.sha256(wrong_version_archive.read_bytes()).hexdigest()
-    wrong_version_script = fixture_repo/'scripts/install-nemo-wrong-version.sh'
-    wrong_version_script.write_text(
-        nemo_source
-        .replace(f'runtime_bytes={runtime_bytes}', f'runtime_bytes={wrong_version_bytes}')
-        .replace(runtime_sha256, wrong_version_sha256)
-    )
-    wrong_version_script.chmod(0o755)
-    wrong_version_env = dict(nemo_env, TEST_RUNTIME_ARCHIVE=str(wrong_version_archive))
-    result = subprocess.run(
-        [str(wrong_version_script), str(base/'nemo-runtime-wrong-version')],
-        env=wrong_version_env, capture_output=True, text=True, timeout=10,
-    )
+    wrong_version_script = pinned_to({'cpu': fixture_archive('cpu', '9.9.9')}, 'install-nemo-wrong-version.sh')
+    result = install(base/'nemo-runtime-wrong-version', script=wrong_version_script,
+                     TEST_RUNTIME_ARCHIVE_CPU=str(base/'runtime-cpu-9.9.9.tar.gz'))
     assert result.returncode != 0 and 'did not report version' in result.stderr
     assert executed.exists() and not (base/'nemo-runtime-wrong-version').exists()
     executed.unlink()
 
-    bad_env = dict(nemo_env, TEST_CURL_MODE='tampered')
-    result = subprocess.run(
-        [str(fixture_script), str(base/'nemo-runtime-bad-hash')],
-        env=bad_env, capture_output=True, text=True, timeout=10,
-    )
+    result = install(base/'nemo-runtime-bad-hash', TEST_CURL_MODE='tampered')
     assert result.returncode != 0 and 'checksum verification' in result.stderr
     assert not executed.exists()
 
-    oversized_env = dict(nemo_env, TEST_CURL_MODE='oversized')
-    result = subprocess.run(
-        [str(fixture_script), str(base/'nemo-runtime-oversized')],
-        env=oversized_env, capture_output=True, text=True, timeout=10,
-    )
+    result = install(base/'nemo-runtime-oversized', TEST_CURL_MODE='oversized')
     assert result.returncode != 0 and 'expected exactly' in result.stderr
     assert not executed.exists()
 
@@ -347,7 +382,7 @@ printf 'nemo-speech 9.9.9\\n'
     program = 'temporary="$1"\ntrap '+"'"+target+"' EXIT\nexit 0\n"
     result = subprocess.run(['bash','-c',program,'test',str(temporary)], start_new_session=True, timeout=3)
     assert result.returncode == 0 and not temporary.exists()
-    print("PASS the NeMo runtime uses one exact, bounded, verified release artifact with no source fallback")
+    print("PASS the NeMo runtime is one exact, bounded, verified release artifact per build, chosen by the NVIDIA driver, with no source fallback")
 
 # The sandboxed daemon can only write a journal folder opened to it: the tool
 # creates the folder, writes the drop-in once, and leaves it alone after.
@@ -374,6 +409,22 @@ print("PASS the journal folder is created and opened to the sandboxed daemon onc
 # AltGr is Hyprland's MOD5, and a key recorded by its physical code (because
 # AltGr or Shift changed what it types) is named as Hyprland matches it.
 assert set_hotkey.parse_binding("altgr + code:60") == "MOD5 + period"   # the same key on US and German layouts
-assert set_hotkey.label("MOD5 + period") == "AltGr + ."
+assert set_hotkey.label("MOD5 + period") == "AltGr+."
+assert set_hotkey.label(" + ".join(["ISO_Level3_Shift", "Menu"])) == "AltGr+Menu"
 assert set_hotkey.parse_binding("super + mod5 + j") == "SUPER + MOD5 + J"
 print("PASS AltGr bindings and physical keys are named the way Hyprland matches them")
+
+# Notes and reminders are marked delivered before the shell sends them, so a
+# title or body that notify-send took for an option ("- call mom", "-v renew
+# the cert") would be lost for good. Every notify-send in the host ends its
+# options with "--" before the words.
+host = (ROOT / "hosts/omarchy/OmaFlow.qml").read_text()
+calls = re.findall(r'\["notify-send",(.*?)\]', host, flags=re.S)
+assert len(calls) >= 3, calls
+for call in calls:
+    arguments = [part.strip() for part in call.split(",")]
+    assert '"--"' in arguments, call
+    options = arguments[:arguments.index('"--"')]
+    # Only literal flags and their literal values may come before "--".
+    assert all(part.startswith('"') and part.endswith('"') for part in options), call
+print('PASS every notify-send in the shell ends its options before the words')

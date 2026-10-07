@@ -90,6 +90,7 @@ fi
 
 # 7. The capture actually yields PCM in OmaFlow's exact format
 if command -v pw-cat >/dev/null; then
+  printf '  ...   listening to the microphone for 3 seconds to check it\n'
   captured=$(timeout 3 pw-cat --record --raw --format s16 --rate 16000 --channels 1 \
              --latency 32ms --media-category Capture --media-role Communication - 2>/dev/null \
              | head -c 32000 | wc -c)

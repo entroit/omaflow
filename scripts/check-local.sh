@@ -30,6 +30,7 @@ python3 tools/runtime_test.py
 python3 tools/platform_test.py
 python3 tools/installation_test.py
 python3 tools/scoring_test.py
+python3 tools/copy_lint.py
 lua tools/hotkey_test.lua
 shellcheck install link-local scripts/preflight.sh scripts/install-nemo.sh scripts/install-release scripts/package-release scripts/check-local.sh
 for script in install link-local scripts/preflight.sh scripts/install-nemo.sh scripts/install-release scripts/package-release scripts/check-local.sh; do
@@ -44,7 +45,12 @@ if ((full)); then
   tools/cleanup_itn_gate.py
   tools/dictation_modes_gate.py
   python3 tools/ui_smoke.py
-  omarchy plugin validate .
+  # Validate what git publishes, not local agent and editor folders, which
+  # hold symlinks the marketplace never sees.
+  published="$(mktemp -d)"
+  git ls-files -z --cached --others --exclude-standard | xargs -0 cp --parents -t "$published"
+  omarchy plugin validate "$published"
+  rm -rf "$published"
 fi
 
 printf '\nLocal checks passed.\n'

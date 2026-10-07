@@ -9,6 +9,9 @@ Item {
   property string caption: ""
   property bool monoCaption: false
   property bool last: false
+  // A next step under the caption, such as where to turn something on.
+  property string link: ""
+  signal linkClicked()
   default property alias control: slot.data
 
   width: parent ? parent.width : 400
@@ -32,6 +35,17 @@ Item {
       // A path keeps both ends; a sentence wraps.
       elide: row.monoCaption ? Text.ElideMiddle : Text.ElideNone
       wrapMode: row.monoCaption ? Text.NoWrap : Text.Wrap
+    }
+    Pill {
+      visible: row.link.length > 0
+      kind: "link"
+      text: row.link
+      size: 13
+      // The text lines up with the caption; the hover shape reaches past it.
+      x: -6
+      horizontalPadding: 6
+      verticalPadding: 2
+      onClicked: row.linkClicked()
     }
   }
 

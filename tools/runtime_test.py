@@ -36,6 +36,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
             "import json, os, sys; from pathlib import Path\n"
             "runtime = Path(os.environ['XDG_RUNTIME_DIR'])\n"
             "with (runtime / 'hyprctl-log').open('a') as log: log.write(json.dumps(sys.argv[1:]) + chr(10))\n"
+            "if (runtime / 'paste-fail').exists() and 'send_key_state' in ' '.join(sys.argv): sys.exit(1)\n"
             "print('{\"address\":\"0xtest\",\"class\":\"test\"}')\n"
         ),
         "systemctl": "import os; from pathlib import Path; (Path(os.environ[\"XDG_RUNTIME_DIR\"])/\"model-command\").touch()",
@@ -66,7 +67,8 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
             "elif not (runtime / 'capture-fixture').exists():\n"
             "    time.sleep(120)\n"
             "else:\n"
-            "    sys.stdout.buffer.write(b'\\x01\\x00' * 1600)\n"
+            "    sample = b'\\x00\\x40' if (runtime / 'capture-loud').exists() else b'\\x01\\x00'\n"
+            "    sys.stdout.buffer.write(sample * 1600)\n"
             "    sys.stdout.buffer.flush()\n"
             "    def finish(_signal, _frame):\n"
             "        sys.stdout.buffer.write(b'\\x02\\x00' * 320)\n"
@@ -80,6 +82,8 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
             "runtime = Path(os.environ['XDG_RUNTIME_DIR'])\n"
             "if sys.argv[1] == 'get-volume':\n"
             "    print('Volume: 0.80')\n"
+            "elif sys.argv[1] == 'inspect':\n"
+            "    print('  * node.description = \"Fixture Microphone\"')\n"
             "else:\n"
             "    with (runtime / 'volume-log').open('a') as log: log.write(sys.argv[-1] + chr(10))\n"
         ),
@@ -146,6 +150,26 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         (runtime / "clipboard-ok").touch()
         send("copy")
         wait_until(lambda: state()["error"] == "" and state()["feedback"] == "Copied to clipboard")
+        # The same message twice still counts as new.
+        serial = state()["feedback_serial"]
+        send("copy")
+        wait_until(lambda: state()["feedback_serial"] > serial)
+        # An edit, and Keep the raw text, can be undone like a delete.
+        entry = state()["history"][0]
+        send("history-edit:" + json.dumps({"id": entry["id"], "text": "Edited by hand."}))
+        wait_until(lambda: state()["feedback"] == "Changes saved" and state()["can_undo_delete"])
+        assert state()["history"][0]["edited"] is True
+        send("history-undo")
+        wait_until(lambda: state()["feedback"] == "Previous text restored")
+        assert state()["history"][0]["text"] == entry["text"] and not state()["history"][0]["edited"]
+        send("history-edit:" + json.dumps({"id": entry["id"], "text": "  "}))
+        wait_until(lambda: state()["feedback"].startswith("A dictation can't be empty."))
+        # Undo goes with the delete's own message, not with whatever comes next.
+        send("history-delete:" + str(state()["history"][0]["id"]))
+        wait_until(lambda: state()["can_undo_delete"] and state()["feedback"] == "Dictation deleted")
+        send("copy")
+        wait_until(lambda: state()["feedback"] == "Copied to clipboard")
+        assert not state()["can_undo_delete"]
 
     def ipc(case, runtime, state, send):
         with socket.socket(socket.AF_UNIX) as blocker:
@@ -182,9 +206,90 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         assert not (case / "state/omaflow/audio").exists(), "dictation audio is off by default"
         assert state()["history"][0]["audio"] is False
 
+    def saved_failure(case, runtime, state, send):
+        # With History on, a dictation the speech engine fails is saved there
+        # with its recording: closing the card or another take loses nothing.
+        (runtime / "capture-fixture").touch()
+        (runtime / "asr-fail").touch()
+        def fail_a_dictation():
+            send("press")
+            wait_until(lambda: state()["phase"] == "recording")
+            time.sleep(.08)
+            send("release")
+            wait_until(lambda: state()["phase"] == "error")
+            return state()["history"][0]
+        entry = fail_a_dictation()
+        reason = entry["status"]["reason"]
+        assert entry["status"]["state"] == "not_transcribed" and entry["text"] == "" and entry["audio"], entry
+        assert state()["error"].startswith(reason), state()["error"]
+        assert state()["error"].endswith("Your recording is saved in History."), state()["error"]
+        assert state()["can_retry"] and state()["kept_in_history"] and state()["card_timer"] is None
+        audio = case / "state/omaflow/audio" / f'{entry["id"]}.wav'
+        assert audio.read_bytes()[40:44] == (3840).to_bytes(4, "little")
+        # Try again on the card fills the same entry and pastes like a dictation.
+        (runtime / "asr-fail").unlink()
+        send("retry")
+        wait_until(lambda: state()["phase"] == "result" and state()["text"] == "Complete fixture transcript.")
+        assert [item["id"] for item in state()["history"]] == [entry["id"]]
+        filled = state()["history"][0]
+        assert filled["text"] == "Complete fixture transcript." and "status" not in filled, filled
+        # Dictation audio is off, so the recording goes once it has done its job.
+        wait_until(lambda: not audio.exists())
+        assert filled["audio"] is False
+        send("close")
+        wait_until(lambda: state()["phase"] == "idle")
+        # Esc closes the card of a saved one; the entry stays in History.
+        (runtime / "asr-fail").touch()
+        entry = fail_a_dictation()
+        send("close")
+        wait_until(lambda: state()["phase"] == "idle" and not state()["can_retry"])
+        assert state()["history"][0]["id"] == entry["id"]
+        # Transcribe again from History while it still fails: it stays.
+        send(f"history-retry:{entry['id']}")
+        wait_until(lambda: state()["feedback_error"] and state()["feedback"].startswith("Still not transcribed. "))
+        assert state()["history"][0]["status"]["state"] == "not_transcribed"
+        assert state()["history_transcribing"] == []
+        # Once it works, the entry is filled in and nothing is pasted or copied.
+        (runtime / "asr-fail").unlink()
+        (runtime / "copy-attempt").unlink(missing_ok=True)
+        log = runtime / "hyprctl-log"
+        pastes = log.read_text().count("send_key") if log.exists() else 0
+        send(f"history-retry:{entry['id']}")
+        send(f"history-retry:{entry['id']}")
+        wait_until(lambda: state()["feedback"] == "Transcribed. Paste or copy it from History.")
+        assert state()["history"][0]["text"] == "Complete fixture transcript."
+        assert state()["phase"] == "idle", "the card never shows"
+        assert not (runtime / "copy-attempt").exists(), "not copied"
+        assert (log.read_text().count("send_key") if log.exists() else 0) == pastes, "not pasted"
+        # Asking twice transcribed it once; asking again changes nothing.
+        serial = state()["feedback_serial"]
+        send(f"history-retry:{entry['id']}")
+        time.sleep(.3)
+        assert state()["feedback_serial"] == serial and len(state()["history"]) == 2
+        # Discard on the card deletes the saved dictation, with Undo.
+        (runtime / "asr-fail").touch()
+        entry = fail_a_dictation()
+        send("discard")
+        wait_until(lambda: state()["phase"] == "idle" and state()["feedback"] == "Dictation deleted")
+        assert state()["can_undo_delete"] and entry["id"] not in [item["id"] for item in state()["history"]]
+        send("history-undo")
+        wait_until(lambda: state()["history"][0]["id"] == entry["id"])
+        assert (case / "state/omaflow/audio" / f'{entry["id"]}.wav').exists()
+        # A journal take that fails keeps today's behaviour: memory only.
+        send("journal-toggle")
+        wait_until(lambda: state()["phase"] == "recording")
+        time.sleep(.08)
+        send("journal-toggle")
+        wait_until(lambda: state()["phase"] == "error")
+        assert state()["can_retry"] and not state()["kept_in_history"]
+        assert state()["error"].endswith("Your recording is kept until you start another."), state()["error"]
+        assert len(state()["history"]) == 3
+
     def retry_failed(case, runtime, state, send):
-        # The speech engine fails a complete recording: it is kept, and the
-        # card waits for Try again instead of closing on a timer.
+        # With History off, a recording the speech engine fails is kept in
+        # memory, and the card waits for Try again instead of closing on a timer.
+        send('configure:{"key":"history_limit","value":0}')
+        wait_until(lambda: state()["history_limit"] == 0)
         (runtime / "capture-fixture").touch()
         (runtime / "asr-fail").touch()
         send("press")
@@ -192,8 +297,10 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         time.sleep(.08)
         send("release")
         wait_until(lambda: state()["phase"] == "error")
-        assert state()["can_retry"] is True, state()["error"]
-        assert state()["error"].endswith("Your recording is kept."), state()["error"]
+        assert state()["can_retry"] is True and state()["kept_in_history"] is False, state()["error"]
+        assert state()["error"].endswith("Your recording is kept until you start another."), state()["error"]
+        assert state()["history"] == []
+        assert state()["error_action"] == ""
         assert state()["card_timer"] is None
         # Try again sends the same recording, and this time it goes through.
         (runtime / "asr-fail").unlink()
@@ -201,8 +308,12 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         wait_until(lambda: state()["phase"] == "result" and state()["text"] == "Complete fixture transcript.")
         request = (runtime / "asr-request").read_bytes()
         assert int.from_bytes(request[40:44], "little") == 3840, "the whole recording, sent again"
-        # Closing a failed card lets the recording go: nothing to try again.
+        # The clipboard did not take the words and History is off, so the
+        # card is their only copy: Esc leaves it, Discard ends it.
         send("close")
+        time.sleep(.2)
+        assert state()["phase"] == "result"
+        send("discard")
         wait_until(lambda: state()["phase"] == "idle")
         (runtime / "asr-fail").touch()
         send("press")
@@ -210,7 +321,13 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         time.sleep(.08)
         send("release")
         wait_until(lambda: state()["phase"] == "error" and state()["can_retry"])
+        # Esc and the close button leave a kept recording alone; Discard
+        # lets it go.
         send("close")
+        send("dismiss")
+        time.sleep(.2)
+        assert state()["phase"] == "error" and state()["can_retry"]
+        send("discard")
         wait_until(lambda: state()["phase"] == "idle" and not state()["can_retry"])
         send("retry")
         time.sleep(.2)
@@ -225,6 +342,16 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         send("release")
         wait_until(lambda: state()["phase"] == "notice")
         assert state()["can_retry"] is False and state()["card_timer"]["total_ms"] > 0
+        # Nothing reached the meter either: the card gives its own advice.
+        assert state()["feedback"] == "", state()["feedback"]
+        # A voice the meter heard that left no words says to come closer.
+        (runtime / "capture-loud").touch()
+        send("press")
+        wait_until(lambda: state()["phase"] == "recording")
+        time.sleep(.08)
+        send("release")
+        wait_until(lambda: state()["phase"] == "notice" and state()["feedback"])
+        assert state()["feedback"] == "No words came through. Try again a little closer to the microphone."
 
     def settings(case, runtime, state, send):
         send('configure:{"key":"style","value":"verbatim"}')
@@ -241,6 +368,25 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         wait_until(lambda: not state()["cleanup_enabled"])
         result = subprocess.run([str(BINARY), "not-a-command"], capture_output=True, text=True, timeout=2)
         assert result.returncode != 0 and "unknown command" in result.stderr
+        # A word already there is an error, so the field keeps it.
+        send("vocabulary-add:Zephyrine")
+        wait_until(lambda: "Zephyrine" in state()["custom_vocabulary"])
+        send("vocabulary-add:ZEPHYRINE")
+        wait_until(lambda: state()["feedback_error"] and state()["feedback"] == "Zephyrine is already in your words.")
+        # A setting says what it did.
+        send("press"); time.sleep(.06); send("release")
+        wait_until(lambda: len(state()["history"]) == 1)
+        send("close")
+        send('configure:{"key":"history_limit","value":0}')
+        wait_until(lambda: state()["feedback"] == "History is off. 1 saved dictation deleted.")
+        assert state()["input_device"] == "Fixture Microphone"
+        assert state()["asr_failed"] is False
+        # A threshold set by number is a manual one, as with the slider.
+        assert state()["meter_gate_auto"] is True
+        send("meter-gate:-50")
+        wait_until(lambda: state()["meter_gate_db"] == -50 and state()["meter_gate_auto"] is False)
+        behavior = __import__("tomllib").loads((case/"config.toml").read_text())["behavior"]
+        assert behavior["meter_gate_db"] == -50 and behavior["meter_gate_auto"] is False, behavior
 
 
     def models(case, runtime, state, send):
@@ -277,6 +423,15 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         assert state()["text"] and not state()["history"]
         assert (case/'state/omaflow/history.json').read_bytes() == before
         assert not (case/'state/omaflow/training.jsonl').exists()
+        # The clipboard did not take the words either, so the card is their
+        # only copy: Esc and a notice leave it, only Discard or a copy end it.
+        assert "History is off" in state()["error"], state()["error"]
+        send("close"); send("dismiss")
+        send('configure:{"key":"duck_audio_percent","value":40}')
+        wait_until(lambda: state()["feedback"] == "Other audio now drops by 40% while you record.")
+        assert state()["phase"] == "result" and state()["error"], "the words are still on the card"
+        send("discard")
+        wait_until(lambda: state()["phase"] == "idle")
 
     def pending_models(case, runtime, state, send):
         time.sleep(.2)
@@ -285,9 +440,27 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         send('configure:{"key":"models_configured","value":false}')
         wait_until(lambda: state()["model_settings"]["configured"] is False)
         send('press')
-        wait_until(lambda: 'Models not configured' in state()["error"])
+        wait_until(lambda: state()["error"].startswith("Nothing was recorded."))
+        assert "Parakeet TDT 0.6B v3 (714 MB)" in state()["error"], state()["error"]
+        assert state()["error_action"] == "choose_model"
         assert state()["phase"] != "recording"
         send('close')
+        # While the chosen model is still downloading, the card says so. How
+        # far it is comes from the download itself, which keeps moving.
+        progress = {"id": "nvidia/parakeet-tdt-0.6b-v3", "percent": 62, "message": ""}
+        send('model-progress:' + json.dumps(dict(progress, state="downloading")))
+        wait_until(lambda: state()["phase"] == "idle" and state()["model_downloads"])
+        send('press')
+        wait_until(lambda: state()["error_action"] == "downloading")
+        assert state()["error"].startswith("Hold "), state()["error"]
+        assert state()["error"].endswith(" again when Parakeet TDT 0.6B v3 finishes."), state()["error"]
+        error = state()["error"]
+        send('model-progress:' + json.dumps(dict(progress, state="downloading", percent=71)))
+        wait_until(lambda: state()["model_downloads"][progress["id"]]["percent"] == 71)
+        assert state()["error"] == error, "the words carry no figure to go stale"
+        send('close')
+        send('model-progress:' + json.dumps(dict(progress, state="cancelled")))
+        wait_until(lambda: state()["phase"] == "idle" and not state()["model_downloads"])
         send('configure:{"key":"models","value":{"speech_model":"saved-but-not-started"}}')
         wait_until(lambda: state()["model_settings"]["speech_model"] == 'saved-but-not-started')
         assert state()["model_settings"]["configured"] is False
@@ -320,6 +493,31 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         send("paste-last")
         wait_until(lambda: state()["feedback"] == "Copied to clipboard")
         assert not state()["feedback_error"]
+
+    def missed_paste(case, runtime, state, send):
+        # A paste that does not reach the window leaves the words copied, and
+        # the card closes on its own like the clipboard card.
+        (runtime / "clipboard-ok").touch()
+        (runtime / "paste-fail").touch()
+        send("press"); time.sleep(.06); send("release")
+        wait_until(lambda: state()["phase"] == "result")
+        assert not state()["paste_sent"] and not state()["error"]
+        assert not state()["history"][0]["pasted"]
+        timer = state()["card_timer"]
+        assert timer["total_ms"] == 5000 and 0 < timer["remaining_ms"] <= 5000, timer
+        # Pointing at it stops the clock, and letting go starts it again.
+        send("card-hold")
+        wait_until(lambda: state()["card_timer"]["remaining_ms"] is None)
+        send("card-resume")
+        wait_until(lambda: state()["card_timer"]["remaining_ms"] is not None)
+        # Paste again from History misses the same way, and closes the same way.
+        send("paste-last")
+        wait_until(lambda: state()["feedback"] == "Copied to clipboard")
+        assert state()["phase"] == "result" and state()["card_timer"]["total_ms"] == 5000
+        # A new take closes it.
+        send("press")
+        wait_until(lambda: state()["phase"] == "recording")
+        send("cancel")
 
     def custom_paste(case, runtime, state, send):
         (runtime / "clipboard-ok").touch()
@@ -382,6 +580,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
     def journal_take(case, runtime, state, send):
         send("journal-toggle")
         wait_until(lambda: state()["phase"] == "recording" and state()["journal_take"] and state()["latched"])
+        assert state()["take_date"] == "", "today's entry names no day"
         send("journal-toggle")
         wait_until(lambda: state()["phase"] == "journal-saved")
         saved = state()["journal_saved"]
@@ -415,6 +614,18 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         found = json.loads(subprocess.run([str(BINARY), "journal", "search", "window"],
                                           env=env, capture_output=True, text=True, timeout=5).stdout)
         assert found["days"] == [added["date"]] and found["hits"][0]["matches"] == [[15, 6]]
+        # A past day can still be written; the entry says when it was added.
+        send("journal-toggle:2020-01-02")
+        wait_until(lambda: state()["phase"] == "recording" and state()["journal_take"])
+        assert state()["take_date"] == "2020-01-02"
+        send("journal-toggle")
+        wait_until(lambda: state()["phase"] == "journal-saved")
+        assert state()["journal_saved"]["date"] == "2020-01-02"
+        past = (case / "Journal" / "2020-01-02.md").read_text()
+        assert ", added " + added["date"] + "\n<!-- omaflow:" in past, past
+        listed = json.loads(subprocess.run([str(BINARY), "journal", "day", "2020-01-02"],
+                                           env=env, capture_output=True, text=True, timeout=5).stdout)
+        assert [entry["added"] for entry in listed["entries"]] == [added["date"]]
 
     def todo_take(case, runtime, state, send):
         send("todo-toggle")
@@ -430,7 +641,8 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         # Undo on the card takes exactly the capture back out.
         revision = state()["todos_revision"]
         send("todo-undo")
-        wait_until(lambda: state()["todos_revision"] > revision and state()["phase"] == "idle")
+        wait_until(lambda: state()["todos_revision"] > revision and state()["phase"] == "notice")
+        assert state()["feedback"] == "1 to-do taken out", state()["feedback"]
         assert "- [ ]" not in (case / "To-dos" / "To-dos.md").read_text()
         # Held like the dictation key: letting go adds them.
         send("todo-press")
@@ -456,6 +668,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         send("todo-toggle")
         wait_until(lambda: state()["phase"] == "todos-saved")
         assert state()["todos_saved"]["items"][0]["list"] == "Infra"
+        assert state()["todos_saved"]["changed"] is False
         send("todo-move:Dev")
         wait_until(lambda: state()["todos_saved"]["moved"] and state()["todo_list"] == "Dev")
         listed = json.loads(subprocess.run([str(BINARY), "todos", "list"], env=env, capture_output=True, text=True, timeout=5).stdout)
@@ -482,6 +695,8 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         assert state()["phase"] == "todos-saved"
         send("todo-card-edit:" + json.dumps({"index": saved["index"], "text": saved["text"], "new_text": "Renew the certs"}))
         wait_until(lambda: state()["todos_saved"]["items"][0]["text"] == "Renew the certs")
+        # Undo would no longer take back just what was said, and the card says so.
+        assert state()["todos_saved"]["changed"] is True
         edited = state()["todos_saved"]["items"][0]
         assert edited["due"] == "2026-10-09" and edited["list"] == "Infra", "an edit keeps the date and list"
         assert "- [ ] Renew the certs 📅 2026-10-09" in (case / "To-dos" / "To-dos.md").read_text()
@@ -504,6 +719,29 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
                                                       text=True, timeout=5, check=True).stdout)["reminders"]
         assert [todo["text"] for todo in reminders()] == ["Call Mira"]
         assert reminders() == [], "once"
+        todos = lambda *args: json.loads(subprocess.run([str(BINARY), "todos", *args], env=env, capture_output=True,
+                                                        text=True, timeout=5, check=True).stdout)
+        index = str(added["index"])
+        assert todos("list")["reminded"] == [added["index"]], "Today bubbles it up with Later and Done"
+        # Later: it comes back once at the new moment and leaves Bubbled up.
+        until = todos("snooze", index, "Call Mira", "15")["until"]
+        file = lambda: (case / "To-dos" / "To-dos.md").read_text()
+        assert f"- [ ] Call Mira 🕒 {clock} ⏰ {until} 📅 {today}" in file(), file()
+        assert todos("list")["reminded"] == [] and reminders() == []
+        # Off keeps the time; default goes back to the plain line.
+        todos("remind", index, "Call Mira", "off")
+        assert f"- [ ] Call Mira 🕒 {clock} 📅 {today}" in file(), file()
+        todos("remind", index, "Call Mira", "default")
+        assert f"- [ ] Call Mira ⏰ {today} {clock} 📅 {today}" in file(), file()
+        # Said with the to-do, a reminder is its own and its words are dropped.
+        fed = todos("add", "Feed the cat tomorrow at 5pm, remind me 10 minutes before")["added"][0]
+        assert fed["text"] == "Feed the cat" and fed["reminder"] == f"{fed['due']} 16:50", fed
+        # How early reminders come is a setting, from the offered choices only.
+        send('configure:{"key":"todos_remind_before","value":15}')
+        wait_until(lambda: state()["todo_settings"]["remind_before"] == 15)
+        send('configure:{"key":"todos_remind_before","value":7}')
+        wait_until(lambda: state()["feedback_error"])
+        assert state()["todo_settings"]["remind_before"] == 15
         # The card's own close button closes it even mid-edit.
         send("todo-toggle")
         wait_until(lambda: state()["phase"] == "recording")
@@ -513,6 +751,19 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         time.sleep(.1)
         send("dismiss")
         wait_until(lambda: state()["phase"] == "idle")
+        # The list moves to another folder with its own files, and the
+        # setting moves with it; a list already there stops the move.
+        moved_to = case / "Moved"
+        assert todos("move-folder", str(moved_to)) == {"moved": True, "folder": str(moved_to), "left_behind": []}
+        assert (moved_to / "To-dos.md").is_file() and not (case / "To-dos" / "To-dos.md").exists()
+        assert __import__("tomllib").loads((case / "config.toml").read_text())["todos"]["folder"] == str(moved_to)
+        (case / "To-dos" / "To-dos.md").write_text("- [ ] Theirs\n")
+        clash = subprocess.run([str(BINARY), "todos", "move-folder", str(case / "To-dos")], env=env,
+                               capture_output=True, text=True, timeout=5)
+        assert clash.returncode != 0 and json.loads(clash.stdout)["error"] == (
+            f"To-dos.md already exists in {case / 'To-dos'}. Nothing was moved. "
+            "Move or rename it there, or choose another folder."), clash.stdout
+        assert (moved_to / "To-dos.md").is_file()
 
     def journal_recording(case, runtime, state, send):
         (runtime / "capture-fixture").touch()
@@ -579,6 +830,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
     run_case("history changes survive failed storage without false success", True, failed_history_write)
     run_case("dictation ducks the sink and always restores it", False, audio_ducking)
     run_case("clipboard-only delivery never reports a paste", True, clipboard_only)
+    run_case("a missed paste stays copied and its card closes on its own", True, missed_paste)
     run_case("custom paste saves atomically and injects only a validated chord", True, custom_paste)
     run_case("clipboard failure retains text; clear undo; copy errors", True, delivery)
     run_case("incomplete IPC client cannot block controls", True, ipc)
@@ -590,9 +842,15 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         backend='engine="openai"\nendpoint="http://fixture.invalid/transcribe"\n',
     )
     run_case(
-        "a failed transcription keeps its recording, and Try again sends it again",
+        "with History off, a failed transcription keeps its recording, and Try again sends it again",
         False,
         retry_failed,
+        backend='engine="openai"\nendpoint="http://fixture.invalid/transcribe"\n',
+    )
+    run_case(
+        "a failed dictation is saved in History, transcribed again there or from its card",
+        False,
+        saved_failure,
         backend='engine="openai"\nendpoint="http://fixture.invalid/transcribe"\n',
     )
     run_case("validated dictation preferences; unknown settings and commands rejected", True, settings)
@@ -602,3 +860,62 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
     run_case("deferred models block recording until explicitly enabled", True, pending_models, pending=True)
 
     run_case("history disabled writes no dictated text or training sample", True, no_saved_dictation)
+
+    # A marketplace checkout has no target/ build: the hotkey writer finds the
+    # installed binary instead, and failing that, omaflow on PATH.
+    checkout = base / "marketplace-checkout"
+    (checkout / "tools").mkdir(parents=True)
+    (checkout / "tools/set_hotkey.py").write_bytes((ROOT / "tools/set_hotkey.py").read_bytes())
+    for installed in (True, False):
+        home = base / f"home-{installed}"
+        config_home = home / ".config"
+        (config_home / "omaflow").mkdir(parents=True)
+        tools = base / f"bin-{installed}"
+        tools.mkdir()
+        (tools / "hyprctl").write_text("#!/usr/bin/python3\nprint('[]')\n")
+        (tools / "hyprctl").chmod(0o755)
+        if installed:
+            release = home / ".local/lib/omaflow/current"
+            release.mkdir(parents=True)
+            (release / "omaflow").symlink_to(BINARY)
+        else:
+            (tools / "omaflow").symlink_to(BINARY)
+        env = {key: value for key, value in os.environ.items() if key != "OMAFLOW_BINARY"}
+        env.update(HOME=str(home), XDG_CONFIG_HOME=str(config_home), PATH=f"{tools}:/usr/bin",
+                   OMAFLOW_CONFIG=str(config_home / "omaflow/config.toml"))
+        result = subprocess.run(["python3", str(checkout / "tools/set_hotkey.py"), "--sync", "--write-only"],
+                                env=env, capture_output=True, text=True, timeout=20)
+        assert json.loads(result.stdout)["ok"], result.stdout + result.stderr
+        assert "omaflow_hotkey" in (config_home / "omaflow/shortcut.lua").read_text()
+    print("PASS the hotkey writer works from a checkout with no build of its own")
+
+    # The hotkey with the daemon down starts it and says so, once per ten
+    # seconds however often the key is pressed.
+    runtime = base / "no-daemon"
+    runtime.mkdir()
+    tools = base / "bin-no-daemon"
+    tools.mkdir()
+    for name in ("systemctl", "notify-send"):
+        # is-failed answers yes only once the service has been marked failed.
+        (tools / name).write_text(f"#!/usr/bin/python3\nimport os, sys\nopen('{runtime}/{name}.log', 'a').write(' '.join(sys.argv[1:]) + chr(10))\n"
+                                  f"sys.exit(0 if 'is-failed' not in sys.argv or os.path.exists('{runtime}/failed') else 1)\n")
+        (tools / name).chmod(0o755)
+    env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), PATH=f"{tools}:/usr/bin",
+               XDG_CONFIG_HOME=str(base / "no-daemon-config"))
+    for _ in range(2):
+        pressed = subprocess.run([str(BINARY), "press"], env=env, capture_output=True, text=True, timeout=5)
+        assert pressed.returncode != 0
+    assert (runtime / "systemctl.log").read_text().count("start omaflow.service") == 2
+    notices = (runtime / "notify-send.log").read_text().splitlines()
+    assert len(notices) == 1 and "OmaFlow was not running" in notices[0], notices
+    # "--" ends notify-send's options, so words starting with "-" are shown.
+    assert notices[0].startswith("-a OmaFlow -- "), notices
+    assert "Hold the dictation key again in a few seconds." in notices[0], notices
+    # A service that failed gets a notice that says where to look.
+    (runtime / "omaflow-start-notice").unlink()
+    (runtime / "failed").touch()
+    subprocess.run([str(BINARY), "press"], env=env, capture_output=True, text=True, timeout=5)
+    notices = (runtime / "notify-send.log").read_text().splitlines()
+    assert len(notices) == 2 and "OmaFlow could not start" in notices[1], notices
+    assert "See why with: journalctl --user -u omaflow" in notices[1], notices
+    print("PASS a hotkey press with the daemon down starts it and says so once")

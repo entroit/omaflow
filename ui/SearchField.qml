@@ -13,6 +13,8 @@ Rectangle {
   signal down()
   signal up()
   signal accepted()
+  // Ctrl+Z with nothing typed to undo: the page's Undo.
+  signal undoPressed()
 
   implicitHeight: 36
   radius: height / 2
@@ -44,6 +46,7 @@ Rectangle {
     placeholderText: search.placeholder
     placeholderTextColor: Theme.secondary
     selectionColor: Theme.alpha(Theme.accent, 0.4)
+    selectedTextColor: Theme.text
     font.family: Theme.sans
     font.pixelSize: 13
     leftPadding: 4
@@ -51,6 +54,12 @@ Rectangle {
     Keys.onEscapePressed: {
       if (text.length > 0) text = ""
       else { focus = false; search.escaped() }
+    }
+    Keys.onPressed: function(event) {
+      if (event.key === Qt.Key_Z && event.modifiers === Qt.ControlModifier && !canUndo) {
+        search.undoPressed()
+        event.accepted = true
+      }
     }
     Keys.onDownPressed: search.down()
     Keys.onUpPressed: search.up()

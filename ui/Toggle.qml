@@ -1,7 +1,7 @@
 import QtQuick
 
-// An on/off switch. The whole row it sits in is usually the click target;
-// this is only the switch itself.
+// An on/off switch. The words beside it are usually a click target too
+// (SettingRow's toggle); this is only the switch itself.
 Item {
   id: toggle
 

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Remove OmaFlow, its data, and models and runtimes installed by OmaFlow.
-
-The installer no longer installs Ollama itself, so nothing here removes that
-package; models OmaFlow pulled into it are still removed.
+"""Remove OmaFlow, its settings and dictation history, and the models and
+runtimes it installed. Your journal and to-dos folders stay, and so does
+Ollama itself.
 """
 import argparse
 import os
@@ -18,7 +17,8 @@ ROOT = Path(__file__).resolve().parent
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.parse_args()
+    parser.add_argument('--yes', action='store_true', help='erase without asking, for scripts')
+    args = parser.parse_args()
     home = Path.home()
     config = Path(os.environ.get('XDG_CONFIG_HOME', home / '.config'))
     state = Path(os.environ.get('XDG_STATE_HOME', home / '.local/state'))
@@ -42,7 +42,7 @@ def main():
     direct_checkout = plugin == ROOT
     foreign = [path for path in links if (path.exists() or path.is_symlink()) and path not in owned and not (path == plugin and direct_checkout)]
     if foreign:
-        parser.error('Refusing to remove integration owned elsewhere: ' + ', '.join(map(str, foreign)))
+        raise SystemExit('These are not OmaFlow\'s links: ' + ', '.join(map(str, foreign)) + '. Move them away, then run ./uninstall again.')
     bindings = config / 'hypr/bindings.lua'
     before = bindings.read_text() if bindings.exists() else ''
     after = re.sub(r'^\s*-- OmaFlow dictation hotkey\.\n', '', before, flags=re.M)
@@ -65,7 +65,7 @@ def main():
         elif kind == 'cleanup-model' and value and not value.startswith('-'):
             model_commands.append(['ollama', 'rm', value])
         else:
-            parser.error('Invalid installer receipt entry: ' + repr(entry))
+            raise SystemExit(f'The install record has an entry OmaFlow did not write: {entry!r}. Nothing was removed. Take it out of {receipt_path()}, then run ./uninstall again.')
     runtime = Path(os.environ.get('XDG_RUNTIME_DIR', Path(tempfile.gettempdir()) / ('omaflow-' + os.environ.get('USER', ''))))
     runtime_paths = [runtime / name for name in ('omaflow.sock', 'omaflow-state.json', 'omaflow-level')]
     purge_paths += [config / 'hypr/bindings.lua.omaflow-backup', config / 'hypr/bindings.lua.omaflow-uninstall-backup']
@@ -73,13 +73,26 @@ def main():
     for command in model_commands:
         print('Remove installed model:', command[-1])
     for path in resource_paths + runtime_paths + [ROOT]:
-        print('Erase:', path)
+        if path.exists() or path.is_symlink():
+            print('Erase:', path)
     for path in owned:
         print('Remove link:', path)
     if before != after:
         print('Remove OmaFlow registration from:', bindings)
-    for path in purge_paths:
-        print('Erase:', path)
+    # Only what is there, and nothing twice: config.toml goes with its folder.
+    listed = [path for path in purge_paths if path.exists() or path.is_symlink()]
+    for path in listed:
+        if not any(other != path and path.is_relative_to(other) for other in listed):
+            print('Erase:', path)
+    # Nothing here can be undone, so it asks, as ./install does before it changes anything.
+    if not args.yes:
+        try:
+            answer = input('Erase all of this, including your settings and dictation history? Your journal and to-dos folders stay. [y/N] ')
+        except EOFError:
+            answer = ''
+        if answer.strip().lower() not in ('y', 'yes'):
+            print('Nothing was removed.')
+            return
     # Do not leave a live widget pointing at removed files. Failure leaves links intact.
     if plugin in owned or direct_checkout:
         subprocess.run(['omarchy', 'plugin', 'disable', 'entroit.omaflow'], check=True)
@@ -115,11 +128,13 @@ def main():
         receipt_path().unlink()
         receipt_path().parent.rmdir()
     shutil.rmtree(ROOT)
-    print('OmaFlow removed, including its checkout and recorded models and runtimes.')
+    print('OmaFlow removed, including the OmaFlow folder and the models and runtimes it installed.')
 
 
 if __name__ == '__main__':
     try:
         main()
-    except (OSError, subprocess.CalledProcessError, RuntimeError) as error:
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(' '.join(map(str, error.cmd)) + ' failed. Nothing after it was removed; run ./uninstall again.')
+    except (OSError, RuntimeError) as error:
         raise SystemExit(str(error))

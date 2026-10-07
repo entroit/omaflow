@@ -14,6 +14,18 @@ Column {
     ? "sudo pacman -S --needed ollama-vulkan && sudo systemctl enable --now ollama"
     : "sudo systemctl start ollama"
   readonly property bool ready: model.problem === "" && endpoint.problem === ""
+  // Why Save can't run yet, naming the field, shown beside the button.
+  readonly property string blocker: model.problem !== "" ? (model.text.trim().length === 0 ? "Enter a model first." : "Fix the model first.")
+    : endpoint.problem !== "" ? (endpoint.text.trim().length === 0 ? "Enter an address first." : "Fix the address first.")
+    : ""
+  // Removing a stored key asks once, like the other deletes in Settings.
+  property bool confirmRemoveKey: false
+  // The saved server, by host, for the card that says it is not answering.
+  readonly property string serverHost: {
+    if (app.modelSettings.cleanup_engine !== "openai") return ""
+    var url = String(app.modelSettings.cleanup_endpoint || "").trim()
+    return (url.match(/^https?:\/\/([^\/]+)/) || [])[1] || url
+  }
 
   function endpointProblem(value) {
     var url = String(value).trim()
@@ -52,25 +64,35 @@ Column {
       spacing: 8
       UiText {
         text: page.engine === "ollama" ? (page.app.cleanupRuntime === "missing" ? "Cleanup runs on Ollama, which is not installed." : "Ollama is installed but not answering.")
-          : "The cleanup server is not answering."
+          : (page.serverHost ? page.serverHost : "The cleanup server") + " is not answering."
+        width: parent.width
+        wrapMode: Text.Wrap
         weight: Font.DemiBold
       }
-      Row {
-        visible: page.engine === "ollama"
-        spacing: 10
-        UiText { anchors.verticalCenter: parent.verticalCenter; text: page.ollamaCommand; font.family: Theme.mono; font.pixelSize: 12; muted: true }
-        Pill { kind: "fill"; text: "Copy"; onClicked: page.app.copy(page.ollamaCommand) }
+      UiText {
+        visible: page.engine !== "ollama"
+        width: parent.width
+        wrapMode: Text.Wrap
+        text: "Start it or check the address below, then test the connection."
       }
-      UiText { width: parent.width; wrapMode: Text.Wrap; muted: true; text: "Until it answers, dictations are pasted as recognised, and the card says so." }
-    }
-  }
-
-  SettingRow {
-    title: "Runs on"
-    Segmented {
-      options: [{ value: "ollama", label: "Ollama" }, { value: "openai", label: "OpenAI-compatible" }]
-      current: page.engine
-      onPicked: function(value) { page.engine = value; page.showServer = value === "openai" }
+      // The command wraps at its spaces, and Copy under it, at the narrowest
+      // window; Copy still takes it whole.
+      Flow {
+        visible: page.engine === "ollama"
+        width: parent.width
+        spacing: 10
+        UiText { width: Math.min(implicitWidth, parent.width); wrapMode: Text.Wrap; text: page.ollamaCommand; font.family: Theme.mono; font.pixelSize: 12; muted: true; height: Math.max(implicitHeight, copyOllama.height) }
+        Pill {
+          id: copyOllama
+          // The clipboard says nothing back, so the button does for a moment.
+          property bool copied: false
+          Timer { id: copiedTimer; interval: 2000; onTriggered: copyOllama.copied = false }
+          kind: "fill"; text: copied ? "Copied" : "Copy"
+          Accessible.name: "Copy the command"
+          onClicked: { page.app.copy(page.ollamaCommand); copied = true; copiedTimer.restart() }
+        }
+      }
+      UiText { width: parent.width; wrapMode: Text.Wrap; muted: true; text: "Until it answers, dictations are pasted as raw text, and the card says so." }
     }
   }
 
@@ -86,17 +108,24 @@ Column {
     Column {
       id: table
       width: parent.width
+      // The same columns as the speech models on Models.
+      Item {
+        width: parent.width
+        height: 36
+        UiText { x: 14; anchors.verticalCenter: parent.verticalCenter; text: "Model"; muted: true; font.pixelSize: 12 }
+        UiText { x: parent.width - 250; anchors.verticalCenter: parent.verticalCenter; text: "Size"; muted: true; font.pixelSize: 12 }
+      }
       Repeater {
         model: page.app.cleanupCatalog
-        ModelRow { required property var modelData; required property int index; first: index === 0; app: page.app; kind: "cleanup"; entry: modelData }
+        ModelRow { required property var modelData; required property int index; last: index === page.app.cleanupCatalog.length - 1; app: page.app; kind: "cleanup"; entry: modelData }
       }
     }
   }
 
+  // Most people pick from the table; a server of your own is one step away.
   Pill {
-    visible: page.engine === "ollama"
     kind: "link"
-    text: page.showServer ? "Hide server settings" : "Use another Ollama model or machine"
+    text: page.showServer ? "Hide server settings" : "Use another model or machine"
     size: 13
     horizontalPadding: 0
     onClicked: page.showServer = !page.showServer
@@ -107,8 +136,19 @@ Column {
     width: parent.width
     spacing: 18
 
+    SettingRow {
+      title: "Runs on"
+      Segmented {
+        name: "Runs on"
+        options: [{ value: "ollama", label: "Ollama" }, { value: "openai", label: "OpenAI-compatible" }]
+        current: page.engine
+        onPicked: function(value) { page.engine = value }
+      }
+    }
+
     Field {
       id: model
+      deferProblem: true
       width: parent.width
       mono: true
       label: page.engine === "openai" ? "Model" : "Ollama model tag"
@@ -120,12 +160,13 @@ Column {
     }
     Field {
       id: endpoint
+      deferProblem: true
       width: parent.width
       mono: true
       label: "Address"
       text: page.app.modelSettings.cleanup_endpoint || ""
       placeholderText: page.engine === "openai" ? "http://127.0.0.1:4000/v1/chat/completions" : "http://127.0.0.1:11434/api/chat"
-      hint: "Your transcript and the focused window's title go here."
+      hint: "Your raw text and the focused window's title go here."
       problem: page.endpointProblem(text)
     }
     Field {
@@ -135,12 +176,26 @@ Column {
       password: true
       placeholderText: page.app.modelSettings.cleanup_api_key_set ? "A key is stored. Type to replace it." : "Leave empty if your server needs none"
       maximumLength: 512
+      hint: "Sent as a bearer token. Stored in your config file, which only your user can read."
     }
+    // Tried before it is saved, as on Your own model.
+    EndpointTester {
+      app: page.app
+      cleanupTest: true
+      enabled: page.ready
+      cleanupSettings: {
+        var settings = { cleanup_engine: page.engine, cleanup_model: model.text, cleanup_endpoint: endpoint.text }
+        if (key.text.length > 0) settings.cleanup_api_key = key.text
+        return settings
+      }
+    }
+    UiText { width: parent.width; wrapMode: Text.Wrap; muted: true; font.pixelSize: 12; text: "The test sends one short made-up sentence to the model and address above, before you save. It never sends a dictation." }
     Row {
       spacing: 8
       Pill {
         kind: "primary"; text: "Save cleanup model"; size: 13; verticalPadding: 8
         enabled: page.ready
+        hint: page.blocker
         onClicked: {
           var update = { cleanup_engine: page.engine, cleanup_model: model.text, cleanup_endpoint: endpoint.text }
           if (key.text.length > 0) update.cleanup_api_key = key.text
@@ -148,9 +203,15 @@ Column {
           key.text = ""
         }
       }
-      Pill { visible: page.app.modelSettings.cleanup_api_key_set === true; kind: "danger"; text: "Remove the stored key"; size: 13; verticalPadding: 8; onClicked: page.app.preference("models", { cleanup_api_key: "" }) }
+      UiText { visible: !page.ready; anchors.verticalCenter: parent.verticalCenter; text: page.blocker; muted: true; font.pixelSize: 12 }
+      Pill { visible: page.app.modelSettings.cleanup_api_key_set === true && !page.confirmRemoveKey; kind: "danger"; text: "Remove the stored key"; size: 13; verticalPadding: 8; onClicked: page.confirmRemoveKey = true }
+      Pill { visible: page.confirmRemoveKey && page.app.modelSettings.cleanup_api_key_set === true; kind: "fill"; text: "Keep it"; size: 13; verticalPadding: 8; onClicked: page.confirmRemoveKey = false }
+      Pill {
+        visible: page.confirmRemoveKey && page.app.modelSettings.cleanup_api_key_set === true
+        kind: "danger"; text: "Remove key"; size: 13; verticalPadding: 8
+        Accessible.name: "Remove the stored cleanup API key"
+        onClicked: { page.app.preference("models", { cleanup_api_key: "" }); page.confirmRemoveKey = false }
+      }
     }
-    EndpointTester { app: page.app; cleanupTest: true }
-    UiText { width: parent.width; wrapMode: Text.Wrap; muted: true; font.pixelSize: 12; text: "The test uses the saved model and address and sends one short made-up sentence. It never sends a dictation." }
   }
 }
