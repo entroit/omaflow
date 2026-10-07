@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "entroit.omaflow",
   "name": "OmaFlow",
-  "version": "0.20.0",
+  "version": "0.20.1",
   "author": "Entroit",
   "license": "MIT",
   "description": "Fast, private local dictation for Omarchy.",

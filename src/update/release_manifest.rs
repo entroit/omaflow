@@ -120,6 +120,13 @@ mod tests {
         }
     }
 
+    // The installed version reads this file with these rules before it
+    // offers the update, so notes that break them strand every install.
+    #[test]
+    fn the_shipped_release_metadata_passes_its_own_rules() {
+        ReleaseManifest::parse(include_bytes!("../../dist/release.json")).unwrap();
+    }
+
     #[test]
     fn rejects_paths_and_release_copy_outside_the_contract() {
         assert!(valid().validate().is_ok());

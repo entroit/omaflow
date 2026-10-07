@@ -1,6 +1,6 @@
 [package]
 name = "omaflow-core"
-version = "0.20.0"
+version = "0.20.1"
 edition = "2024"
 description = "OmaFlow's platform-independent core: configuration, the dictation state machine, history and the journal"
 license = "MIT"

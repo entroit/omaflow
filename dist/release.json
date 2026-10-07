@@ -1,18 +1,18 @@
 {
   "schemaVersion": 1,
   "pluginId": "entroit.omaflow",
-  "version": "0.20.0",
+  "version": "0.20.1",
   "summary": "Reminders in one click, a calmer to-do list, and nothing you say gets lost.",
   "changes": [
     "Choose when each to-do reminds you in one click, and finish or push back a reminder right from Today",
-    "Add journal entries to past days, and if turning speech into text fails, your recording waits in History so you never say it twice",
+    "Add journal entries to past days, and a failed transcription keeps your recording in History",
     "Works on computers without an NVIDIA graphics card, with clearer messages on every screen"
   ],
   "binary": {
     "target": "x86_64-unknown-linux-gnu",
     "path": "dist/bin/x86_64-unknown-linux-gnu/omaflow",
-    "bytes": 2780704,
-    "sha256": "4b0df6b971988ac42725ef274cdb059bf2d0db64eb72c3c6235dc231d16809e8"
+    "bytes": 2780688,
+    "sha256": "916b508bc37424876f5caefc31cc00f59076a3fc2071193acaa1a27b5af6b2ee"
   },
   "stateSchemaVersion": 4
 }
