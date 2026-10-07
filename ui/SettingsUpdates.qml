@@ -7,11 +7,6 @@ Column {
   required property var app
   spacing: 22
 
-  readonly property string installCommand: "cd " + app.pluginDir + " && ./install"
-  // The clipboard says nothing back, so the button does for a moment.
-  property bool copied: false
-  Timer { id: copiedTimer; interval: 2000; onTriggered: page.copied = false }
-
   // A half-replaced OmaFlow is put right by bringing back the version you
   // had, not by installing again, so its button says that. Progress that
   // could not be read names no update, and Check now is its way out.
@@ -41,14 +36,19 @@ Column {
 
   PageTitle { width: parent.width; title: "Updates and app"; subtitle: "Installed: OmaFlow " + (page.app.runningVersion || "unknown") + ". A new version shows as a dot on the bar icon and a notification." }
 
+  // An update that came with Omarchy's plugin update, or a partly updated
+  // OmaFlow, is finished here; the news waits until it is.
+  SetupBanner { id: setupBanner; width: parent.width; app: page.app; setupOnly: true }
+
   Rectangle {
+    visible: !setupBanner.visible
     width: parent.width
     height: card.implicitHeight + 36
     radius: Theme.radiusPanel
     color: Theme.fill4
-    border.width: page.app.updateFailed || page.app.updateOffer.externalCheckoutWarning || !page.app.supportedState ? 1 : 0
+    border.width: page.app.updateFailed || page.app.updateOffer.externalCheckoutWarning ? 1 : 0
     // Red where the header is red: dictation is blocked until this is put right.
-    border.color: !page.app.supportedState || page.app.updatePausesDictation ? Theme.red : Theme.yellow
+    border.color: page.app.updatePausesDictation ? Theme.red : Theme.yellow
 
     Column {
       id: card
@@ -68,8 +68,7 @@ Column {
           wrapMode: Text.Wrap
           font.pixelSize: 16
           weight: Font.Bold
-          text: !page.app.supportedState ? "OmaFlow is only partly updated"
-            : page.app.updateFailed ? (page.app.updateTransaction.targetVersion
+          text: page.app.updateFailed ? (page.app.updateTransaction.targetVersion
               ? "The update to " + page.app.updateTransaction.targetVersion + " did not finish" : "The update did not finish")
             : page.app.updateRunning ? String(page.app.updateTransaction.message || "Preparing the update")
             : page.app.updateOffer.externalCheckoutWarning ? "The OmaFlow folder changed outside OmaFlow"
@@ -124,48 +123,17 @@ Column {
         wrapMode: Text.Wrap
         muted: true
         visible: text.length > 0
-        text: !page.app.supportedState ? "Part of OmaFlow is still on the old version. Paste this in a terminal:"
-          : page.app.updateFailed ? page.failureDetail
+        text: page.app.updateFailed ? page.failureDetail
           : page.app.updateOffer.externalCheckoutWarning
             ? "Updates are paused. Review the changes " + (page.app.pluginDir ? "in " + page.app.pluginDir + " " : "") + "with git, then choose Check now."
           : page.app.updateOffer.error ? String(page.app.updateOffer.error)
           : page.app.updateAvailable ? String(page.app.verifiedUpdate.summary || "")
           : page.checkedText || "OmaFlow checks once a day."
       }
-      Row {
-        visible: !page.app.supportedState
-        width: parent.width
-        spacing: 10
-        Rectangle {
-          anchors.verticalCenter: parent.verticalCenter
-          width: Math.min(parent.width - copyCommand.width - 10, command.implicitWidth + 24)
-          height: command.implicitHeight + 16
-          radius: Theme.radiusInput
-          color: Theme.fill8
-          UiText {
-            id: command
-            x: 12
-            width: parent.width - 24
-            anchors.verticalCenter: parent.verticalCenter
-            // A word joiner keeps "./install" whole when the line wraps.
-            text: page.installCommand.replace("./install", "./\u2060install")
-            font.family: Theme.mono
-            font.pixelSize: 12
-            wrapMode: Text.Wrap
-          }
-        }
-        Pill {
-          id: copyCommand
-          anchors.verticalCenter: parent.verticalCenter
-          kind: "primary"; text: page.copied ? "Copied" : "Copy command"; size: 13
-          onClicked: { page.app.copy(page.installCommand); page.copied = true; copiedTimer.restart() }
-        }
-      }
       Repeater {
-        // Not while partly updated: the repair comes first, the news after.
-        // Nor under an update that did not finish or cannot start yet,
+        // Not under an update that did not finish or cannot start yet,
         // where they would read as what happened.
-        model: page.app.supportedState && page.app.updateAvailable && !page.app.updateFailed
+        model: page.app.updateAvailable && !page.app.updateFailed
           && !page.app.updateOffer.externalCheckoutWarning && !page.app.updateOffer.error && Array.isArray(page.app.verifiedUpdate.changes) ? page.app.verifiedUpdate.changes : []
         UiText { required property var modelData; width: card.width; wrapMode: Text.Wrap; text: String(modelData) }
       }

@@ -154,6 +154,15 @@ Window {
         item.pending = { kind: "delete", items: [gone], view: item.viewKey, slot: 2 }
       })
       if (window.mode === "history-notinstalled") { appState.binaryFound = false; appState.history = []; appState.pluginDir = "/home/you/.config/omarchy/plugins/entroit.omaflow" }
+      // Finish setup: running, a missing package, failed; then an update
+      // from Omarchy's plugin update, waiting and running.
+      if (window.mode.indexOf("history-setup-") === 0) { appState.binaryFound = false; appState.history = [] }
+      if (window.mode === "history-setup-running") appState.applySetupStatus(JSON.stringify({ updatedAtMs: Fixtures.NOW, state: "running", step: "services", from: "" }))
+      if (window.mode === "history-setup-packages") appState.applySetupStatus(JSON.stringify({ updatedAtMs: Fixtures.NOW, state: "needs-packages", from: "", missing: "jq wl-clipboard", command: "sudo pacman -S --needed jq wl-clipboard" }))
+      if (window.mode === "history-setup-failed") appState.applySetupStatus(JSON.stringify({ updatedAtMs: Fixtures.NOW, state: "failed", from: "", log: "/run/user/1000/omaflow-setup.log",
+        message: "Hyprland rejected the configuration: bindings.lua:3: invalid dispatcher; bindings.lua:4: invalid dispatcher" }))
+      if (window.mode.indexOf("settings-updates-finish") === 0) { appState.pluginVersion = "0.21.0"; appState.installedVersion = "0.19.0" }
+      if (window.mode === "settings-updates-finish-running") appState.applySetupStatus(JSON.stringify({ updatedAtMs: Fixtures.NOW, state: "running", step: "shell", from: "0.19.0" }))
       if (window.mode === "history-raw") find(root, "HistoryScreen", function(item) { item.view = "raw" })
       if (window.mode === "history-skipped") find(root, "HistoryScreen", function(item) { item.selectedId = "3" })
       // The dot on the mark: an update ready, and one that did not finish.

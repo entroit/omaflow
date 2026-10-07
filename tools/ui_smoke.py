@@ -49,6 +49,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-host-") as staging:
     host.mkdir(parents=True)
     shutil.copy(ROOT / "hosts/omarchy/Job.qml", host)
     shutil.copy(ROOT / "hosts/omarchy/Copies.js", host)
+    shutil.copy(ROOT / "hosts/omarchy/Setup.js", host)
     # Offscreen Qt has no layer shell, so the overlay window becomes an Item;
     # everything inside it is still created and bound.
     source = (ROOT / "hosts/omarchy/OmaFlow.qml").read_text()
@@ -136,6 +137,11 @@ window = subprocess.run(["/usr/lib/qt6/bin/qmltestrunner", "-input", str(ROOT / 
 if window.returncode != 0:
     raise SystemExit("The window test failed:\n" + window.stdout + window.stderr)
 print("PASS the window keeps its header, toasts and update states readable and reachable", flush=True)
+setup = subprocess.run(["/usr/lib/qt6/bin/qmltestrunner", "-input", str(ROOT / "tools/setup_test.qml")],
+                       env=dict(os.environ, QT_QPA_PLATFORM="offscreen"), capture_output=True, text=True, timeout=60)
+if setup.returncode != 0:
+    raise SystemExit("The setup banner test failed:\n" + setup.stdout + setup.stderr)
+print("PASS Finish setup starts the detached setup and shows its progress, missing packages and failures", flush=True)
 
 # 3. The connection tester's handling of real replies.
 probe = ROOT / "tools/preview/Probe.qml"

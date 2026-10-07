@@ -15,6 +15,11 @@ while (($#)); do
   shift
 done
 backup_dir="$config_home/omarchy/backups/omaflow-$(date +%Y%m%d-%H%M%S)"
+# A setup the OmaFlow window started shows how far it has got.
+progress() {
+  [[ -z ${OMAFLOW_SETUP_STATUS:-} ]] || "$repo_dir/scripts/setup-status" "$OMAFLOW_SETUP_STATUS" \
+    from="${OMAFLOW_SETUP_FROM:-}" state=running step="$1"
+}
 
 backup_and_link() {
   local source_path="$1"
@@ -94,6 +99,7 @@ backup_and_link "$repo_dir/dist/omaflow-update-reconcile.service" "$config_home/
 backup_and_link "$repo_dir/dist/omaflow.desktop" "$HOME/.local/share/applications/omaflow.desktop" "omaflow.desktop"
 backup_and_link "$repo_dir/assets/icon.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/omaflow.svg" "omaflow.svg"
 
+progress services
 systemctl --user daemon-reload
 systemctl --user enable omaflow.service
 systemctl --user restart omaflow.service
@@ -106,10 +112,12 @@ if [[ -d "$backup_dir" ]]; then
   printf 'Replaced files were backed up to %s\n' "$backup_dir"
 fi
 
+progress shell
 hyprctl reload
 config_errors="$(hyprctl configerrors)"
 if [[ -n "$config_errors" ]]; then
-  printf 'Hyprland rejected the configuration:\n%s\n' "$config_errors" >&2
+  # One line, so the window can show it whole as the reason.
+  printf 'Hyprland rejected the configuration: %s\n' "${config_errors//$'\n'/; }" >&2
   exit 1
 fi
 omarchy restart shell

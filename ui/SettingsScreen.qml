@@ -106,7 +106,7 @@ FocusScope {
             width: parent.width - 24
             wrapMode: Text.Wrap
             text: !screen.app.binaryFound
-              ? "OmaFlow is not installed yet, so changes here are not saved. History shows the command that finishes installing."
+              ? "OmaFlow is not installed yet, so changes here are not saved. Choose Finish setup on History."
               : "OmaFlow is stopped, so changes here are not saved. Start it from the top of the window."
           }
         }

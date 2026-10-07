@@ -38,7 +38,7 @@ exist.
 | `ui/` | The whole interface as plain Qt Quick: `App.qml` (state and actions), `Theme.qml` (colours from the Omarchy theme, fonts, shapes), the History, Journal and Settings screens and the overlay card. It never imports Quickshell, so another host can run it. Every file must be listed in `ui/qmldir`. |
 | `hosts/omarchy/` | The Omarchy shell plugin: bar icon, window and overlay, and the only QML that imports Quickshell. |
 | `tools/preview/` | Renders any screen of `ui/` with sample data on plain Qt: `tools/preview/render.sh OUT [MODE…]`. |
-| `scripts/` | Preflight, the NeMo-Speech runtime installer and the local check runner. |
+| `scripts/` | Preflight, the release installer, the status file of the window's Finish setup, the NeMo-Speech runtime installer and the local check runner. |
 | `dist/` | The bundled binary, release manifest, user units and desktop entry. |
 | `integrations/hyprland.lua` | Hotkey adapter; reads the generated shortcut file. |
 | `config/config.toml` | Bundled defaults and the cleanup prompt, embedded in the binary. |

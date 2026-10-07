@@ -41,6 +41,6 @@ jq -n \
   --arg version "$version" \
   --arg sha "$sha" \
   --argjson bytes "$bytes" \
-  '{schemaVersion:1,pluginId:"entroit.omaflow",version:$version,summary:"Reminders in one click, a calmer to-do list, and nothing you say gets lost.",changes:["Choose when each to-do reminds you in one click, and finish or push back a reminder right from Today","Add journal entries to past days, and a failed transcription keeps your recording in History","Works on computers without an NVIDIA graphics card, with clearer messages on every screen"],binary:{target:"x86_64-unknown-linux-gnu",path:"dist/bin/x86_64-unknown-linux-gnu/omaflow",bytes:$bytes,sha256:$sha},stateSchemaVersion:4}' \
+  '{schemaVersion:1,pluginId:"entroit.omaflow",version:$version,summary:"Install and update OmaFlow like any other plugin, then finish with one click.",changes:["After adding or updating the plugin, Finish setup in the OmaFlow window does the rest, with no terminal","One-click reminders, a calmer to-do list, journal entries on past days, and fixes on every screen","Works on computers without an NVIDIA graphics card"],binary:{target:"x86_64-unknown-linux-gnu",path:"dist/bin/x86_64-unknown-linux-gnu/omaflow",bytes:$bytes,sha256:$sha},stateSchemaVersion:4}' \
   >"$repo_dir/dist/release.json"
 printf 'Wrote %s (%s bytes, %s).\n' "$destination" "$bytes" "$sha"

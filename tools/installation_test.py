@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise complete installer/linker and uninstall flows in an isolated home."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,12 +13,15 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 
-with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
-    base = Path(directory); repo = base/'checkout'; repo.mkdir()
-    home = base/'home'; home.mkdir(); commands = base/'bin'; commands.mkdir()
-    config = home/'.config'; (config/'hypr').mkdir(parents=True)
-    (config/'hypr/omaflow-hotkey.lua').write_text('local omaflow_hotkey = { "F13" }\nlocal omaflow_consumed_keys = { "F13" }\nreturn { hotkey = omaflow_hotkey, consumed = omaflow_consumed_keys }\n')
-    (config/'hypr/bindings.lua').write_text('-- unrelated settings\n')
+
+def commit(repo, message):
+    subprocess.run(['/usr/bin/git', '-C', str(repo), 'add', '.'], check=True)
+    subprocess.run(['/usr/bin/git', '-C', str(repo), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', message], check=True)
+
+
+def checkout(repo):
+    """A committed OmaFlow folder from github.com/entroit/omaflow, as plugin add leaves it."""
+    repo.mkdir()
     for name in ['install', 'link-local', 'uninstall', 'manifest.json', 'Cargo.toml']:
         shutil.copy2(ROOT/name, repo/name)
     for name in ['config', 'dist', 'integrations', 'assets']:
@@ -29,9 +33,30 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     (repo/'target/release').mkdir(parents=True)
     shutil.copy2(ROOT/'target/release/omaflow', repo/'target/release/omaflow')
     subprocess.run(['/usr/bin/git', 'init', '-q', '-b', 'main', str(repo)], check=True)
-    subprocess.run(['/usr/bin/git', '-C', str(repo), 'add', '.'], check=True)
-    subprocess.run(['/usr/bin/git', '-C', str(repo), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture'], check=True)
+    commit(repo, 'fixture')
     subprocess.run(['/usr/bin/git', '-C', str(repo), 'remote', 'add', 'origin', 'https://github.com/entroit/omaflow'], check=True)
+
+
+def stub_commands(commands):
+    """Desktop and system commands that only log what they were asked. TEST_MISSING
+    names packages pacman says are not installed; sudo always fails."""
+    commands.mkdir()
+    for name in ['cargo','pacman','systemctl','hyprctl','omarchy','omarchy-shell','pw-cat','wl-copy','wl-paste','git','update-desktop-database','ollama','curl','sudo']:
+        body = f'printf "%s\\n" "{name} $*" >> "$TEST_LOG"\n'
+        if name == 'hyprctl': body += '''if [[ $* == '-j binds' ]]; then echo '[]'; fi\n'''
+        if name == 'omarchy': body += '''if [[ $* == 'plugin list --json' ]]; then echo '[{"id":"entroit.omaflow","enabled":true}]'; fi\n'''
+        if name == 'pacman': body += '''if [[ $1 == -Qq && " ${TEST_MISSING:-} " == *" $2 "* ]]; then exit 1; fi\n'''
+        if name == 'sudo': body += 'exit 1\n'
+        path = commands/name; path.write_text('#!/usr/bin/bash\n'+body+'exit 0\n'); path.chmod(0o755)
+
+
+with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
+    base = Path(directory); repo = base/'checkout'
+    home = base/'home'; home.mkdir(); commands = base/'bin'
+    config = home/'.config'; (config/'hypr').mkdir(parents=True)
+    (config/'hypr/omaflow-hotkey.lua').write_text('local omaflow_hotkey = { "F13" }\nlocal omaflow_consumed_keys = { "F13" }\nreturn { hotkey = omaflow_hotkey, consumed = omaflow_consumed_keys }\n')
+    (config/'hypr/bindings.lua').write_text('-- unrelated settings\n')
+    checkout(repo)
     release_installer = repo/'scripts/install-release'
     direct_git = repo/'.git'; saved_git = repo/'.git.saved'
     direct_git.rename(saved_git); direct_git.write_text('gitdir: /tmp/not-trusted\n')
@@ -51,11 +76,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     subprocess.run(['/usr/bin/git', '-C', str(repo), 'update-index', '--no-skip-worktree', 'manifest.json'], check=True)
     print('PASS production release install rejects linked worktrees, symlinks, and hidden byte drift')
     log = base/'commands.log'
-    for name in ['cargo','pacman','systemctl','hyprctl','omarchy','omarchy-shell','pw-cat','wl-copy','wl-paste','git','update-desktop-database','ollama','curl']:
-        body = f'printf "%s\\n" "{name} $*" >> "$TEST_LOG"\n'
-        if name == 'hyprctl': body += '''if [[ $* == '-j binds' ]]; then echo '[]'; fi\n'''
-        if name == 'omarchy': body += '''if [[ $* == 'plugin list --json' ]]; then echo '[{"id":"entroit.omaflow","enabled":true}]'; fi\n'''
-        path = commands/name; path.write_text('#!/usr/bin/bash\n'+body+'exit 0\n'); path.chmod(0o755)
+    stub_commands(commands)
     env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(config), XDG_CACHE_HOME=str(home/".cache"), XDG_STATE_HOME=str(home/'.local/state'),
                XDG_RUNTIME_DIR=str(base/'runtime'), PATH=f'{commands}:/usr/bin', TEST_LOG=str(log),
                OMAFLOW_CONFIG=str(config/'omaflow/config.toml'), HYPRLAND_INSTANCE_SIGNATURE='test')
@@ -208,3 +229,109 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     assert 'pacman -R' not in log.read_text()
     assert not (base/'runtime/omaflow-state.json').exists()
     print('PASS complete removal of direct plugin checkout and recorded resources; shared model retained')
+
+
+# Finish setup in the window runs ./install --from-window, detached: no
+# questions, no sudo, and its progress and result in a status file.
+with tempfile.TemporaryDirectory(prefix='omaflow-setup-') as directory:
+    base = Path(directory); repo = base/'plugins/entroit.omaflow'; repo.parent.mkdir()
+    home = base/'home'; config = home/'.config'; config.mkdir(parents=True)
+    commands = base/'bin'; stub_commands(commands)
+    runtime = base/'runtime'; runtime.mkdir()
+    log = base/'commands.log'; log.write_text('')
+    checkout(repo)
+    env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(config), XDG_CACHE_HOME=str(home/'.cache'),
+               XDG_STATE_HOME=str(home/'.local/state'), XDG_RUNTIME_DIR=str(runtime), PATH=f'{commands}:/usr/bin',
+               TEST_LOG=str(log), OMAFLOW_CONFIG=str(config/'omaflow/config.toml'), HYPRLAND_INSTANCE_SIGNATURE='test')
+    status_file = runtime/'omaflow-setup.json'
+
+    def setup(*options, **extra):
+        return subprocess.run([str(repo/'install'), '--from-window', *options], env=dict(env, **extra),
+                              capture_output=True, text=True, timeout=60)
+
+    def status():
+        return json.loads(status_file.read_text())
+
+    def snapshot():
+        files = {}
+        for path in sorted(home.rglob('*')):
+            if path.is_symlink(): files[str(path)] = 'link ' + os.readlink(path)
+            elif path.is_file(): files[str(path)] = path.read_bytes()
+        return files
+
+    # A missing package stops it before anything changes, with the command.
+    untouched = snapshot()
+    missing = setup(TEST_MISSING='jq wl-clipboard')
+    assert missing.returncode != 0
+    assert status()['state'] == 'needs-packages', status()
+    assert status()['command'] == 'sudo pacman -S --needed jq wl-clipboard', status()
+    assert status()['missing'] == 'jq wl-clipboard'
+    assert 'sudo pacman -S --needed jq wl-clipboard' in (runtime/'omaflow-setup.log').read_text()
+    assert snapshot() == untouched and not (home/'.local').exists()
+    assert not any(line.split()[0] in ('sudo', 'systemctl', 'hyprctl', 'omarchy') for line in log.read_text().splitlines()), log.read_text()
+    print('PASS a missing package stops the window setup before any change and names the command')
+
+    # Check again only checks: still missing says so, present clears the way.
+    checked = setup('--dry-run', TEST_MISSING='jq')
+    assert checked.returncode != 0 and status()['command'] == 'sudo pacman -S --needed jq'
+    checked = setup('--dry-run')
+    assert checked.returncode == 0 and status()['state'] == 'checked', checked.stdout + checked.stderr
+    assert snapshot() == untouched
+    print('PASS Check again re-checks the packages and changes nothing')
+
+    # A fresh home: the whole install, without sudo.
+    log.write_text('')
+    first = setup()
+    assert first.returncode == 0, (runtime/'omaflow-setup.log').read_text()
+    assert status()['state'] == 'ok' and status()['from'] == '', status()
+    assert status()['message'] == 'OmaFlow is installed. Your dictation key is AltGr+Menu.', status()
+    assert not any(line.startswith('sudo ') for line in log.read_text().splitlines())
+    assert 'omarchy restart shell' in log.read_text() and 'systemctl --user restart omaflow.service' in log.read_text()
+    assert (home/'.local/bin/omaflow').is_symlink()
+    assert (config/'hypr/bindings.lua').read_text().count('require("omaflow")') == 1
+    assert 'ISO_Level3_Shift' in (config/'omaflow/shortcut.lua').read_text()
+    installed = json.loads((home/'.local/state/omaflow/update/installed.json').read_text())
+    assert installed['version'] == json.loads((repo/'dist/release.json').read_text())['version']
+    print('PASS the window setup installs a fresh home without sudo and reports the dictation key')
+
+    # Run twice, same result: nothing is added, moved or backed up again.
+    settled = snapshot()
+    again = setup()
+    assert again.returncode == 0 and status()['state'] == 'ok', (runtime/'omaflow-setup.log').read_text()
+    changed = [path for path in set(settled) | set(snapshot()) if settled.get(path) != snapshot().get(path)]
+    # Only the receipt's install time moves.
+    assert changed == [str(home/'.local/state/omaflow/update/installed.json')], changed
+    assert not (config/'omarchy/backups').exists()
+    print('PASS a second window setup is a no-op')
+
+    # A failing step leaves its own words as the reason, not "running".
+    hyprctl = (commands/'hyprctl').read_text()
+    (commands/'hyprctl').write_text('#!/usr/bin/bash\nif [[ $1 == configerrors ]]; then printf "bindings.lua:3: bad bind\\nbindings.lua:4: bad bind\\n"; fi\nexit 0\n')
+    failed = setup()
+    assert failed.returncode != 0 and status()['state'] == 'failed', status()
+    assert status()['message'] == 'Hyprland rejected the configuration: bindings.lua:3: bad bind; bindings.lua:4: bad bind', status()
+    assert status()['log'] == str(runtime/'omaflow-setup.log')
+    (commands/'hyprctl').write_text(hyprctl)
+    print('PASS a failed window setup says why')
+
+    # omarchy plugin update brought a new release: the same setup installs it.
+    release = json.loads((repo/'dist/release.json').read_text())
+    bundled = repo/release['binary']['path']
+    major, minor, _ = json.loads((ROOT/'manifest.json').read_text())['version'].split('.')
+    newer = f"{major}.{int(minor) + 1}.0"
+    bundled.write_text('#!/usr/bin/bash\nif [[ $1 == version ]]; then echo \'{"pluginId":"entroit.omaflow","version":"' + newer + '"}\'; exit 0; fi\n'
+                       f'exec {ROOT/"target/release/omaflow"} "$@"\n')
+    bundled.chmod(0o755)
+    release['version'] = newer
+    release['binary']['bytes'] = bundled.stat().st_size
+    release['binary']['sha256'] = hashlib.sha256(bundled.read_bytes()).hexdigest()
+    (repo/'dist/release.json').write_text(json.dumps(release, indent=2) + '\n')
+    manifest = json.loads((repo/'manifest.json').read_text()); manifest['version'] = newer
+    (repo/'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    commit(repo, 'release ' + newer)
+    updated = setup()
+    assert updated.returncode == 0, (runtime/'omaflow-setup.log').read_text()
+    assert status() | {'updatedAtMs': 0} == {'updatedAtMs': 0, 'from': installed['version'], 'state': 'ok', 'message': f'OmaFlow is updated to {newer}.'}, status()
+    assert (home/'.local/lib/omaflow/current/omaflow').read_bytes() == bundled.read_bytes()
+    assert json.loads((home/'.local/state/omaflow/update/installed.json').read_text())['version'] == newer
+    print('PASS after a plugin update the window setup installs the new bundled binary')

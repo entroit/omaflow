@@ -1,18 +1,18 @@
 {
   "schemaVersion": 1,
   "pluginId": "entroit.omaflow",
-  "version": "0.20.1",
-  "summary": "Reminders in one click, a calmer to-do list, and nothing you say gets lost.",
+  "version": "0.21.0",
+  "summary": "Install and update OmaFlow like any other plugin, then finish with one click.",
   "changes": [
-    "Choose when each to-do reminds you in one click, and finish or push back a reminder right from Today",
-    "Add journal entries to past days, and a failed transcription keeps your recording in History",
-    "Works on computers without an NVIDIA graphics card, with clearer messages on every screen"
+    "After adding or updating the plugin, Finish setup in the OmaFlow window does the rest, with no terminal",
+    "One-click reminders, a calmer to-do list, journal entries on past days, and fixes on every screen",
+    "Works on computers without an NVIDIA graphics card"
   ],
   "binary": {
     "target": "x86_64-unknown-linux-gnu",
     "path": "dist/bin/x86_64-unknown-linux-gnu/omaflow",
     "bytes": 2780688,
-    "sha256": "916b508bc37424876f5caefc31cc00f59076a3fc2071193acaa1a27b5af6b2ee"
+    "sha256": "d4729fe73160269e06a961560ececf11d3126391b7339ff053fa5ffab841f025"
   },
   "stateSchemaVersion": 4
 }

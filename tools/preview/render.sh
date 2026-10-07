@@ -11,13 +11,13 @@ shift
 mkdir -p "$output"
 modes=("$@")
 if ((${#modes[@]} == 0)); then
-  modes=(history history-empty history-setup history-undo history-off history-notinstalled history-raw history-dirty history-edited
+  modes=(history history-empty history-setup history-undo history-off history-notinstalled history-setup-running history-setup-packages history-setup-failed history-raw history-dirty history-edited
     history-toast-error history-unloaded history-stopped journal journal-hover journal-playing journal-talking
     journal-first journal-empty journal-search journal-settings journal-unreadable journal-hit journal-past journal-typing
     journal-settings-confirm journal-past-empty journal-move journal-move-clash journal-playing-hover journal-narrow journal-search-fail journal-editing journal-deleted todos todos-empty todos-editing todos-settling todos-undo
     todos-list todos-inbox-empty todos-hover todos-today todos-upcoming todos-all todos-done todos-rowmenu todos-due todos-due-morning todos-picker todos-remindmenu todos-bubbled todos-later todos-reminder todos-settings todos-folder-move todos-listmenu
     todos-newlist todos-talking todos-editlists todos-folder-edit todos-picker-past todos-narrow settings-basics settings-words settings-privacy settings-privacy-off
-    settings-models settings-ownmodel settings-cleanup settings-hotkeys settings-audio settings-audio-manual settings-updates settings-updates-later settings-updates-failed settings-updates-interrupted
+    settings-models settings-ownmodel settings-cleanup settings-hotkeys settings-audio settings-audio-manual settings-updates settings-updates-later settings-updates-failed settings-updates-interrupted settings-updates-finish settings-updates-finish-running
     settings-privacy-audio settings-basics-recording settings-basics-custom settings-basics-light
     settings-models-missing settings-ownmodel-server settings-cleanup-server
     history-partly history-kept history-tabhint settings-updates-partly settings-models-downloading settings-models-cpu settings-cleanup-light settings-privacy-trim

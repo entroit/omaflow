@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Writes the status file of a setup the OmaFlow window started:
+#   scripts/setup-status FILE KEY=VALUE...
+# The window reads it again after the shell restarts, so it is replaced whole
+# and never read half written. Plain Bash, because a missing jq or Python is
+# exactly what it may have to report.
+set -euo pipefail
+
+file="${1:?Usage: setup-status FILE KEY=VALUE...}"
+shift
+
+json_string() {
+  local value
+  value="$(printf '%s' "$1" | tr '\n\t\r' '   ' | tr -d '\000-\037')"
+  value=${value//\\/\\\\}
+  printf '"%s"' "${value//\"/\\\"}"
+}
+
+body="\"updatedAtMs\":$(date +%s%3N)"
+for pair in "$@"; do
+  body+=",$(json_string "${pair%%=*}"):$(json_string "${pair#*=}")"
+done
+mkdir -p "$(dirname "$file")"
+tmp="$file.$$.tmp"
+(umask 077 && printf '{%s}\n' "$body" >"$tmp")
+mv -f "$tmp" "$file"

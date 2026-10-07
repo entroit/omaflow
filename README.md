@@ -36,19 +36,21 @@ dictation transcribes in **48.8 ms**, two minutes in **373.6 ms**: 281× and
 
 ```bash
 omarchy plugin add https://github.com/entroit/omaflow.git
-cd ~/.config/omarchy/plugins/entroit.omaflow
-./install
 ```
 
-Then click the OmaFlow icon in the bar and choose a speech model; it downloads
-there.
+Enable it when asked, then open OmaFlow from the bar and choose **Finish
+setup**. It installs the OmaFlow app that came with the plugin and two user
+services, and sets your dictation key to AltGr+Menu. The top bar restarts
+once, and the window opens again to choose a speech model; it downloads there.
+If a system package is missing, the window shows the `sudo pacman` command to
+run first and changes nothing until it is there.
 
-Your dictation key is AltGr+Menu. To use another key, choose Change in
-Settings → Advanced → Hotkeys and press it.
+To use another key, choose Change in Settings → Advanced → Hotkeys and press
+it.
 
-The marketplace command downloads the plugin. `./install` installs its bundled
-binary, user services, and the dictation key. It shows the plan before it
-changes your system and does not download a speech model. You do not need Rust
+In a terminal, `./install` in `~/.config/omarchy/plugins/entroit.omaflow` does
+the same. It shows the plan before it changes your system and installs missing
+packages with sudo. Neither downloads a speech model, and you do not need Rust
 or Cargo.
 
 ## Updates stay inside OmaFlow
@@ -58,6 +60,10 @@ marketplace publishes a verified OmaFlow commit, a desktop notification opens
 the OmaFlow window. The bar icon keeps a dot, and **Settings → Advanced →
 Updates and app** shows the release summary and changes. Click **Update and restart**
 to install it, or **Later** to be reminded tomorrow.
+
+Omarchy's own `omarchy plugin update` works too. The window then shows
+**Finish updating to** the new version, and one click installs the app that
+came with it and restarts its services.
 
 An update waits for an active dictation to finish. OmaFlow then switches the
 plugin and daemon together, checks the new service, and restores the previous

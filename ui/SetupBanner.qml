@@ -1,19 +1,33 @@
 import QtQuick
 
 // What stands between this computer and the first dictation, with the one
-// button that fixes it. Hidden when nothing does.
+// button that fixes it. Hidden when nothing does. The setup's states come
+// from app.setup; the speech model is the step after it.
 Rectangle {
   id: banner
 
   required property var app
+  // On Updates and app only the setup shows; the speech model has its own page.
+  property bool setupOnly: false
   signal openSettings(string target)
 
-  readonly property string problem: !app.binaryFound ? "daemon"
-    : app.connected && app.setupUnfinished && !app.speechDownloading ? "model"
-    : app.connected && !app.supportedState ? "version"
+  readonly property var setup: app.setup
+  readonly property var update: setup.update
+  readonly property string problem: setup.state !== "ready" ? setup.state
+    : !setupOnly && app.connected && app.setupUnfinished && !app.speechDownloading ? "model"
     : ""
+  readonly property bool isSetup: problem.length > 0 && problem !== "model"
+  // The button keeps its words while the setup runs.
+  readonly property string action: update ? "Finish update" : "Finish setup"
+  // "jq and wl-clipboard"
+  readonly property string missing: {
+    var names = String(setup.missing || "").split(" ").filter(function(name) { return name.length > 0 })
+    return names.length > 1 ? names.slice(0, -1).join(", ") + " and " + names[names.length - 1] : names.join("")
+  }
+  // The old version still works while an update waits; nothing does before the first install.
+  readonly property bool blocking: problem === "needs-setup" || problem === "needs-packages" || problem === "failed" && !update
+    || app.partlyUpdated
 
-  readonly property string installCommand: "cd " + app.pluginDir + " && ./install"
   // The clipboard says nothing back, so the button does for a moment.
   property bool copied: false
   Timer { id: copiedTimer; interval: 2000; onTriggered: banner.copied = false }
@@ -23,7 +37,7 @@ Rectangle {
   radius: Theme.radiusPanel
   color: Theme.fill4
   border.width: 1
-  border.color: problem === "version" || problem === "daemon" ? Theme.red : Theme.yellow
+  border.color: blocking ? Theme.red : Theme.yellow
 
   Column {
     id: content
@@ -32,16 +46,28 @@ Rectangle {
     spacing: 14
 
     Row {
+      width: parent.width
       spacing: 10
-      Icon { anchors.verticalCenter: parent.verticalCenter; name: "warning"; size: 15; color: banner.problem === "model" ? Theme.yellow : Theme.red }
+      Icon { id: icon; y: 3; name: "warning"; size: 15; color: banner.blocking ? Theme.red : Theme.yellow }
       UiText {
-        anchors.verticalCenter: parent.verticalCenter
+        width: parent.width - icon.width - 10
+        wrapMode: Text.Wrap
         font.pixelSize: 16
         weight: Font.Bold
-        text: banner.problem === "daemon" ? "One command finishes installing OmaFlow"
-          : banner.problem === "version" ? "OmaFlow is only partly updated"
-          : "One step left before you can dictate"
+        text: banner.problem === "model" ? "One step left before you can dictate"
+          : banner.problem === "failed" ? (banner.update ? "The update to " + banner.update.to + " did not finish" : "Setup did not finish")
+          : banner.update ? "Finish updating to " + banner.update.to
+          : "Finish setting up OmaFlow"
       }
+    }
+
+    // Why it stopped, in the setup's own words.
+    UiText {
+      visible: banner.problem === "failed"
+      x: 25
+      width: parent.width - 25
+      wrapMode: Text.Wrap
+      text: String(banner.setup.reason || "")
     }
 
     UiText {
@@ -49,16 +75,23 @@ Rectangle {
       width: parent.width - 25
       wrapMode: Text.Wrap
       muted: true
-      text: banner.problem === "daemon" ? "Adding the plugin copied its files. Paste this in a terminal:"
-        : banner.problem === "version" ? "Part of OmaFlow is still on the old version. Paste this in a terminal:"
-        : banner.app.missingSpeechModel ? String(banner.app.missingSpeechModel.label || banner.app.missingSpeechModel.id)
+      text: banner.problem === "model" ? (banner.app.missingSpeechModel ? String(banner.app.missingSpeechModel.label || banner.app.missingSpeechModel.id)
           + " is chosen but not downloaded yet. Nothing was downloaded during installation."
-        : "Choose a speech model. Nothing was downloaded during installation, and each model lists its size and what it needs to run."
+          : "Choose a speech model. Nothing was downloaded during installation, and each model lists its size and what it needs to run.")
+        : banner.problem === "needs-packages" ? "OmaFlow needs " + banner.missing + " first. Nothing has changed yet. Run this in a terminal, then choose Check again:"
+        : banner.problem === "failed" ? "Try again picks up where it stopped."
+        : banner.update ? (banner.update.from !== banner.update.to
+            ? "The OmaFlow folder is on " + banner.update.to + ", but the app still runs " + banner.update.from + "."
+            : "Part of OmaFlow is still on the old version.")
+          + " " + banner.action + " installs the app that came with it and restarts its background services. Your settings stay."
+          + " The top bar restarts once, then this window opens again."
+        : banner.action + " installs the OmaFlow app that came with the plugin, adds two background services, for dictation and a daily update check, and "
+          + (banner.app.existingHotkey ? "keeps your dictation key, " + banner.app.existingHotkey + "." : "sets your dictation key to AltGr+Menu in Hyprland.")
+          + " The top bar restarts once, then this window opens again."
     }
 
-    // The installer finishes a first install and a half-done update alike.
     Rectangle {
-      visible: banner.problem === "daemon" || banner.problem === "version"
+      visible: banner.problem === "needs-packages"
       x: 25
       width: Math.min(parent.width - 25, command.implicitWidth + 24)
       height: command.implicitHeight + 16
@@ -69,8 +102,7 @@ Rectangle {
         x: 12
         width: parent.width - 24
         anchors.verticalCenter: parent.verticalCenter
-        // A word joiner keeps "./install" whole when the line wraps.
-        text: banner.installCommand.replace("./install", "./\u2060install")
+        text: String(banner.setup.command || "")
         font.family: Theme.mono
         font.pixelSize: 12
         wrapMode: Text.Wrap
@@ -87,10 +119,46 @@ Rectangle {
         onClicked: banner.openSettings("models")
       }
       Pill {
-        visible: banner.problem === "daemon" || banner.problem === "version"
-        kind: "primary"; text: banner.copied ? "Copied" : "Copy command"; size: 13; verticalPadding: 7; horizontalPadding: 12
-        onClicked: { banner.app.copy(banner.installCommand); banner.copied = true; copiedTimer.restart() }
+        visible: ["needs-setup", "needs-update", "running", "failed"].indexOf(banner.problem) >= 0
+        enabled: banner.problem !== "running"
+        kind: "primary"; text: banner.problem === "failed" ? "Try again" : banner.action
+        size: 13; verticalPadding: 7; horizontalPadding: 12
+        onClicked: banner.app.finishSetup()
       }
+      Pill {
+        visible: banner.problem === "needs-packages"
+        enabled: !banner.app.setupChecking
+        kind: "primary"; text: "Check again"; size: 13; verticalPadding: 7; horizontalPadding: 12
+        onClicked: banner.app.checkPackages()
+      }
+      Pill {
+        visible: banner.problem === "needs-packages"
+        kind: "fill"; text: banner.copied ? "Copied" : "Copy command"; size: 13; verticalPadding: 7; horizontalPadding: 12
+        onClicked: { banner.app.copy(banner.setup.command); banner.copied = true; copiedTimer.restart() }
+      }
+      Pill {
+        visible: banner.problem === "failed" && String(banner.setup.log || "").length > 0
+        kind: "link"; text: "Open the log"; size: 13; verticalPadding: 7
+        onClicked: banner.app.openInEditor(banner.setup.log)
+      }
+      UiText {
+        visible: banner.problem === "running" || banner.problem === "needs-packages" && banner.app.setupChecking
+        anchors.verticalCenter: parent.verticalCenter
+        text: banner.problem === "running" ? banner.app.setupStepText : "Checking…"
+        muted: true
+      }
+    }
+
+    // The terminal way does the same, and installs missing packages itself.
+    UiText {
+      visible: banner.isSetup && banner.problem !== "running"
+      x: 25
+      width: parent.width - 25
+      wrapMode: Text.Wrap
+      font.pixelSize: 12
+      muted: true
+      // A word joiner keeps "./install" whole when the line wraps.
+      text: "Or run ./⁠install in a terminal, in " + banner.app.pluginDir + "."
     }
   }
 }

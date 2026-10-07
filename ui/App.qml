@@ -12,6 +12,7 @@ import "Keys.js" as KeyNames
 //   openInEditor(path)                                 open a text file
 //   openExternally(pathOrUrl)                          folder, web page
 //   showWindow(page), hideWindow()                     open or close the main window
+//   setupCommand()                                     argv that starts the setup detached
 Item {
   id: app
   visible: false
@@ -131,6 +132,106 @@ Item {
   // Why the last Update and restart did not start, from the command itself.
   property string updateRequestError: ""
 
+  // ----------------------------------------------------------------- setup
+  // Whether the app the OmaFlow folder brought is installed and running, and
+  // the setup that puts it right (./install --from-window). The host feeds
+  // the facts; `setup` is the one place that turns them into a state.
+  // The version in the OmaFlow folder's manifest.json.
+  property string pluginVersion: ""
+  // The installed release, from its receipt; the running version stands in
+  // for a development build, which has none.
+  property string installedVersion: ""
+  // The status file the setup writes: state, step, message, command, from.
+  property var setupStatus: ({})
+  // False once the host sees the setup gone while its file still says running.
+  property bool setupUnitActive: true
+  property int setupMisses: 0
+  // The dictation key the setup keeps, as people read it, or "" for none.
+  property string existingHotkey: ""
+  // When Finish setup was clicked, until the setup's status file answers.
+  property double setupRequestedAt: 0
+  property string setupStartError: ""
+  property bool setupChecking: false
+  // { state, update, ... }, where update is { from, to } or null:
+  //   ready
+  //   needs-setup                   the app is not installed
+  //   needs-update                  the folder is newer than the app
+  //   running { step }              "app", "services" or "shell"
+  //   needs-packages { missing, command }
+  //   failed { reason, log }
+  readonly property var setup: {
+    var status = setupStatus || {}
+    var current = installedVersion || runningVersion
+    var outdated = binaryFound && (partlyUpdated || pluginVersion !== "" && current !== ""
+      && pluginVersion !== current && !updateRunning && !updatePausesDictation)
+    var update = outdated ? { from: current, to: pluginVersion || current } : null
+    // A setup that started from an installed version is an update, also
+    // once it has put the new one in place.
+    var ran = setupRequestedAt > 0 || setupStartError ? update
+      : status.from ? { from: String(status.from), to: pluginVersion || String(status.from) } : null
+    if (setupUnitActive && (setupRequestedAt > 0 || status.state === "running"))
+      return { state: "running", update: ran, step: String(status.step || "app") }
+    if (setupStartError) return { state: "failed", update: ran, reason: setupStartError, log: "" }
+    if (status.state === "running" || status.state === "failed")
+      return { state: "failed", update: ran, log: String(status.log || ""),
+        reason: status.state === "failed" && status.message ? String(status.message) : "Setup stopped before it finished." }
+    if (status.state === "needs-packages" && (!binaryFound || outdated))
+      return { state: "needs-packages", update: ran, missing: String(status.missing || ""), command: String(status.command || "") }
+    if (!binaryFound) return { state: "needs-setup", update: null }
+    if (outdated) return { state: "needs-update", update: update }
+    return { state: "ready", update: null }
+  }
+  readonly property string setupStepText: setup.step === "shell" ? "Restarting the shell…"
+    : setup.step === "services" ? "Starting the services…" : "Installing OmaFlow…"
+  // Where the setup's banner is: History for a first install, Updates and
+  // app for an update, whose History has dictations in it.
+  readonly property string setupPage: setup.update ? "settings/updates" : "history"
+
+  // The file the setup writes, read again whenever it changes. A setup this
+  // window was waiting for that has ended says how it went; `fresh` is one
+  // that ended just before this window started, as the shell restarted.
+  function applySetupStatus(raw, fresh) {
+    var next
+    try { next = JSON.parse(raw || "{}") || {} } catch (error) { next = {} }
+    var waiting = setup.state === "running" || fresh === true
+    if (setupRequestedAt > 0 && Number(next.updatedAtMs || 0) >= setupRequestedAt - 2000) setupRequestedAt = 0
+    replaceIfChanged("setupStatus", next)
+    if (!waiting || next.state !== "ok") return
+    if (next.message) toast(String(next.message), false)
+    // The folder is on the installed release again, so a warning that it
+    // changed outside OmaFlow is out of date; checking replaces it.
+    if (updateOffer.externalCheckoutWarning) checkForUpdate()
+  }
+  // The host's answer to whether the setup's unit still runs. Gone twice in
+  // a row, so a setup that just wrote its result is not caught between the
+  // write and the read.
+  function noteSetupUnit(active) {
+    setupMisses = active ? 0 : setupMisses + 1
+    setupUnitActive = setupMisses < 2
+  }
+  function finishSetup() {
+    if (setup.state === "running" || !host || !host.setupCommand) return
+    setupStartError = ""
+    setupMisses = 0
+    setupUnitActive = true
+    setupRequestedAt = clockOverride || Date.now()
+    spawn(host.setupCommand(), function(stdout, stderr, code) {
+      if (code === 0) return
+      setupRequestedAt = 0
+      setupStartError = failureText(stderr, "Setup did not start")
+    })
+  }
+  // Check again only looks at the packages; Finish setup then does the rest.
+  function checkPackages() {
+    if (setupChecking || !pluginDir) return
+    setupChecking = true
+    spawn([pluginDir + "/install", "--from-window", "--dry-run"], function(stdout, stderr, code) {
+      setupChecking = false
+      if (code !== 0 && setup.state === "needs-packages")
+        toast("Still missing: " + setup.missing + ". Run the command, then check again.", true)
+    })
+  }
+
   // --------------------------------------------------------------- journal
   property var journalSettings: ({folder: "~/Documents/Journal", cleanup: "light", keep_recordings: true, empty_day_question: false})
   property int journalRevision: 0
@@ -206,12 +307,14 @@ Item {
   // The daemon and this window are from different versions, so either may
   // misread the other until the update finishes.
   readonly property bool partlyUpdated: connected && !supportedState
-  readonly property string statusTone: !binaryFound || !connected || asrFailed || updatePausesDictation ? "red"
+  readonly property string statusTone: setup.state === "running" ? "yellow"
+    : !binaryFound || !connected || asrFailed || updatePausesDictation ? "red"
     : phase === "recording" ? "red"
     : setupUnfinished || speechDownloading || speechLoading ? "yellow"
     : partlyUpdated ? "red"
     : "green"
-  readonly property string statusText: !binaryFound ? "Not installed yet"
+  readonly property string statusText: setup.state === "running" ? setupStepText
+    : !binaryFound ? "Not installed yet"
     : !connected ? (pendingAction === "start" ? "Starting OmaFlow" : "OmaFlow stopped")
     : phase === "recording" ? (journalTake ? "Recording journal entry" : todoTake ? "Recording to-dos" : "Recording")
     : phase === "processing" ? (journalTake ? "Writing it down" : todoTake ? "Adding to-dos"
@@ -223,9 +326,10 @@ Item {
     : speechLoading ? "Speech model loading"
     : partlyUpdated ? "Partly updated"
     : "Ready, hold " + hotkeyLabel
-  // What the header offers next to that line: "install", "models" and
-  // "updates" make the line itself a link, "start" and "restart" add a button.
-  readonly property string statusAction: !binaryFound ? "install"
+  // What the header offers next to that line: "install" (the setup's
+  // banner), "models" and "updates" make the line itself a link, "start" and
+  // "restart" add a button.
+  readonly property string statusAction: setup.state === "running" || !binaryFound ? "install"
     : !connected ? "start"
     : phase === "recording" || phase === "processing" ? ""
     : updatePausesDictation ? "updates"

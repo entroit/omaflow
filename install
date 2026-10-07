@@ -23,6 +23,7 @@ assume_yes=0
 dry_run=0
 skip_preflight=0
 set_hotkey=0
+from_window=0
 
 usage() {
   cat <<'EOF'
@@ -35,6 +36,12 @@ Usage: ./install [options]
   --skip-preflight        Do not run scripts/preflight.sh first
   --dry-run               Print what would happen and change nothing
   --yes, -y               Do not ask for confirmation
+  --from-window           Run as the OmaFlow window's Finish setup does: no
+                          questions, no sudo, no preflight. A missing package
+                          stops it before anything changes, with the command
+                          that installs it. Progress goes to
+                          $XDG_RUNTIME_DIR/omaflow-setup.json. With --dry-run
+                          it only checks the packages.
   -h, --help              This message
 
 Examples:
@@ -72,6 +79,12 @@ while (($# > 0)); do
     ;;
   --yes | -y)
     assume_yes=1
+    shift
+    ;;
+  --from-window)
+    from_window=1
+    assume_yes=1
+    skip_preflight=1
     shift
     ;;
   -h | --help)
@@ -115,6 +128,30 @@ key_label() {
   printf '%s' "$label"
 }
 
+# The window starts this detached, because its last step restarts the shell
+# the window lives in, and reads how far it got from this file afterwards.
+status_file="${XDG_RUNTIME_DIR:-/run/user/$UID}/omaflow-setup.json"
+# Each report names the version it started from, empty on a first install,
+# so the window can call it an update even after the new one is in place.
+previous_version="$(jq -r '.version // empty' "${XDG_STATE_HOME:-$HOME/.local/state}/omaflow/update/installed.json" 2>/dev/null || true)"
+report() { "$repo_dir/scripts/setup-status" "$status_file" from="$previous_version" "$@"; }
+reported=0
+reason=""
+if ((from_window && !dry_run)); then
+  log_file="${status_file%.json}.log"
+  exec >"$log_file" 2>&1
+  export OMAFLOW_SETUP_STATUS="$status_file" OMAFLOW_SETUP_FROM="$previous_version"
+  report state=running step=app
+  # Whatever stops the run says why: the reason set below, or the last line
+  # the failing step printed.
+  setup_stopped() {
+    (($? == 0 || reported)) && return
+    report state=failed log="$log_file" \
+      message="${reason:-$(grep -v '^[[:space:]]*$' "$log_file" | tail -n 1 | sed 's/^[[:space:]]*//')}"
+  }
+  trap setup_stopped EXIT
+fi
+
 if [[ $EUID -eq 0 ]]; then
   printf 'Run ./install as your normal user, not with sudo. It asks for the\n' >&2
   printf 'password only for the package step.\n' >&2
@@ -122,7 +159,8 @@ if [[ $EUID -eq 0 ]]; then
 fi
 
 # Python is part of the supported Omarchy desktop; the hotkey writer needs it.
-if ! command -v python3 >/dev/null; then
+# From the window, a missing Python is reported with the other packages.
+if ((from_window == 0)) && ! command -v python3 >/dev/null; then
   printf 'OmaFlow needs Python 3.11+. Install it with: sudo pacman -S python\n' >&2
   exit 1
 fi
@@ -151,6 +189,7 @@ want_package jq
 want_package pipewire-audio
 want_package wl-clipboard
 want_package git
+want_package curl
 
 hotkey_file="$config_home/hypr/omaflow-hotkey.lua"
 need_hotkey=0
@@ -159,6 +198,18 @@ if ((set_hotkey)) || [[ ! -f $hotkey_file ]]; then need_hotkey=1; fi
 bindings="$config_home/hypr/bindings.lua"
 need_bindings=0
 if [[ ! -f $bindings ]] || ! grep -q 'require("omaflow")' "$bindings"; then need_bindings=1; fi
+
+# The window cannot ask for a password, so it stops here, before any change,
+# with the command that installs what is missing.
+if ((from_window)); then
+  if ((${#packages[@]})); then
+    report state=needs-packages missing="${packages[*]}" command="sudo pacman -S --needed ${packages[*]}"
+    reported=1
+    printf 'OmaFlow needs %s first. Nothing was changed. Install it with: sudo pacman -S --needed %s\n' "${packages[*]}" "${packages[*]}" >&2
+    exit 1
+  fi
+  if ((dry_run)); then report state=checked; fi
+fi
 
 # The install copies this folder's own release, so a changed folder would
 # stop it after the password and the packages; say so before anything runs.
@@ -192,6 +243,9 @@ if ((assume_yes == 0)); then
   read -r reply
   [[ $reply == [yY]* ]] || { printf 'Nothing was changed.\n'; exit 1; }
 fi
+
+# A terminal run is newer news than whatever the window last tried.
+((from_window)) || rm -f "$status_file"
 
 # --- 4. Packages, with one password prompt ----------------------------------
 if ((${#packages[@]})); then
@@ -252,6 +306,7 @@ for unit in omaflow.service omaflow-update-check.timer; do
     step "$unit is active"
   else
     printf '  FAILED %s is not active. See: journalctl --user -u %s\n' "$unit" "$unit" >&2
+    reason="${reason:-$unit did not start. See why with: journalctl --user -u $unit}"
     problems=1
   fi
 done
@@ -261,6 +316,7 @@ if omarchy plugin list --json 2>/dev/null |
   step 'the bar widget is enabled'
 else
   printf '  FAILED the bar widget is not enabled. Run: omarchy plugin enable entroit.omaflow right\n' >&2
+  reason="${reason:-The OmaFlow icon is not on the top bar. Run: omarchy plugin enable entroit.omaflow right}"
   problems=1
 fi
 
@@ -288,4 +344,12 @@ if ((first_install)); then
   printf 'It downloads there, with its size and hardware needs shown before anything starts.\n'
 else
   printf 'OmaFlow is ready with your existing settings.\n'
+fi
+if ((from_window)); then
+  version="$(jq -r '.version' "$repo_dir/dist/release.json")"
+  if [[ -n $previous_version && $previous_version != "$version" ]]; then
+    report state=ok message="OmaFlow is updated to $version."
+  else
+    report state=ok message="OmaFlow is installed.${hotkey_display:+ Your dictation key is $hotkey_display.}"
+  fi
 fi

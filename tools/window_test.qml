@@ -389,7 +389,7 @@ Item {
       verify(text("Reminders for to-dos with a time.") !== null)
       updatesApp.stateVersion = 3
       verify(text("Reminders for to-dos with a time.") === null)
-      verify(pill("Copy command") !== null)
+      verify(pill("Finish update") !== null, "the repair is one button")
       updatesApp.stateVersion = 4
     }
   }

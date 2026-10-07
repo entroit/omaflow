@@ -32,8 +32,8 @@ python3 tools/installation_test.py
 python3 tools/scoring_test.py
 python3 tools/copy_lint.py
 lua tools/hotkey_test.lua
-shellcheck install link-local scripts/preflight.sh scripts/install-nemo.sh scripts/install-release scripts/package-release scripts/check-local.sh
-for script in install link-local scripts/preflight.sh scripts/install-nemo.sh scripts/install-release scripts/package-release scripts/check-local.sh; do
+shellcheck install link-local scripts/preflight.sh scripts/install-nemo.sh scripts/install-release scripts/setup-status scripts/package-release scripts/check-local.sh
+for script in install link-local scripts/preflight.sh scripts/install-nemo.sh scripts/install-release scripts/setup-status scripts/package-release scripts/check-local.sh; do
   bash -n "$script"
 done
 git diff --check

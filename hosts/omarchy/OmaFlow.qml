@@ -7,7 +7,9 @@ import qs.Commons
 import qs.Ui
 import "../../ui"
 import "../../ui/Dates.js" as Dates
+import "../../ui/Keys.js" as KeyNames
 import "Copies.js" as Copies
+import "Setup.js" as Setup
 
 // OmaFlow inside the Omarchy shell: the bar icon, the window, and the card at
 // the bottom of the screen. Everything you see is the shared UI in ../../ui;
@@ -67,8 +69,8 @@ Panel {
   }
 
   // The shell calls these to summon the widget, as clicking the update
-  // notification does: open where the update waits, if one does.
-  function open() { showWindow(flow.updateAttention || root.updatePaused ? "settings/updates" : "") }
+  // notification does: open where the setup or the update waits, if one does.
+  function open() { showWindow(root.setupNeeded ? flow.setupPage : flow.updateAttention || root.updatePaused ? "settings/updates" : "") }
   function close() { hideWindow() }
 
   App {
@@ -85,6 +87,7 @@ Panel {
       function openExternally(target) { Quickshell.execDetached(["xdg-open", target]) }
       function hideWindow() { window.visible = false }
       function showWindow(page) { root.showWindow(page) }
+      function setupCommand() { return Setup.command(flow.pluginDir + "/install", function(name) { return Quickshell.env(name) }) }
     }
   }
   Component { id: jobComponent; Job {} }
@@ -112,7 +115,15 @@ Panel {
   // OmaFlow stopped in the moment before it is read.
   property bool stateRead: false
   Timer { id: retry; interval: 12; onTriggered: stateFile.reload() }
-  Timer { interval: 1000; running: true; repeat: true; onTriggered: { stateFile.reload(); root.leader = Copies.leader() === root } }
+  Timer {
+    interval: 1000; running: true; repeat: true
+    onTriggered: {
+      stateFile.reload()
+      // A status file that did not exist yet is not watched.
+      if (flow.setup.state !== "ready") setupFile.reload()
+      root.leader = Copies.leader() === root
+    }
+  }
 
   FileView {
     path: root.runtimeDir + "/omaflow-level"
@@ -196,6 +207,68 @@ Panel {
     onLoaded: { try { flow.updateDeferral = JSON.parse(text() || "{}") } catch (error) { flow.updateDeferral = ({}) } }
     onLoadFailed: flow.updateDeferral = ({})
     onFileChanged: reload()
+  }
+
+  // ------------------------------------------------------------- the setup
+  // What Finish setup compares and reports: the OmaFlow folder's version,
+  // the installed release, the key it keeps, and how far a setup has got.
+  FileView {
+    path: flow.pluginDir + "/manifest.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: { try { flow.pluginVersion = String(JSON.parse(text()).version || "") } catch (error) { flow.pluginVersion = "" } }
+    onLoadFailed: flow.pluginVersion = ""
+    onFileChanged: reload()
+  }
+  FileView {
+    path: root.stateHome + "/omaflow/update/installed.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: { try { flow.installedVersion = String(JSON.parse(text()).version || "") } catch (error) { flow.installedVersion = "" } }
+    onLoadFailed: flow.installedVersion = ""
+    onFileChanged: reload()
+  }
+  FileView {
+    path: root.configHome + "/hypr/omaflow-hotkey.lua"
+    watchChanges: true
+    printErrors: false
+    onLoaded: flow.existingHotkey = Setup.hotkeys(text()).map(KeyNames.label).join("+")
+    onLoadFailed: flow.existingHotkey = ""
+    onFileChanged: reload()
+  }
+  FileView {
+    id: setupFile
+    path: root.runtimeDir + "/omaflow-setup.json"
+    watchChanges: true
+    printErrors: false
+    property bool read: false
+    property string last: ""
+    onLoaded: root.readSetup(text())
+    onLoadFailed: root.readSetup("")
+    onFileChanged: reload()
+  }
+  // The shell restarts during a setup, so a window that started one is
+  // gone when it ends. Its successor opens where the setup's banner is, to
+  // show how far it got or how it went.
+  function readSetup(raw) {
+    if (setupFile.read && raw === setupFile.last) return
+    var first = !setupFile.read
+    setupFile.read = true
+    setupFile.last = raw
+    var status = {}
+    try { status = JSON.parse(raw || "{}") || {} } catch (error) {}
+    var fresh = first && (status.state === "ok" || status.state === "failed") && Date.now() - Number(status.updatedAtMs || 0) < 60000
+    flow.applySetupStatus(raw, fresh)
+    if (first && (status.state === "running" || fresh)) showWindow(flow.setupPage)
+    // A setup that ended has installed something, or not: look again.
+    if (status.state !== "running") binaryProbe.running = true
+  }
+  // While a setup should be running, whether its unit still is.
+  Timer {
+    interval: 2000
+    running: flow.setupRequestedAt > 0 || flow.setupStatus.state === "running"
+    repeat: true
+    onTriggered: flow.spawn(Setup.ACTIVE, function(stdout, stderr, code) { flow.noteSetupUnit(code === 0) })
   }
 
   // `omarchy plugin add` copies the files but never builds the daemon.
@@ -318,10 +391,11 @@ Panel {
         : flow.phase === "processing" ? Theme.accent
         : barButton.foreground
       badge: root.stopped || root.speechStopped || root.updatePaused
-        || flow.phase === "idle" && (flow.updateAttention || flow.partlyUpdated || !flow.binaryFound || flow.setupUnfinished)
+        || flow.phase === "idle" && (flow.updateAttention || root.setupNeeded || flow.setupUnfinished)
       // Red where the window's header is red: nothing dictates until it is put right.
-      badgeColor: root.stopped || root.speechStopped || root.updatePaused || !flow.binaryFound || flow.partlyUpdated ? Theme.red
-        : flow.updateAttention ? Theme.accent : Theme.yellow
+      badgeColor: root.stopped || root.speechStopped || root.updatePaused || !flow.binaryFound || flow.partlyUpdated
+        || flow.setup.state === "failed" ? Theme.red
+        : flow.updateAttention || root.setupNeeded ? Theme.accent : Theme.yellow
       // A ring, not a dot, where dictation cannot run: themes in greys tell it apart by shape.
       badgeRing: root.stopped || root.updatePaused
     }
@@ -330,6 +404,12 @@ Panel {
   // Installed and built, but the daemon is not running: nothing you hold
   // will dictate until it starts. An update stops it on purpose for a moment.
   readonly property bool stopped: stateRead && flow.binaryFound && !flow.connected && !flow.updateRunning
+    && flow.setup.state !== "running"
+  // Finish setup, or the setup it started, waits in the window.
+  readonly property bool setupNeeded: flow.setup.state !== "ready"
+  readonly property string updateWaits: flow.setup.update && flow.setup.update.from !== flow.setup.update.to
+    ? "OmaFlow " + flow.setup.update.to + " is downloaded but not running yet. Click to finish updating."
+    : "OmaFlow is partly updated. Click to finish the update."
   // The daemon runs but its speech model stopped; the window's header
   // restarts it. Read in the same order as that header's line.
   readonly property bool speechStopped: flow.connected && flow.asrFailed && !flow.setupUnfinished && !flow.speechDownloading
@@ -360,7 +440,13 @@ Panel {
     Accessible.description: tooltipText
     // Until the state file is read, nothing is known: no claim, no action.
     tooltipText: !root.stateRead ? "OmaFlow"
-      : !flow.binaryFound ? "OmaFlow is not installed yet. Click for the one command that finishes it."
+      : flow.setup.state === "running" ? (flow.setup.update ? "Finishing the update to " + flow.setup.update.to : "Setting up OmaFlow")
+        + ". Click to see how far along it is."
+      : flow.setup.state === "failed" ? (flow.setup.update ? "The update to " + flow.setup.update.to + " did not finish" : "Setup did not finish")
+        + ". Click to see why and try again."
+      : flow.setup.state === "needs-packages" ? "OmaFlow needs a package installed first. Click to see the command."
+      : !flow.binaryFound ? "OmaFlow is not set up yet. Click to finish setup."
+      : flow.setup.state === "needs-update" && !flow.connected ? root.updateWaits
       : flow.updateRunning && !(flow.connected && (flow.phase === "recording" || flow.phase === "processing"))
         ? "OmaFlow is updating. Dictation is back in a moment. Click to see how far along it is."
       : !flow.connected ? "OmaFlow is stopped. Click to start it."
@@ -381,21 +467,22 @@ Panel {
       : root.firstDownload ? "Downloading the speech model. Dictation starts when it finishes. Click to see how far along it is."
       : root.unfinished ? (flow.missingSpeechModel ? "Download the speech model" : "Choose a speech model")
         + " to start dictating. Click to open OmaFlow."
-      : flow.partlyUpdated ? "OmaFlow is partly updated. Click to finish the update."
+      : flow.setup.state === "needs-update" ? root.updateWaits
       : flow.updateFailed ? "An update did not finish. Click to see why and try again."
       : flow.updateAttention && flow.updateAvailable ? "OmaFlow " + flow.verifiedUpdate.version + " is ready to install. Click to see what changed."
       : flow.updateAttention && flow.updateOffer.externalCheckoutWarning ? "The OmaFlow folder changed outside OmaFlow. Click to see what to do."
       : "Hold " + flow.hotkeyLabel + " to dictate. Right-click for the journal."
     onPressed: function(button) {
       if (!root.stateRead) return
-      // The window opens first, so a start that fails says why in it.
-      if (!flow.connected && flow.binaryFound && !flow.updateRunning) { root.showWindow(""); root.start(); return }
       if (flow.phase === "recording" && flow.latched) {
         if (flow.journalTake) flow.journalToggle()
         else if (flow.todoTake) flow.todoToggle()
         else flow.stopRecording()
         return
       }
+      if (root.setupNeeded) { root.showWindow(flow.setupPage); return }
+      // The window opens first, so a start that fails says why in it.
+      if (root.stopped) { root.showWindow(""); root.start(); return }
       if (root.unfinished) root.showWindow("history")
       else if (root.firstDownload) root.showWindow("settings/models")
       else if (root.speechStopped) root.showWindow("")

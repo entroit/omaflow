@@ -219,12 +219,13 @@ Rectangle {
           muted: true
         }
         // Not installed yet, no speech model, or partly updated: the line is
-        // the way to fix it. On History the install command is already on
-        // the page, so there it is only the line.
+        // the way to fix it. Where the setup's banner is already on the
+        // page, it is only the line.
         Pill {
           id: status
           visible: ["install", "models", "updates"].indexOf(view.app.statusAction) >= 0
-            && !(view.app.statusAction === "install" && view.page === "history")
+            && !(view.app.statusAction === "install"
+              && (view.page === "settings" ? "settings/" + view.settingsPage : view.page) === view.app.setupPage)
           anchors.verticalCenter: parent.verticalCenter
           kind: "link"
           text: view.app.statusText
@@ -234,9 +235,9 @@ Rectangle {
           labelMaximumWidth: header.statusRoom - 15 - 8
           hint: view.app.statusAction === "models" ? "Opens Settings, Advanced, Models"
             : view.app.statusAction === "updates" ? "Opens Settings, Advanced, Updates and app"
-            : "Shows the command that finishes installing"
+            : view.app.setupPage === "history" ? "Opens History, where setup finishes" : "Opens Settings, Advanced, Updates and app"
           onClicked: view.show(view.app.statusAction === "models" ? "settings/models"
-            : view.app.statusAction === "updates" ? "settings/updates" : "history")
+            : view.app.statusAction === "updates" ? "settings/updates" : view.app.setupPage)
         }
         // While it runs, the line beside it says so, and the button steps
         // aside so the line keeps its words in a narrow window.
