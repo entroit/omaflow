@@ -38,8 +38,8 @@ dictation transcribes in **48.8 ms**, two minutes in **373.6 ms**: 281× and
 omarchy plugin add https://github.com/entroit/omaflow.git
 ```
 
-Enable it when asked, then open OmaFlow from the bar and choose **Finish
-setup**. It installs the OmaFlow app that came with the plugin and two user
+Enable it when asked. The OmaFlow window opens by itself on **Finish setup**;
+choose it. It installs the OmaFlow app that came with the plugin and two user
 services, and sets your dictation key to AltGr+Menu. The top bar restarts
 once, and the window opens again to choose a speech model; it downloads there.
 If a system package is missing, the window shows the `sudo pacman` command to
@@ -207,18 +207,15 @@ and to-dos folders are yours and stay.
 
 ## Upgrading from 0.17 or older
 
-OmaFlow 0.17 and older cannot update themselves to this version. After the
-marketplace lists 0.18, run the three commands below once, with the exact
-40-character commit the marketplace shows. Do not use a branch name such as
-`main`.
+OmaFlow 0.17 and older cannot update themselves from the window. Update the
+plugin with Omarchy once, then open OmaFlow from the bar and choose
+**Finish update**:
 
 ```bash
-git -C ~/.config/omarchy/plugins/entroit.omaflow fetch --no-tags https://github.com/entroit/omaflow <FULL_VERIFIED_COMMIT>
-git -C ~/.config/omarchy/plugins/entroit.omaflow merge --ff-only <FULL_VERIFIED_COMMIT>
-cd ~/.config/omarchy/plugins/entroit.omaflow && ./install --yes
+omarchy plugin update entroit.omaflow
 ```
 
-After these three commands, OmaFlow updates itself from the window.
+From then on, OmaFlow updates itself from the window.
 
 ---
 

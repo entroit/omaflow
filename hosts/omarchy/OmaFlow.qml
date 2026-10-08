@@ -1,4 +1,5 @@
 import QtQuick
+import QtCore
 import Quickshell
 import Quickshell.Io
 import Quickshell.Hyprland
@@ -407,6 +408,28 @@ Panel {
     && flow.setup.state !== "running"
   // Finish setup, or the setup it started, waits in the window.
   readonly property bool setupNeeded: flow.setup.state !== "ready"
+
+  // Right after `omarchy plugin add` or `update`, the window opens by itself
+  // on Finish setup or Finish update, once for each, so nobody has to find
+  // it. Remembered beside the window's other state; the checks settle first.
+  readonly property string setupOffer: flow.setup.state === "needs-setup" ? "setup " + flow.pluginVersion
+    : flow.setup.state === "needs-update" && flow.setup.update ? "update " + flow.setup.update.to : ""
+  Settings {
+    id: offered
+    location: "file://" + root.stateHome + "/omaflow/ui.ini"
+    category: "setup"
+    property string offer: ""
+  }
+  onSetupOfferChanged: offerTimer.restart()
+  onLeaderChanged: if (leader) offerTimer.restart()
+  Timer {
+    id: offerTimer
+    interval: 2500
+    onTriggered: if (root.leader && root.setupOffer && root.setupOffer !== offered.offer) {
+      offered.offer = root.setupOffer
+      root.showWindow(flow.setupPage)
+    }
+  }
   readonly property string updateWaits: flow.setup.update && flow.setup.update.from !== flow.setup.update.to
     ? "OmaFlow " + flow.setup.update.to + " is downloaded but not running yet. Click to finish updating."
     : "OmaFlow is partly updated. Click to finish the update."
