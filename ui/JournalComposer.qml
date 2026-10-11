@@ -136,7 +136,9 @@ Item {
         selectByMouse: true
         // Cleared only once the entry is saved, so a failed save keeps your words.
         function accept() { if (text.trim().length > 0) composer.typed(text.trim()) }
+        // Pasted through PasteGuard, never read from the clipboard by Qt.
         Keys.onPressed: function(event) {
+          if (paste.key(event)) return
           if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && !(event.modifiers & Qt.ShiftModifier)) {
             accept()
             event.accepted = true
@@ -148,6 +150,9 @@ Item {
         // Esc only leaves the field; the draft waits there for you.
         Keys.onEscapePressed: focus = false
         Accessible.name: composer.todo ? "Type a to-do" : "Type a journal entry"
+        Controls.ContextMenu.menu: null
+        Controls.ContextMenu.onRequested: function(at) { paste.openMenu(at) }
+        PasteGuard { id: paste; app: composer.app }
       }
     }
 

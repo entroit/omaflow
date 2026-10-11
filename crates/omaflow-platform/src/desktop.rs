@@ -15,27 +15,6 @@ use std::{
 /// never interleave their clipboard write and key chord.
 pub static DELIVERY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[derive(Debug, Default)]
-pub enum ClipboardSnapshot {
-    #[default]
-    Empty,
-    Content {
-        mime_type: String,
-        data: Vec<u8>,
-    },
-}
-
-impl ClipboardSnapshot {
-    pub fn text_context(&self) -> &str {
-        match self {
-            Self::Content { mime_type, data } if is_text_mime(mime_type) => {
-                std::str::from_utf8(data).unwrap_or("")
-            }
-            _ => "",
-        }
-    }
-}
-
 pub fn copy_text(text: &str) -> Result<(), String> {
     let _guard = DELIVERY_LOCK
         .lock()
@@ -105,13 +84,23 @@ pub fn set_clipboard(data: &[u8], mime_type: Option<&str>) -> Result<(), String>
     }
 }
 
-pub fn read_clipboard() -> Result<ClipboardSnapshot, String> {
+/// The most text a paste takes. More than this is refused rather than cut,
+/// so a paste is either whole or does not happen.
+pub const PASTE_LIMIT: usize = 1024 * 1024;
+
+/// The clipboard's text, or the primary selection's, read by `wl-paste` in its
+/// own process with a time and size limit. The OmaFlow window pastes through
+/// this so the shell never reads clipboard data itself: an app that offers
+/// endless data stops here instead of filling the shell's memory.
+pub fn read_clipboard_text(primary: bool) -> Result<String, String> {
+    let selection: &[&str] = if primary { &["--primary"] } else { &[] };
     let types_output = Command::new("wl-paste")
+        .args(selection)
         .arg("--list-types")
-        .bounded_output()
-        .map_err(|error| format!("could not inspect clipboard: {error}"))?;
+        .bounded_output_for(Duration::from_secs(2))
+        .map_err(|_| "The clipboard did not answer.".to_string())?;
     if !types_output.status.success() {
-        return Ok(ClipboardSnapshot::Empty);
+        return Ok(String::new());
     }
     let types_text = String::from_utf8_lossy(&types_output.stdout);
     let types: Vec<&str> = types_text
@@ -119,26 +108,27 @@ pub fn read_clipboard() -> Result<ClipboardSnapshot, String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .collect();
-    let Some(mime_type) = preferred_clipboard_type(&types) else {
-        return Ok(ClipboardSnapshot::Empty);
+    let Some(mime_type) = preferred_clipboard_type(&types).filter(|t| is_text_mime(t)) else {
+        return Ok(String::new());
     };
-    if !is_text_mime(mime_type) {
-        return Ok(ClipboardSnapshot::Empty);
-    }
     let output = Command::new("wl-paste")
-        .args(["--type", mime_type])
-        .bounded_output()
-        .map_err(|error| format!("could not read clipboard as {mime_type}: {error}"))?;
+        .args(selection)
+        .args(["--no-newline", "--type", mime_type])
+        .bounded_output_for(Duration::from_secs(2))
+        .map_err(|error| {
+            if error.to_string().contains("exceeds") {
+                "The clipboard holds too much text to paste.".to_string()
+            } else {
+                "The clipboard did not answer.".to_string()
+            }
+        })?;
     if !output.status.success() {
-        return Err(format!(
-            "could not read clipboard as {mime_type}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        return Ok(String::new());
     }
-    Ok(ClipboardSnapshot::Content {
-        mime_type: mime_type.to_string(),
-        data: output.stdout,
-    })
+    if output.stdout.len() > PASTE_LIMIT {
+        return Err("The clipboard holds too much text to paste.".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 pub fn preferred_clipboard_type<'a>(types: &'a [&'a str]) -> Option<&'a str> {
@@ -253,7 +243,7 @@ pub fn active_window_matches(expected: Option<&Value>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipboardSnapshot, paste_shortcut, preferred_clipboard_type};
+    use super::{is_text_mime, paste_shortcut, preferred_clipboard_type};
     use omaflow_core::config::{PasteDelivery, PasteMode, PasteModifier, PasteShortcut};
     use serde_json::json;
 
@@ -309,14 +299,10 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_context_reads_text_and_ignores_binary() {
+    fn paste_takes_text_and_ignores_binary() {
         let types = ["text/plain", "image/jpeg", "image/png"];
         assert_eq!(preferred_clipboard_type(&types), Some("text/plain"));
         assert_eq!(preferred_clipboard_type(&["image/png"]), None);
-        let snapshot = ClipboardSnapshot::Content {
-            mime_type: "image/png".into(),
-            data: vec![0, 159, 146, 150],
-        };
-        assert_eq!(snapshot.text_context(), "");
+        assert!(!is_text_mime("image/png"));
     }
 }

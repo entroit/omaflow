@@ -428,7 +428,7 @@ Item {
     }
     function test_an_entry_says_when_its_recording_was_not_kept() {
       var spoken = Object.assign({}, Fixtures.DAY.entries[1], { audio: false })
-      var row = entryComponent.createObject(root, { entry: spoken, date: Fixtures.TODAY, width: 600 })
+      var row = entryComponent.createObject(root, { entry: spoken, date: Fixtures.TODAY, width: 600, app: app })
       verify(shown(row, "Recording not kept"))
       row.current = true
       var asSpoken = named(row, "Show entry from 12:15 as spoken")

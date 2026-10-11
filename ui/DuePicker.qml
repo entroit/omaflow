@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Controls as Controls
 import "Dates.js" as Dates
 
 // Any day, and if you like a time, for a to-do: for what the When menu does
@@ -9,6 +8,7 @@ import "Dates.js" as Dates
 Item {
   id: picker
 
+  required property var app
   property bool open: false
   property Item anchorItem: null
   property string today: ""
@@ -294,12 +294,13 @@ Item {
               Accessible.name: "Type another time"
             }
             // Other… opens the typed time in its place.
-            Controls.TextField {
+            LineEdit {
               id: timeInput
+              app: picker.app
               visible: picker.other
               width: 82; height: 26
               leftPadding: 10; rightPadding: 10; topPadding: 0; bottomPadding: 0
-              verticalAlignment: TextInput.AlignVCenter
+              verticalAlignment: TextEdit.AlignVCenter
               color: Theme.text
               placeholderText: "3pm"
               placeholderTextColor: Theme.secondary

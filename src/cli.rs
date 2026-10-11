@@ -171,6 +171,30 @@ pub fn run() -> ExitCode {
             }
         }
         "copy" => send_command("copy"),
+        // The window pastes through this, never through Qt, so a clipboard
+        // that streams without end cannot fill the shell's memory.
+        "clipboard-text" => {
+            let primary = args.next().as_deref() == Some("--primary");
+            match omaflow_platform::desktop::read_clipboard_text(primary) {
+                Ok(text) => {
+                    use std::io::Write;
+                    let mut out = std::io::stdout().lock();
+                    if out
+                        .write_all(text.as_bytes())
+                        .and_then(|()| out.flush())
+                        .is_ok()
+                    {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(error) => {
+                    eprintln!("omaflow: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         "paste-last" => send_command("paste-last"),
         "history-paste" => history_command("history-paste", args.next()),
         "history-copy" => history_command("history-copy", args.next()),
@@ -397,16 +421,7 @@ pub fn run() -> ExitCode {
                         .get("transcript")
                         .and_then(serde_json::Value::as_str)
                         .ok_or("Missing transcript")?;
-                    let clip = value
-                        .get("clipboard")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    Ok(backend::evaluate_text(
-                        &config,
-                        text,
-                        clip,
-                        value.get("window"),
-                    ))
+                    Ok(backend::evaluate_text(&config, text, value.get("window")))
                 });
             match result {
                 Ok(value) => {
@@ -600,7 +615,7 @@ The keys, the bar icon and the window run the rest:
   To-dos: todo-press, todo-release, todo-toggle [JSON], todo-discard, todo-undo, todo-list LIST, todo-move LIST,
           todo-card-edit, todo-card-remove, todos list|done|undone|edit|due|remind|snooze|reminders|move|
           delete|clear-done|new-list|rename-list|delete-list|restore|forget-deleted|move-folder
-  Delivery: copy, paste-last, paste-mode auto|ctrl-v|shift-insert|clipboard|custom
+  Delivery: copy, paste-last, paste-mode auto|ctrl-v|shift-insert|clipboard|custom, clipboard-text [--primary]
   History: history-copy, history-raw, history-paste, history-play, history-retry, history-edit,
            history-delete, history-undo, history-clear, erase-data
   Settings: configure KEY JSON|-, vocabulary-add, vocabulary-remove, reload-config, meter-gate DB

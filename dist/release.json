@@ -1,18 +1,18 @@
 {
   "schemaVersion": 1,
   "pluginId": "entroit.omaflow",
-  "version": "0.21.0",
-  "summary": "Install and update OmaFlow like any other plugin, then finish with one click.",
+  "version": "0.21.1",
+  "summary": "Safer pasting, and Finish setup that opens by itself.",
   "changes": [
-    "After adding or updating the plugin, Finish setup in the OmaFlow window does the rest, with no terminal",
-    "One-click reminders, a calmer to-do list, journal entries on past days, and fixes on every screen",
-    "Works on computers without an NVIDIA graphics card"
+    "Pasting into OmaFlow has a size and time limit, so a misbehaving app cannot freeze the top bar",
+    "The OmaFlow window opens on Finish setup or Finish update by itself when one is waiting",
+    "Removed the hidden cleanup setting that sent clipboard text to the cleanup model"
   ],
   "binary": {
     "target": "x86_64-unknown-linux-gnu",
     "path": "dist/bin/x86_64-unknown-linux-gnu/omaflow",
-    "bytes": 2780688,
-    "sha256": "d4729fe73160269e06a961560ececf11d3126391b7339ff053fa5ffab841f025"
+    "bytes": 2777496,
+    "sha256": "c375925cee7d093db02b5704e14dc5de82bf86e77cc2d07a1d906282fe8f5ccd"
   },
   "stateSchemaVersion": 4
 }

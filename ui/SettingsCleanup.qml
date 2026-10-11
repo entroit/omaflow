@@ -148,6 +148,7 @@ Column {
 
     Field {
       id: model
+      app: page.app
       deferProblem: true
       width: parent.width
       mono: true
@@ -160,6 +161,7 @@ Column {
     }
     Field {
       id: endpoint
+      app: page.app
       deferProblem: true
       width: parent.width
       mono: true
@@ -171,6 +173,7 @@ Column {
     }
     Field {
       id: key
+      app: page.app
       width: parent.width
       label: "API key, optional"
       password: true

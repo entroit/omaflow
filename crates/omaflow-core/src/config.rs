@@ -360,12 +360,10 @@ pub struct Cleanup {
     pub keep_alive: String,
     pub think: bool,
     pub temperature: f64,
-    pub context_max_chars: usize,
     pub num_ctx: i64,
     pub num_predict: i64,
     pub stop_sequences: Vec<String>,
     pub use_window_context: bool,
-    pub use_clipboard_context: bool,
     pub custom_vocabulary: Vec<String>,
     #[serde(skip_serializing)]
     pub api_key: String,
@@ -464,12 +462,10 @@ impl Default for Cleanup {
             keep_alive: "24h".into(),
             think: false,
             temperature: 0.0,
-            context_max_chars: 4_000,
             num_ctx: 16_384,
             num_predict: -1,
             stop_sequences: Vec::new(),
             use_window_context: true,
-            use_clipboard_context: false,
             custom_vocabulary: Vec::new(),
             api_key: String::new(),
             system_prompt: DEFAULT_CLEANUP_PROMPT.into(),
@@ -728,7 +724,7 @@ impl Config {
             | "keep_models_loaded"
             | "keep_dictation_audio"
             | "meter_gate_auto" => "behavior",
-            "enabled" | "use_window_context" | "use_clipboard_context" | "style" => "cleanup",
+            "enabled" | "use_window_context" | "style" => "cleanup",
             _ => return Err("Unknown setting".into()),
         };
         let value = toml::Value::try_from(value).map_err(|e| e.to_string())?;

@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Controls as Controls
 
 // A labelled text input that keeps saying what it is after you type. A
 // problem replaces the hint in the error colour, so the line under the field
@@ -23,6 +22,7 @@ Column {
   property bool visited: false
   readonly property string shownProblem: problem.length > 0 && (!deferProblem || visited || !input.activeFocus) ? problem : ""
   property alias input: input
+  required property var app
   signal accepted()
 
   spacing: 6
@@ -33,8 +33,9 @@ Column {
     muted: true
   }
 
-  Controls.TextField {
+  LineEdit {
     id: input
+    app: field.app
     width: parent.width
     height: 38
     leftPadding: 13
@@ -45,10 +46,10 @@ Column {
     selectedTextColor: Theme.text
     font.family: field.mono ? Theme.mono : Theme.sans
     font.pixelSize: 13
-    echoMode: field.password ? TextInput.Password : TextInput.Normal
+    password: field.password
     maximumLength: 2048
     selectByMouse: true
-    verticalAlignment: TextInput.AlignVCenter
+    verticalAlignment: TextEdit.AlignVCenter
     background: Rectangle {
       radius: Theme.radiusInput
       color: Theme.fill4

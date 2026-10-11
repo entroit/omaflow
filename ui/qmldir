@@ -15,6 +15,7 @@ JournalScreen 1.0 JournalScreen.qml
 JournalSettingsSheet 1.0 JournalSettingsSheet.qml
 Keycap 1.0 Keycap.qml
 KeyRecorder 1.0 KeyRecorder.qml
+LineEdit 1.0 LineEdit.qml
 MainView 1.0 MainView.qml
 Mark 1.0 Mark.qml
 Meter 1.0 Meter.qml
@@ -23,6 +24,7 @@ NavItem 1.0 NavItem.qml
 OverlayCard 1.0 OverlayCard.qml
 PageTitle 1.0 PageTitle.qml
 Pill 1.0 Pill.qml
+PasteGuard 1.0 PasteGuard.qml
 PopupMenu 1.0 PopupMenu.qml
 SearchField 1.0 SearchField.qml
 Segmented 1.0 Segmented.qml

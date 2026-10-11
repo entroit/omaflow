@@ -72,7 +72,6 @@ timeout_seconds = 30
 keep_alive = "24h"
 think = false
 temperature = 0.0
-context_max_chars = 4000
 # Prompt, transcript, context and answer must fit here. Usable dictation length
 # and memory consumption depend on the content, model and inference runtime.
 num_ctx = 16384
@@ -81,9 +80,6 @@ stop_sequences = []
 # Window class and title of the focused app go into the cleanup prompt. Not in
 # Settings: it is a title, not content, and can help spell app-specific terms.
 use_window_context = true
-# Clipboard text goes into the prompt so copied names are spelled the same way.
-# Off by default because clipboards hold passwords. Not in Settings either.
-use_clipboard_context = false
 # Optional bearer token for a cleanup server that requires one. Sent as an
 # Authorization header only when it is not empty, and never published.
 api_key = ""

@@ -15,6 +15,7 @@ Rectangle {
   id: row
 
   required property var todo
+  required property var app
   property bool current: false
   property bool editing: false
   // Just ticked: still in its place while the line is drawn through it.
@@ -197,8 +198,9 @@ Rectangle {
       onTextChanged: if (row.editing) row.draftEdited(text)
       Keys.onReturnPressed: finish()
       Keys.onEnterPressed: finish()
-      // Clicking elsewhere keeps what you typed, like most lists.
-      onActiveFocusChanged: if (!activeFocus && row.editing) finish()
+      // Clicking elsewhere keeps what you typed, like most lists; its own
+      // right-click menu is not elsewhere.
+      onActiveFocusChanged: if (!activeFocus && row.editing && !paste.menuOpen) finish()
       Keys.onEscapePressed: row.cancelRequested()
       function finish() {
         var next = text.replace(/\s*\n\s*/g, " ").trim()
@@ -206,6 +208,12 @@ Rectangle {
         else row.saveRequested(next)
       }
       Accessible.name: "Edit “" + row.todo.text + "”"
+      // Pasted through PasteGuard, never read from the clipboard by Qt.
+      Keys.onPressed: function(event) { paste.key(event) }
+      Controls.ContextMenu.menu: null
+      Controls.ContextMenu.onRequested: function(at) { paste.openMenu(at) }
+      // One line in the file, so a pasted line break is a space.
+      PasteGuard { id: paste; app: row.app; singleLine: true }
     }
 
     // The list it is in, in views across lists. Not while editing: the field

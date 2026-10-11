@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Controls as Controls
 
 // A quiet filled capsule; the outline only appears while you type in it.
 // Press / to get here.
@@ -9,6 +8,7 @@ Rectangle {
   property alias text: input.text
   property string placeholder: "Search"
   property alias input: input
+  required property var app
   signal escaped()
   signal down()
   signal up()
@@ -34,14 +34,14 @@ Rectangle {
     anchors.verticalCenter: parent.verticalCenter
   }
 
-  Controls.TextField {
+  LineEdit {
     id: input
+    app: search.app
     anchors.left: key.right
     anchors.leftMargin: 3
     anchors.right: parent.right
     anchors.rightMargin: 10
     anchors.verticalCenter: parent.verticalCenter
-    background: null
     color: Theme.text
     placeholderText: search.placeholder
     placeholderTextColor: Theme.secondary

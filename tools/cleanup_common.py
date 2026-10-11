@@ -15,10 +15,10 @@ def configuration():
     return json.loads(result.stdout)["cleanup"]
 
 
-def evaluate(config, model, transcript, clipboard="", window=""):
+def evaluate(config, model, transcript, window=""):
     started = time.monotonic()
     body = {"transcript": transcript, "prompt": config["system_prompt"],
-            "model": model, "clipboard": clipboard, "vocabulary": config["custom_vocabulary"]}
+            "model": model, "vocabulary": config["custom_vocabulary"]}
     if window:
         body["window"] = {"class": "evaluation", "title": window}
     result = subprocess.run([str(BINARY), "evaluate"], input=json.dumps(body),
@@ -30,6 +30,6 @@ def evaluate(config, model, transcript, clipboard="", window=""):
     return value, round((time.monotonic() - started) * 1000)
 
 
-def request(config, model, transcript, clipboard="", window=""):
-    value, elapsed = evaluate(config, model, transcript, clipboard, window)
+def request(config, model, transcript, window=""):
+    value, elapsed = evaluate(config, model, transcript, window)
     return value["text"], elapsed

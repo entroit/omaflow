@@ -82,6 +82,7 @@ Column {
 
   Field {
     id: model
+    app: page.app
     deferProblem: true
     width: parent.width
     mono: true
@@ -97,6 +98,7 @@ Column {
 
   Field {
     id: endpoint
+    app: page.app
     deferProblem: true
     visible: !page.managed
     width: parent.width
@@ -111,6 +113,7 @@ Column {
 
   Field {
     id: health
+    app: page.app
     deferProblem: true
     visible: !page.managed
     width: parent.width
@@ -127,6 +130,7 @@ Column {
     spacing: 12
     Field {
       id: language
+      app: page.app
       deferProblem: true
       width: page.managed ? (parent.width - 12) / 2 : parent.width
       label: "Language"
@@ -152,6 +156,7 @@ Column {
 
   Field {
     id: key
+    app: page.app
     visible: !page.managed
     width: parent.width
     label: "API key, optional"

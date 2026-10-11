@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -29,6 +30,20 @@ listed = {line.split()[-1] for line in (ROOT / "ui/qmldir").read_text().splitlin
 missing = sorted(path.name for path in (ROOT / "ui").glob("*.qml") if path.name not in listed)
 if missing:
     raise SystemExit("Add these to ui/qmldir: " + ", ".join(missing))
+
+# 0. Every editable text item pastes through PasteGuard, and a Controls one
+#    drops Qt's own right-click menu, so the shell never reads the clipboard.
+#    No TextInput or TextField at all: Qt 6.11 and 6.12 read the whole
+#    clipboard for one on every change, so one line is a LineEdit.
+for path in sorted([*(ROOT / "ui").glob("*.qml"), *(ROOT / "hosts").rglob("*.qml")]):
+    source = re.sub(r"//.*$", "", path.read_text(), flags=re.M)
+    if re.search(r"\b(?:TextInput|TextField)\b", source):
+        raise SystemExit(f"{path.relative_to(ROOT)}: use LineEdit, not a TextInput or TextField (see ui/LineEdit.qml)")
+    editors = len(re.findall(r"^\s*(?:\w+\.)?(?:TextArea|TextEdit) \{", source, re.M))
+    controls = len(re.findall(r"^\s*Controls\.TextArea \{", source, re.M))
+    if source.count("PasteGuard {") != editors or source.count("ContextMenu.menu: null") != controls:
+        raise SystemExit(f"{path.relative_to(ROOT)}: give each text field a PasteGuard, and each Controls one "
+                         "ContextMenu.menu: null (see ui/PasteGuard.qml)")
 
 # 1. Every screen, rendered.
 result = subprocess.run([str(ROOT / "tools/preview/render.sh"), str(output)], text=True)
@@ -142,6 +157,11 @@ setup = subprocess.run(["/usr/lib/qt6/bin/qmltestrunner", "-input", str(ROOT / "
 if setup.returncode != 0:
     raise SystemExit("The setup banner test failed:\n" + setup.stdout + setup.stderr)
 print("PASS Finish setup starts the detached setup and shows its progress, missing packages and failures", flush=True)
+paste = subprocess.run(["/usr/lib/qt6/bin/qmltestrunner", "-input", str(ROOT / "tools/paste_test.qml")],
+                       env=dict(os.environ, QT_QPA_PLATFORM="offscreen"), capture_output=True, text=True, timeout=60)
+if paste.returncode != 0:
+    raise SystemExit("The paste test failed:\n" + paste.stdout + paste.stderr)
+print("PASS fields paste through omaflow clipboard-text by key, middle button and menu, never through Qt", flush=True)
 
 # 3. The connection tester's handling of real replies.
 probe = ROOT / "tools/preview/Probe.qml"

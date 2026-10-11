@@ -1,6 +1,5 @@
 import QtCore
 import QtQuick
-import QtQuick.Controls as Controls
 import QtQuick.Layouts
 import "Dates.js" as Dates
 
@@ -655,6 +654,7 @@ FocusScope {
   component Todo: TodoRow {
     // Found by this name in tests and previews, as the type is Todo here.
     objectName: "TodoRow"
+    app: screen.app
     // Upcoming says the day above; the row need not repeat it.
     showDue: screen.view !== "upcoming"
     today: screen.today
@@ -789,12 +789,12 @@ FocusScope {
       border.width: 1.5
       border.color: screen.listError ? Theme.red : Theme.accent
       Dot { list: nameInput.text.trim() || "?"; x: 12; anchors.verticalCenter: parent.verticalCenter }
-      Controls.TextField {
+      LineEdit {
         id: nameInput
+        app: screen.app
         x: 29 - leftPadding
         anchors.verticalCenter: parent.verticalCenter
         width: parent.width - x - 8
-        background: null
         color: Theme.text
         font.family: Theme.sans
         font.pixelSize: 14
@@ -806,8 +806,9 @@ FocusScope {
         Component.onCompleted: { forceActiveFocus(); selectAll() }
         onAccepted: nameField.done(text, false)
         Keys.onEscapePressed: { screen.listError = ""; nameField.cancelled() }
-        // Clicking away after an error keeps the old name, as Esc does.
-        onActiveFocusChanged: if (!activeFocus && visible) {
+        // Clicking away after an error keeps the old name, as Esc does. Its
+        // own right-click menu is not away.
+        onActiveFocusChanged: if (!activeFocus && visible && !menuOpen) {
           if (screen.listError) { screen.listError = ""; nameField.cancelled() }
           else nameField.done(text, true)
         }
@@ -1386,6 +1387,7 @@ FocusScope {
 
   DuePicker {
     id: duePicker
+    app: screen.app
     today: screen.today
     now: screen.nowMoment
     remindBefore: screen.remindBefore
@@ -1514,6 +1516,7 @@ FocusScope {
         bottomPadding: 14
         Field {
           id: folder
+          app: screen.app
           visible: folderSheet.movingTo.length === 0
           width: parent.width
           label: "Folder"

@@ -10,6 +10,7 @@ Rectangle {
 
   required property var entry
   required property string date
+  required property var app
   property string today: ""
   property var playback: null      // the daemon's journal_playback, if any
   property real nowMs: Date.now()
@@ -121,7 +122,9 @@ Rectangle {
       background: Rectangle { radius: Theme.radiusInput; color: Theme.background; border.width: 1; border.color: Theme.accent }
       // As in the composer: Enter saves, Shift+Enter starts a new line.
       Keys.onEscapePressed: row.cancelRequested()
+      // Pasted through PasteGuard, never read from the clipboard by Qt.
       Keys.onPressed: function(event) {
+        if (paste.key(event)) return
         if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && !(event.modifiers & Qt.ShiftModifier)) {
           row.saveRequested(editor.text)
           event.accepted = true
@@ -132,6 +135,9 @@ Rectangle {
       // Rebuilt while editing, such as after a failed save: the words come back.
       Component.onCompleted: if (row.editing) Qt.callLater(begin)
       Accessible.name: "Edit " + row.named
+      Controls.ContextMenu.menu: null
+      Controls.ContextMenu.onRequested: function(at) { paste.openMenu(at) }
+      PasteGuard { id: paste; app: row.app }
     }
 
     UiText {

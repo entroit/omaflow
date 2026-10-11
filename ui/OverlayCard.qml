@@ -904,6 +904,10 @@ Item {
       onActiveFocusChanged: if (!activeFocus && line.editing) finish(true)
       onWindowActiveChanged: if (!windowActive && line.editing) finish(true)
       Accessible.name: "Edit the to-do"
+      // Pasted through PasteGuard, never read from the clipboard by Qt.
+      Keys.onPressed: function(event) { editorPaste.key(event) }
+      // A plain TextEdit has no right-click menu, and one to-do is one line.
+      PasteGuard { id: editorPaste; app: overlay.app; offersMenu: false; singleLine: true }
     }
     UiText {
       id: keys

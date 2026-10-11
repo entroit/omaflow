@@ -6,8 +6,7 @@ use crate::{
 };
 use omaflow_core::{journal, todos};
 use omaflow_platform::desktop::{
-    ClipboardSnapshot, DELIVERY_LOCK, active_window, active_window_matches, paste, read_clipboard,
-    set_clipboard,
+    DELIVERY_LOCK, active_window, active_window_matches, paste, set_clipboard,
 };
 pub use omaflow_platform::desktop::{copy_text, paste_shortcut, paste_text_now};
 use omaflow_platform::process::CommandExt;
@@ -761,16 +760,10 @@ impl Runtime {
                 } else {
                     let raw_text = text.to_string_lossy().into_owned();
                     let pasting = take == Take::Paste;
-                    let previous = if pasting && config.cleanup.use_clipboard_context {
-                        read_clipboard().unwrap_or_default()
-                    } else {
-                        ClipboardSnapshot::Empty
-                    };
                     let window = if pasting { active_window() } else { None };
                     finish_transcript(
                         &config,
                         raw_text,
-                        previous,
                         window.as_ref(),
                         (Duration::ZERO, Instant::now()),
                         &worker_cancel,
@@ -833,7 +826,6 @@ pub fn warm_cleanup(config: &Config) {
         if cleanup(
             config,
             "This is a short warm-up transcription.",
-            "",
             None,
             &cancel,
         )
@@ -1223,15 +1215,10 @@ fn stop_recording(
 ) -> Result<StopOutcome, String> {
     let total_started = Instant::now();
     // A journal entry or a to-do is written down, not pasted, so it needs
-    // neither the focused window nor the clipboard as context.
+    // no focused window as context.
     let pasting = matches!(take, Take::Paste);
     let window = if pasting { active_window() } else { None };
     let backend_started = Instant::now();
-    let previous = if pasting && config.cleanup.use_clipboard_context {
-        read_clipboard().unwrap_or_default()
-    } else {
-        ClipboardSnapshot::Empty
-    };
 
     let captured = match recording {
         Recording::Complete(captured) => captured,
@@ -1312,7 +1299,6 @@ fn stop_recording(
         Take::Paste | Take::History => finish_transcript(
             config,
             raw_text,
-            previous,
             window.as_ref(),
             (backend_elapsed, total_started),
             cancel,
@@ -1676,7 +1662,7 @@ fn finish_journal(
         // Medium asks the cleanup model when there is one, and falls back to
         // the light pass rather than to nothing when it does not answer.
         JournalCleanup::Medium if config.cleanup.enabled => {
-            match cleanup(config, &spoken, "", None, cancel) {
+            match cleanup(config, &spoken, None, cancel) {
                 Ok(cleaned) if !cleaned.trim().is_empty() => cleaned,
                 Ok(_) => journal::tidy(&spoken),
                 Err(error) => {
@@ -1734,7 +1720,7 @@ fn finish_todos(
         if !config.todos.prompt.trim().is_empty() {
             todo_config.cleanup.system_prompt = config.todos.prompt.clone();
         }
-        match cleanup(&todo_config, &spoken, "", None, cancel) {
+        match cleanup(&todo_config, &spoken, None, cancel) {
             Ok(cleaned) => items = todos::split(&cleaned),
             Err(error) => {
                 eprintln!("omaflow: to-do cleanup unavailable, splitting by sentence: {error}");
@@ -1772,7 +1758,6 @@ pub(crate) fn evaluate_todos(
 fn finish_transcript(
     config: &Config,
     raw_text: String,
-    previous: ClipboardSnapshot,
     window: Option<&Value>,
     timing: (Duration, Instant),
     cancel: &AtomicBool,
@@ -1792,7 +1777,7 @@ fn finish_transcript(
     let cleanup_started = Instant::now();
     let mut cleanup_error = None;
     if config.cleanup.enabled {
-        match cleanup(config, &text, previous.text_context(), window, cancel) {
+        match cleanup(config, &text, window, cancel) {
             Ok(cleaned) => text = cleaned,
             Err(error) => {
                 eprintln!("omaflow: cleanup unavailable, using raw transcript: {error}");

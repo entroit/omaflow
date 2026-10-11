@@ -29,6 +29,8 @@ Item {
 
   JournalEntry {
     id: ghost
+    // Greyed out and never edited, so it has nothing to paste with.
+    app: null
     width: gone.width
     entry: gone.entry
     date: gone.date

@@ -110,6 +110,7 @@ Sheet {
       bottomPadding: 14
       Field {
         id: folder
+        app: sheet.app
         visible: sheet.movingTo.length === 0
         width: parent.width
         label: "Folder"

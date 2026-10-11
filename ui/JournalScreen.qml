@@ -296,6 +296,7 @@ FocusScope {
 
       SearchField {
         id: search
+        app: screen.app
         x: 16; y: 16
         width: parent.width - 32
         placeholder: "Search your journal"
@@ -678,6 +679,7 @@ FocusScope {
               id: entryRow
               JournalEntry {
                 width: slot.width
+                app: screen.app
                 entry: slot.modelData
                 date: screen.date
                 today: screen.today

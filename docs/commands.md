@@ -60,6 +60,7 @@ tasks above the first heading.
 |---|---|
 | `copy` | Copy the last result to the clipboard without pasting. |
 | `paste-last` | Paste the most recent dictation into the focused window again. |
+| `clipboard-text [--primary]` | Print the clipboard's text, or the primary selection's, for the window to paste. Gives up after a few seconds and refuses more than 1 MB. |
 | `paste-mode auto\|ctrl-v\|shift-insert\|clipboard\|custom` | Choose how text reaches the focused window. `clipboard` copies only; `custom` uses the chord saved in Settings → Advanced → Hotkeys. |
 
 ## History

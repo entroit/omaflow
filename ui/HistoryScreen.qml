@@ -201,6 +201,7 @@ FocusScope {
 
       SearchField {
         id: search
+        app: screen.app
         x: 12; y: 16
         width: parent.width - 24
         placeholder: "Search dictations"
@@ -541,6 +542,11 @@ FocusScope {
           onVisibleChanged: if (!visible && activeFocus) screen.focusKeys()
           onCursorRectangleChanged: if (activeFocus) detailFlick.reveal(editor, cursorRectangle.y, cursorRectangle.y + cursorRectangle.height)
           Accessible.name: "Dictation text, editable"
+          // Pasted through PasteGuard, never read from the clipboard by Qt.
+          Keys.onPressed: function(event) { editorPaste.key(event) }
+          Controls.ContextMenu.menu: null
+          Controls.ContextMenu.onRequested: function(at) { editorPaste.openMenu(at) }
+          PasteGuard { id: editorPaste; app: screen.app }
         }
 
         UiText {

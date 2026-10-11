@@ -220,7 +220,7 @@ Window {
           find(root, "TodosScreen", function(screen) { screen.menuTodo = row.todo })
           find(root, "DuePicker", function(picker) {
             picker.anchorItem = row.dueAnchor; picker.date = "2026-09-25"; picker.time = "17:00"; picker.reminder = "2026-09-25 16:20"; picker.open = true
-            find(picker, "TextField", function(field) { field.text = "18:00" })
+            find(picker, "LineEdit", function(field) { field.text = "18:00" })
           })
         } })
       if (window.mode === "journal-editing") find(root, "JournalScreen", function(screen) { screen.editingId = String(Fixtures.DAY.entries[0].id) })

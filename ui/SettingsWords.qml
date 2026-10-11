@@ -34,6 +34,7 @@ Column {
     spacing: 8
     Field {
       id: newWord
+      app: page.app
       width: parent.width - add.width - 8
       name: "Add a word"
       placeholderText: "Add a name, product or term"
@@ -52,6 +53,7 @@ Column {
 
   SearchField {
     id: search
+    app: page.app
     visible: page.app.customVocabulary.length > 8
     width: parent.width
     placeholder: "Search " + page.app.customVocabulary.length + " words"
