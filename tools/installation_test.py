@@ -279,6 +279,17 @@ with tempfile.TemporaryDirectory(prefix='omaflow-setup-') as directory:
     assert snapshot() == untouched
     print('PASS Check again re-checks the packages and changes nothing')
 
+    # ./install in a terminal never asks for a password either: a missing
+    # package stops it the same way, with the command, and nothing changes.
+    terminal = subprocess.run([str(repo/'install'), '--yes', '--skip-preflight'], env=dict(env, TEST_MISSING='jq'),
+                              capture_output=True, text=True, timeout=60)
+    assert terminal.returncode != 0 and 'sudo pacman -S --needed jq' in terminal.stderr, terminal.stdout + terminal.stderr
+    assert snapshot() == untouched
+    calls = log.read_text().splitlines()
+    assert not any(line.split()[0] in ('sudo', 'systemctl', 'hyprctl', 'omarchy') for line in calls), calls
+    assert all(line.startswith('pacman -Qq ') for line in calls if line.startswith('pacman')), calls
+    print('PASS a terminal install with a missing package stops before any change, without sudo')
+
     # A fresh home: the whole install, without sudo.
     log.write_text('')
     first = setup()

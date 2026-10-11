@@ -42,15 +42,15 @@ Enable it when asked. The OmaFlow window opens by itself on **Finish setup**;
 choose it. It installs the OmaFlow app that came with the plugin and two user
 services, and sets your dictation key to AltGr+Menu. The top bar restarts
 once, and the window opens again to choose a speech model; it downloads there.
-If a system package is missing, the window shows the `sudo pacman` command to
-run first and changes nothing until it is there.
+If a system package is missing, the window names it and changes nothing until
+it is there.
 
 To use another key, choose Change in Settings → Advanced → Hotkeys and press
 it.
 
 In a terminal, `./install` in `~/.config/omarchy/plugins/entroit.omaflow` does
-the same. It shows the plan before it changes your system and installs missing
-packages with sudo. Neither downloads a speech model, and you do not need Rust
+the same. It shows the plan before it changes your system. Neither asks for a
+password, neither downloads a speech model, and you do not need Rust
 or Cargo.
 
 ## Updates stay inside OmaFlow

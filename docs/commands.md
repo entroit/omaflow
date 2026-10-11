@@ -152,8 +152,8 @@ because it puts `omaflow` in place.
 
 | Command | Effect |
 |---|---|
-| `./install` | Install missing packages with sudo, the bundled app after checking its size and SHA-256, its user services, the dictation key and the bar icon. Shows the plan and asks first; `--dry-run` only prints it. Safe to run again. |
-| `./install --from-window` | What **Finish setup** and **Finish update** in the window run, in the `omaflow-setup` user unit, since the last step restarts the shell. The same steps without questions, sudo or preflight. A missing package stops it before anything changes. It writes its step and result to `$XDG_RUNTIME_DIR/omaflow-setup.json` (`state` is `running` with `step` `app`, `services` or `shell`, then `ok`, `failed` with `message` and `log`, or `needs-packages` with `command`; `from` is the version it started from) and its output to `omaflow-setup.log` beside it. |
+| `./install` | Install the bundled app after checking its size and SHA-256, its user services, the dictation key and the bar icon. Never uses sudo: a missing package stops it before anything changes, with the command that installs it. Shows the plan and asks first; `--dry-run` only prints it. Safe to run again. |
+| `./install --from-window` | What **Finish setup** and **Finish update** in the window run, in the `omaflow-setup` user unit, since the last step restarts the shell. The same steps without questions or preflight. A missing package stops it before anything changes. It writes its step and result to `$XDG_RUNTIME_DIR/omaflow-setup.json` (`state` is `running` with `step` `app`, `services` or `shell`, then `ok`, `failed` with `message` and `log`, or `needs-packages` with `command`; `from` is the version it started from) and its output to `omaflow-setup.log` beside it. |
 | `./install --from-window --dry-run` | **Check again**: check the packages only, and change nothing. |
 
 ## Internal
