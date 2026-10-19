@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 download_again='Download OmaFlow again: omarchy plugin remove entroit.omaflow, then omarchy plugin add https://github.com/entroit/omaflow.git'
 
 release_json="$repo_dir/dist/release.json"
