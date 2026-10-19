@@ -454,9 +454,7 @@ Panel {
     bar: root.bar
     text: ""
     iconComponent: barMark
-    foreground: root.bar ? root.bar.foreground : Color.foreground
     active: flow.phase === "recording"
-    activeColor: Color.urgent
     slotSize: Style.bar.statusSlot
     // WidgetButton names nothing for assistive tech; the tooltip is the state.
     Accessible.name: "OmaFlow"

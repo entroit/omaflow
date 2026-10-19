@@ -1,18 +1,18 @@
 {
   "schemaVersion": 1,
   "pluginId": "entroit.omaflow",
-  "version": "0.21.1",
-  "summary": "Safer pasting, and Finish setup that opens by itself.",
+  "version": "0.21.2",
+  "summary": "Setup works through a linked OmaFlow folder and never asks for a password.",
   "changes": [
-    "Pasting into OmaFlow has a size and time limit, so a misbehaving app cannot freeze the top bar",
-    "The OmaFlow window opens on Finish setup or Finish update by itself when one is waiting",
-    "Removed the hidden cleanup setting that sent clipboard text to the cleanup model"
+    "Setup accepts an OmaFlow folder linked to a local copy",
+    "When a required system package is missing, setup stops before making changes and shows the command to install it",
+    "The bar icon uses Omarchy theme colors without warnings on current Qt"
   ],
   "binary": {
     "target": "x86_64-unknown-linux-gnu",
     "path": "dist/bin/x86_64-unknown-linux-gnu/omaflow",
-    "bytes": 2777496,
-    "sha256": "c375925cee7d093db02b5704e14dc5de82bf86e77cc2d07a1d906282fe8f5ccd"
+    "bytes": 2799784,
+    "sha256": "eac1841c7f052886786457c499121f2d5f37d41de0ee977c1b096777d1b46a35"
   },
   "stateSchemaVersion": 4
 }
