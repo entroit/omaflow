@@ -57,6 +57,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     (config/'hypr/omaflow-hotkey.lua').write_text('local omaflow_hotkey = { "F13" }\nlocal omaflow_consumed_keys = { "F13" }\nreturn { hotkey = omaflow_hotkey, consumed = omaflow_consumed_keys }\n')
     (config/'hypr/bindings.lua').write_text('-- unrelated settings\n')
     checkout(repo)
+    linked_repo = base/'linked-checkout'; linked_repo.symlink_to(repo, target_is_directory=True)
     release_installer = repo/'scripts/install-release'
     direct_git = repo/'.git'; saved_git = repo/'.git.saved'
     direct_git.rename(saved_git); direct_git.write_text('gitdir: /tmp/not-trusted\n')
@@ -88,7 +89,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     plan = run('install', '--skip-preflight', '--dry-run')
     assert not (config/'omaflow/config.toml').exists()
     assert 'Download no models' in plan
-    output = run('install', '--skip-preflight', '--yes')
+    output = run(str(linked_repo/'install'), '--skip-preflight', '--yes')
     personal = config/'omaflow/config.toml'
     assert tomllib.loads(personal.read_text())['behavior']['models_configured'] is False
     complete = tomllib.loads(personal.read_text())
@@ -112,7 +113,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     assert str(home/'Documents/Journal') in (config/'systemd/user/omaflow.service.d/journal-folder.conf').read_text()
     result = subprocess.run([str(home/'.local/bin/omaflow'), 'serve-asr'], env=env, capture_output=True, timeout=3)
     assert result.returncode == 0 and not result.stdout
-    print('PASS app-only install links the app and downloads nothing; speech service stays dormant')
+    print('PASS app-only install through a checkout symlink links the app and downloads nothing; speech service stays dormant')
     with (base/'daemon.log').open('w') as daemon_log:
         daemon = subprocess.Popen([str(repo/'target/release/omaflow'), 'daemon'], env=env, stdout=daemon_log, stderr=daemon_log)
         try:
