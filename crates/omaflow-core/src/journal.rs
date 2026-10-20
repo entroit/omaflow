@@ -1271,6 +1271,33 @@ mod tests {
     }
 
     #[test]
+    fn saving_a_journal_entry_does_not_follow_a_planted_temporary_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::new(directory.path().join("shared"));
+        let date: Date = "2026-10-20".parse().unwrap();
+        fs::create_dir_all(journal.folder()).unwrap();
+        let config = directory.path().join("config.toml");
+        fs::write(&config, "[cleanup]\nenabled = false\n").unwrap();
+        std::os::unix::fs::symlink(&config, journal.folder().join("2026-10-20.md.tmp")).unwrap();
+
+        journal
+            .add(
+                date,
+                spoken(1_000_000_001, "18:30", "A safe journal entry.", None),
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            "[cleanup]\nenabled = false\n"
+        );
+        assert_eq!(
+            journal.day(date).unwrap().entries[0].text,
+            "A safe journal entry."
+        );
+    }
+
+    #[test]
     fn a_note_for_a_later_day_says_when_it_was_written() {
         let journal = temp_journal("note");
         let written: Date = "2026-09-30".parse().unwrap();

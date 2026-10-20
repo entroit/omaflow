@@ -1,18 +1,17 @@
 {
   "schemaVersion": 1,
   "pluginId": "entroit.omaflow",
-  "version": "0.21.2",
-  "summary": "Setup works through a linked OmaFlow folder and never asks for a password.",
+  "version": "0.21.3",
+  "summary": "Protect private files when saving to shared folders.",
   "changes": [
-    "Setup accepts an OmaFlow folder linked to a local copy",
-    "When a required system package is missing, setup stops before making changes and shows the command to install it",
-    "The bar icon uses Omarchy theme colors without warnings on current Qt"
+    "Fix a temporary-file symlink vulnerability that could overwrite private files during journal saves",
+    "Apply the same protected writes to to-dos, history, and settings"
   ],
   "binary": {
     "target": "x86_64-unknown-linux-gnu",
     "path": "dist/bin/x86_64-unknown-linux-gnu/omaflow",
-    "bytes": 2799784,
-    "sha256": "eac1841c7f052886786457c499121f2d5f37d41de0ee977c1b096777d1b46a35"
+    "bytes": 2813200,
+    "sha256": "8986b6576b3ebb1b371d9da68687453ff2153f38fb25d461d376917de876ff0c"
   },
   "stateSchemaVersion": 4
 }

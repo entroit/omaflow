@@ -8,6 +8,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / "target/release/omaflow"
@@ -474,7 +475,9 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         send("press"); time.sleep(.06); send("release")
         wait_until(lambda: len(state()["history"]) == 1)
         before = state()["history"]
-        (case / "state/omaflow/history.json.tmp").mkdir()
+        history = case / "state/omaflow/history.json"
+        history.unlink()
+        history.mkdir()
         send("history-clear")
         wait_until(lambda: state()["feedback_error"])
         assert state()["history"] == before
@@ -576,6 +579,33 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         # wondering why their speakers went quiet an hour ago.
         wait_until(lambda: log.read_text().split()[-1].startswith("0.8"))
         wait_until(lambda: not (runtime / "duck-restore").exists())
+
+    def journal_temporary_symlink(case, runtime, state, send):
+        config = case / "config.toml"
+        before = config.read_bytes()
+        shared = case / "Journal"
+        shared.mkdir(mode=0o777, exist_ok=True)
+        shared.chmod(0o777)
+        (shared / "2026-10-20.md.tmp").symlink_to(config)
+
+        send("journal-toggle:2026-10-20")
+        wait_until(lambda: state()["phase"] == "recording")
+        send("journal-toggle")
+        wait_until(lambda: state()["phase"] == "journal-saved")
+
+        assert config.read_bytes() == before, "a journal save changed the private configuration"
+        assert "This completed dictation must remain recoverable." in (shared / "2026-10-20.md").read_text()
+
+    def settings_temporary_symlink(case, runtime, state, send):
+        private = case / "private.txt"
+        private.write_text("keep this private file")
+        (case / "config.toml.tmp").symlink_to(private)
+
+        send('configure:{"key":"history_limit","value":31}')
+        wait_until(lambda: state()["history_limit"] == 31)
+
+        assert private.read_text() == "keep this private file"
+        assert tomllib.loads((case / "config.toml").read_text())["behavior"]["history_limit"] == 31
 
     def journal_take(case, runtime, state, send):
         send("journal-toggle")
@@ -813,6 +843,8 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         wait_until(lambda: not audio.exists())
         assert state()["history"][0]["audio"] is False
 
+    run_case("journal saves ignore planted temporary symlinks and preserve private configuration", True, journal_temporary_symlink)
+    run_case("settings saves ignore planted temporary symlinks and preserve their targets", True, settings_temporary_symlink)
     run_case(
         "dictation audio is kept only when asked, played back, and deleted with its dictation",
         False,

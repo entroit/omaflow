@@ -1,4 +1,4 @@
-//! Small file helpers shared by the history, the journal and the to-dos.
+//! File helpers shared by settings, history, the journal and the to-dos.
 use std::{
     fs,
     io::Write,
@@ -25,31 +25,30 @@ fn write_atomic(path: &Path, bytes: &[u8], strict: bool) -> Result<(), String> {
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let temporary = parent.join(format!("{name}.tmp"));
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(|error| format!("{}: {error}", temporary.display()))?;
-    if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600))
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        format!(
+            "could not create a temporary file in {}: {error}",
+            parent.display()
+        )
+    })?;
+    if let Err(error) = temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
         && strict
     {
         return Err(format!(
             "could not protect {}: {error}",
-            temporary.display()
+            temporary.path().display()
         ));
     }
-    file.write_all(bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|error| format!("{}: {error}", temporary.display()))?;
-    fs::rename(&temporary, path)
-        .map_err(|error| format!("{} -> {}: {error}", temporary.display(), path.display()))
+    temporary
+        .write_all(bytes)
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| format!("{}: {error}", temporary.path().display()))?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| format!("could not replace {}: {}", path.display(), error.error))
 }
 
 /// Creates `path` and makes it private to the owner.
@@ -161,4 +160,59 @@ pub(crate) fn same_folder(one: &Path, other: &Path) -> bool {
             (one.canonicalize(), other.canonicalize()),
             (Ok(one), Ok(other)) if one == other
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_writes_leave_preexisting_temporary_hardlinks_untouched() {
+        for write in [write_private, write_owned] {
+            let directory = tempfile::tempdir().unwrap();
+            let private = directory.path().join("config.toml");
+            fs::write(&private, "private settings").unwrap();
+            let destination = directory.path().join("day.md");
+            fs::hard_link(&private, directory.path().join("day.md.tmp")).unwrap();
+
+            write(&destination, b"first entry").unwrap();
+            write(&destination, b"second entry").unwrap();
+
+            assert_eq!(fs::read(&private).unwrap(), b"private settings");
+            assert_eq!(fs::read(&destination).unwrap(), b"second entry");
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn replacing_a_destination_symlink_does_not_write_to_its_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let private = directory.path().join("config.toml");
+        fs::write(&private, "private settings").unwrap();
+        let destination = directory.path().join("day.md");
+        std::os::unix::fs::symlink(&private, &destination).unwrap();
+
+        write_owned(&destination, b"journal entry").unwrap();
+
+        assert_eq!(fs::read(&private).unwrap(), b"private settings");
+        assert_eq!(fs::read(&destination).unwrap(), b"journal entry");
+        assert!(!destination.is_symlink());
+    }
+
+    #[test]
+    fn a_failed_replacement_preserves_the_destination_and_removes_the_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("day.md");
+        fs::create_dir(&destination).unwrap();
+        let existing = destination.join("existing.md");
+        fs::write(&existing, "keep this entry").unwrap();
+
+        assert!(write_owned(&destination, b"new entry").is_err());
+
+        assert_eq!(fs::read(&existing).unwrap(), b"keep this entry");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 }

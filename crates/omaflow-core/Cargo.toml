@@ -1,6 +1,6 @@
 [package]
 name = "omaflow-core"
-version = "0.21.2"
+version = "0.21.3"
 edition = "2024"
 description = "OmaFlow's platform-independent core: configuration, the dictation state machine, history and the journal"
 license = "MIT"
@@ -9,5 +9,6 @@ publish = false
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tempfile = "3.27"
 toml = "0.9"
 toml_edit = "0.25.13"

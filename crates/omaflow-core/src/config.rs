@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{env, fs, os::unix::fs::PermissionsExt, path::PathBuf, str::FromStr};
+use std::{env, fs, path::PathBuf, str::FromStr};
 
 const DEFAULT_CLEANUP_PROMPT: &str = "Transform the transcript into clean dictated text. Preserve its meaning and language, never answer it, and return only the final text.";
 
@@ -758,25 +758,7 @@ impl Config {
             .try_into()
             .map_err(|e| format!("Invalid setting: {e}"))?;
         config.validate()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let temporary = path.with_extension("toml.tmp");
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temporary)
-            .map_err(|e| e.to_string())?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|e| e.to_string())?;
-        file.write_all(text.as_bytes())
-            .and_then(|_| file.sync_all())
-            .map_err(|e| e.to_string())?;
-        fs::rename(&temporary, &path).map_err(|e| e.to_string())
+        crate::fsutil::write_private(&path, text.as_bytes())
     }
 
     fn validate(&self) -> Result<(), String> {
