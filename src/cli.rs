@@ -46,6 +46,39 @@ pub fn run() -> ExitCode {
     let command = args.next().unwrap_or_else(|| "daemon".into());
     match command.as_str() {
         "daemon" => run_daemon(),
+        "http-connect" => {
+            let result = match (args.next(), args.next()) {
+                (Some(socket), Some(policy)) => omaflow_platform::http::connect_helper(
+                    std::path::Path::new(&socket),
+                    &policy,
+                    &args.collect::<Vec<_>>(),
+                ),
+                _ => {
+                    Err("The connection helper needs a socket, policy and loopback address".into())
+                }
+            };
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("omaflow: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "storage-preflight" => {
+            let runtime = omaflow_platform::runtime_dir();
+            let result = omaflow_core::storage_proof::prepare(
+                &runtime,
+                &[runtime.clone(), crate::state_dir(), Config::path()],
+            );
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("omaflow: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         "config-init" => match Config::initialize() {
             Ok(_) => ExitCode::SUCCESS,
             Err(error) => {

@@ -370,21 +370,41 @@ pub fn private_dir(path: &Path) -> Result<(), String> {
 }
 
 fn check_private_ancestors(path: &Path) -> Result<(), String> {
+    let mut proof = None;
+    check_private_ancestors_with(path, &mut proof)
+}
+
+fn check_private_ancestors_with(
+    path: &Path,
+    proof: &mut Option<Option<crate::storage_proof::Proof>>,
+) -> Result<(), String> {
+    let trusted = |path: &Path,
+                   metadata: &fs::Metadata,
+                   proof: &mut Option<Option<crate::storage_proof::Proof>>| {
+        metadata.uid() == 0
+            || metadata.uid() == unsafe { libc::geteuid() }
+            || proof
+                .get_or_insert_with(crate::storage_proof::Proof::load)
+                .as_ref()
+                .is_some_and(|proof| proof.accepts(path, metadata))
+    };
     for ancestor in path.ancestors().skip(1) {
         let mut metadata = match fs::symlink_metadata(ancestor) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(format!("could not inspect {}: {error}", ancestor.display())),
         };
+        let mut inspected = ancestor.to_path_buf();
         if metadata.is_symlink() {
-            if metadata.uid() != 0 && metadata.uid() != unsafe { libc::geteuid() } {
+            if !trusted(ancestor, &metadata, proof) {
                 return Err(format!("{} belongs to another user", ancestor.display()));
             }
             let resolved = ancestor.canonicalize().map_err(|error| error.to_string())?;
-            check_private_ancestors(&resolved)?;
+            check_private_ancestors_with(&resolved, proof)?;
             metadata = fs::metadata(&resolved).map_err(|error| error.to_string())?;
+            inspected = resolved;
         }
-        let trusted_owner = metadata.uid() == 0 || metadata.uid() == unsafe { libc::geteuid() };
+        let trusted_owner = trusted(&inspected, &metadata, proof);
         let replaceable = metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0;
         if !trusted_owner || replaceable {
             return Err(format!(

@@ -21,6 +21,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod helper;
+pub use helper::connect_helper;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LocalPolicy {
     SameUser,
@@ -120,7 +123,7 @@ impl Relay {
                             continue;
                         }
                         *worker_failure.lock().unwrap() = None;
-                        match connect_verified(&addresses, policy) {
+                        match helper::connect(&addresses, policy, &worker_stop) {
                             Ok(server) => {
                                 if let Err(error) = forward(client, server, &worker_stop) {
                                     *worker_failure.lock().unwrap() = Some(error.to_string());

@@ -7,5 +7,6 @@ pub mod fsutil;
 pub mod history;
 pub mod journal;
 pub mod state;
+pub mod storage_proof;
 pub mod todos;
 pub mod vocabulary;

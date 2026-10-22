@@ -79,8 +79,39 @@ jobs:
             dist/release.json
             release-build.txt
 
+  service-sandbox:
+    if: github.repository == 'entroit/omaflow'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Build the sandbox test executable
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --no-self-update
+          rustc +1.99.1 -Vv
+          cargo +1.99.1 build --locked --bin omaflow
+      - name: Start the runner's user service manager
+        run: |
+          # Allow user-service sandbox namespaces on this disposable Ubuntu runner.
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 kernel.apparmor_restrict_unprivileged_userns=0
+          sudo systemctl start "user@$(id -u).service"
+          printf 'XDG_RUNTIME_DIR=/run/user/%s\n' "$(id -u)" >> "$GITHUB_ENV"
+          printf 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%s/bus\n' "$(id -u)" >> "$GITHUB_ENV"
+      - name: Require real user-service sandbox tests
+        run: |
+          systemctl --version
+          systemctl --user show-environment > /dev/null
+          python3 tools/service_sandbox_test.py --binary "$PWD/target/debug/omaflow" --require-systemd
+
   publish:
-    needs: build
+    needs: [build, service-sandbox]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

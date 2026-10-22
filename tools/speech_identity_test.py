@@ -115,6 +115,8 @@ def serving(uid, replace=False, namespace=True, record_connections=False):
         os.killpg(process.pid, signal.SIGKILL)
         process.wait(timeout=5)
         reader.join(timeout=2)
+        process.stdout.close()
+        process.stderr.close()
 
 
 def suite(cross_user):
@@ -271,6 +273,8 @@ def uid_mapping_suite():
                    XDG_CONFIG_HOME=str(base / "config"), XDG_DATA_HOME=str(base / "data"),
                    XDG_CACHE_HOME=str(base / "cache"), XDG_STATE_HOME=str(base / "state"),
                    XDG_RUNTIME_DIR=str(base / "runtime"), PATH=f"{commands}:/usr/bin")
+        # These nested namespace clients are not systemd service invocations.
+        env.pop("INVOCATION_ID", None)
         overflow = int(Path("/proc/sys/kernel/overflowuid").read_text())
         cases = [
             ("unmapped accounts", [], False),

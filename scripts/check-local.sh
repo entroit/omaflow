@@ -30,6 +30,7 @@ python3 tools/download_privacy_test.py
 python3 tools/speech_identity_test.py
 python3 tools/runtime_test.py
 python3 tools/private_storage_test.py
+python3 tools/service_sandbox_test.py
 python3 tools/clipboard_test.py
 python3 tools/platform_test.py
 python3 tools/installation_test.py

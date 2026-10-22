@@ -4,6 +4,8 @@ Documentation=https://github.com/entroit/omaflow
 Before=omaflow.service
 
 [Service]
+ExecStartPre=+/bin/sh -ec '"$$1" storage-preflight || exec "$$2" storage-preflight' -- "%h/.local/lib/omaflow/current/omaflow" "%h/.local/lib/omaflow/trusted-runner"
+ExecStopPost=+/usr/bin/rm -f -- "${XDG_RUNTIME_DIR}/omaflow-storage-${INVOCATION_ID}.json"
 Type=oneshot
 ExecStart=%h/.local/lib/omaflow/trusted-runner update reconcile
 TimeoutStartSec=3min
