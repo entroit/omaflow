@@ -11,8 +11,8 @@
   "binary": {
     "target": "x86_64-unknown-linux-gnu",
     "path": "dist/bin/x86_64-unknown-linux-gnu/omaflow",
-    "bytes": 2863936,
-    "sha256": "d01cb2e4b84e5aa4133fadf02381a75754a119f699384d7edb43a60bdff53eea"
+    "bytes": 2938296,
+    "sha256": "fb18edaeb61ccac2599856191d6196d980c8a33679f0310b260daf2460f0cbec"
   },
   "stateSchemaVersion": 4
 }
