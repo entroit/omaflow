@@ -226,7 +226,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     broken = subprocess.run([str(repo/'target/release/omaflow'), 'reload-config'], env=env, capture_output=True, text=True, timeout=30)
     personal.write_text(good)
     reason = broken.stderr.strip()
-    assert broken.returncode != 0 and '\n' not in reason and 'TOML parse error at line' in reason, broken.stderr
+    assert broken.returncode != 0 and '\n' not in reason and 'Invalid TOML syntax at line' in reason, broken.stderr
     print('PASS reload-config with OmaFlow stopped succeeds, and a broken file says why')
 
 

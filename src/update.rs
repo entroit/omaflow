@@ -22,7 +22,6 @@ use std::{
     io::{Read, Write},
     net::Shutdown,
     os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -1012,7 +1011,7 @@ fn probe_daemon_health(socket: &Path, expect_commit: &str) -> Result<(), String>
     if !full_sha(expect_commit) {
         return Err("expected commit is invalid".into());
     }
-    let mut stream = UnixStream::connect(socket)
+    let mut stream = omaflow_platform::ipc::connect(socket)
         .map_err(|_| "the OmaFlow daemon health socket is unavailable".to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1198,7 +1197,7 @@ fn wait_for_daemon_exit(timeout: Duration) -> Result<(), String> {
     let socket = crate::runtime_dir().join("omaflow.sock");
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if !socket.exists() || UnixStream::connect(&socket).is_err() {
+        if !socket.exists() || omaflow_platform::ipc::connect(&socket).is_err() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(50));
@@ -1215,7 +1214,7 @@ fn cancel_update_handoff(transaction_id: &str) -> Result<(), String> {
     {
         return Err("the update transaction identity is invalid".into());
     }
-    let mut stream = UnixStream::connect(crate::runtime_dir().join("omaflow.sock"))
+    let mut stream = omaflow_platform::ipc::connect(&crate::runtime_dir().join("omaflow.sock"))
         .map_err(|_| "could not cancel the daemon update handoff".to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
@@ -1495,9 +1494,7 @@ fn sync_dir(path: &Path) -> Result<(), String> {
 
 fn download(url: &str, limit: usize) -> Result<Vec<u8>, String> {
     let directory = store::update_dir();
-    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-        .map_err(|error| error.to_string())?;
+    omaflow_core::fsutil::private_dir(&directory)?;
     let path = directory.join(format!(".catalog.{}.tmp", std::process::id()));
     let _ = fs::remove_file(&path);
     fs::OpenOptions::new()

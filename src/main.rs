@@ -24,7 +24,7 @@ use std::{
     io::{ErrorKind, Read, Write},
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
-        net::{UnixListener, UnixStream},
+        net::UnixListener,
     },
     path::{Path, PathBuf},
     process::{Command, ExitCode},
@@ -518,6 +518,10 @@ fn main() -> ExitCode {
 }
 
 fn run_daemon() -> ExitCode {
+    if let Err(error) = omaflow_platform::private_runtime_dir() {
+        eprintln!("omaflow: {error}");
+        return ExitCode::FAILURE;
+    }
     let config = match Config::load() {
         Ok(config) => config,
         Err(error) => {
@@ -532,7 +536,7 @@ fn run_daemon() -> ExitCode {
 
     let socket = socket_path();
     if socket.exists() {
-        if UnixStream::connect(&socket).is_ok() {
+        if omaflow_platform::ipc::connect(&socket).is_ok() {
             eprintln!("omaflow: OmaFlow is already running. For commands, run omaflow --help.");
             return ExitCode::FAILURE;
         }
@@ -2134,15 +2138,30 @@ impl Daemon {
     /// Plays a journal recording, or with an empty date a kept dictation.
     fn play(&mut self, mut request: JournalPlayback) {
         self.stop_playback();
-        let path = if request.date.is_empty() {
-            audio_path(request.id)
+        let (root, path) = if request.date.is_empty() {
+            let path = audio_path(request.id);
+            (path.parent().unwrap().to_path_buf(), path)
         } else {
             let Ok(date) = request.date.parse() else {
                 return;
             };
-            self.journal().recording_path(date, request.id)
+            let journal = self.journal();
+            (
+                journal.folder().to_path_buf(),
+                journal.recording_path(date, request.id),
+            )
         };
-        let duration_ms = omaflow_platform::sound::wav_duration_ms(&path).unwrap_or(0);
+        let file = match omaflow_core::fsutil::open_regular_at(&root, &path) {
+            Ok(file) => file,
+            Err(_) => {
+                self.operation_feedback(
+                    Err("That recording is unavailable or is not a regular file.".into()),
+                    "",
+                );
+                return;
+            }
+        };
+        let duration_ms = omaflow_platform::sound::recording_duration_ms(&file).unwrap_or(0);
         if duration_ms == 0 {
             self.operation_feedback(Err("That recording is no longer on disk.".into()), "");
             return;
@@ -2160,7 +2179,8 @@ impl Daemon {
         let messages = self.message_tx.clone();
         let (token, offset_ms) = (request.token, request.offset_ms);
         thread::spawn(move || {
-            if let Err(error) = omaflow_platform::sound::play_wav(&path, offset_ms, worker_stop) {
+            if let Err(error) = omaflow_platform::sound::play_wav_file(file, offset_ms, worker_stop)
+            {
                 eprintln!("omaflow: could not play journal recording: {error}");
             }
             let _ = messages.send(Message::PlaybackFinished(token));
@@ -2859,25 +2879,9 @@ impl Daemon {
 }
 
 fn append_training_sample(path: &Path, sample: &TrainingSample<'_>) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("could not protect {}: {error}", parent.display()))?;
-
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("could not protect {}: {error}", path.display()))?;
-    serde_json::to_writer(&mut file, sample).map_err(|error| error.to_string())?;
-    file.write_all(b"\n")
-        .map_err(|error| format!("{}: {error}", path.display()))
+    let mut bytes = serde_json::to_vec(sample).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    omaflow_core::fsutil::append_private(path, &bytes)
 }
 
 fn clamp_meter_gate(gate_db: i32) -> i32 {
@@ -2886,18 +2890,7 @@ fn clamp_meter_gate(gate_db: i32) -> i32 {
 
 fn write_surface_state(path: &Path, state: &SurfaceState<'_>) -> Result<(), String> {
     let bytes = serde_json::to_vec(state).map_err(|error| error.to_string())?;
-    let temporary = path.with_extension("json.tmp");
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(|error| format!("{}: {error}", temporary.display()))?;
-    file.write_all(&bytes)
-        .map_err(|error| format!("{}: {error}", temporary.display()))?;
-    fs::rename(&temporary, path)
-        .map_err(|error| format!("{} -> {}: {error}", temporary.display(), path.display()))
+    omaflow_core::fsutil::write_private(path, &bytes)
 }
 
 fn start_backend_worker(
@@ -3213,10 +3206,11 @@ fn cleanup_server_available(config: &crate::config::Cleanup) -> bool {
         };
         format!("{base}/api/tags")
     };
-    let Ok(auth) = crate::process::CurlAuth::new(&config.api_key) else {
+    let Ok(endpoint) = cleanup::cleanup_endpoint(config, &endpoint) else {
         return false;
     };
-    auth.apply(&mut Command::new("curl"))
+    endpoint
+        .command()
         .args([
             "--silent",
             "--max-time",
@@ -3225,13 +3219,13 @@ fn cleanup_server_available(config: &crate::config::Cleanup) -> bool {
             "/dev/null",
             "--write-out",
             "%{http_code}",
-            &endpoint,
         ])
         .bounded_output()
         .ok()
         .is_some_and(|output| {
             let code = String::from_utf8_lossy(&output.stdout);
-            output.status.success()
+            endpoint.check().is_ok()
+                && output.status.success()
                 && (code.starts_with('2') || (config.engine == "openai" && code == "405"))
         })
 }
@@ -3243,20 +3237,15 @@ fn cleanup_model_loaded(config: &crate::config::Cleanup) -> bool {
     let Some(base) = config.endpoint.strip_suffix("/api/chat") else {
         return false;
     };
-    let Ok(auth) = crate::process::CurlAuth::new(&config.api_key) else {
+    let Ok(endpoint) = cleanup::cleanup_endpoint(config, &format!("{base}/api/ps")) else {
         return false;
     };
-    auth.apply(&mut Command::new("curl"))
-        .args([
-            "--silent",
-            "--fail",
-            "--max-time",
-            "1",
-            &format!("{base}/api/ps"),
-        ])
+    endpoint
+        .command()
+        .args(["--silent", "--fail", "--max-time", "1"])
         .bounded_output()
         .ok()
-        .filter(|out| out.status.success())
+        .filter(|out| endpoint.check().is_ok() && out.status.success())
         .and_then(|out| serde_json::from_slice::<serde_json::Value>(&out.stdout).ok())
         .and_then(|body| body["models"].as_array().cloned())
         .is_some_and(|models| {
@@ -3337,6 +3326,9 @@ fn start_ipc(listener: UnixListener, messages: mpsc::Sender<Message>) {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
+            if omaflow_platform::ipc::verify_peer(&stream).is_err() {
+                continue;
+            }
             let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
             let mut value = String::new();
             if (&mut stream)
@@ -3662,7 +3654,7 @@ fn downloads_json(downloads: &HashMap<String, DownloadProgress>) -> serde_json::
 /// Best-effort delivery for callers that must keep working with no daemon:
 /// true when the command reached one, false when none was listening.
 pub fn send_command_quiet(command: &str) -> bool {
-    UnixStream::connect(socket_path())
+    omaflow_platform::ipc::connect(&socket_path())
         .and_then(|mut stream| {
             stream.set_write_timeout(Some(Duration::from_secs(1)))?;
             stream.write_all(command.as_bytes())
@@ -3689,7 +3681,7 @@ fn deliver(command: &str) -> Result<(), Option<std::io::Error>> {
     let path = socket_path();
     let deadline = Instant::now() + Duration::from_millis(300);
     let mut stream = loop {
-        match UnixStream::connect(&path) {
+        match omaflow_platform::ipc::connect(&path) {
             Ok(stream) => break stream,
             Err(error)
                 if Instant::now() < deadline
@@ -3700,6 +3692,7 @@ fn deliver(command: &str) -> Result<(), Option<std::io::Error>> {
             {
                 thread::sleep(Duration::from_millis(5));
             }
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return Err(Some(error)),
             Err(_) => return Err(None),
         }
     };
@@ -3738,7 +3731,7 @@ pub(crate) fn send_press(command: &str, key: &str) -> ExitCode {
         .and_then(|modified| modified.elapsed().ok())
         .is_some_and(|elapsed| elapsed < Duration::from_secs(10));
     if !recent {
-        let _ = fs::write(&marker, b"");
+        let _ = omaflow_core::fsutil::write_private(&marker, b"");
         let (title, body) = if failed {
             (
                 "OmaFlow could not start",

@@ -118,10 +118,7 @@ fn restore_file() -> PathBuf {
 
 fn write_restore_file(volume: f32) {
     let path = restore_file();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(&path, format!("{volume:.4}"));
+    let _ = omaflow_core::fsutil::write_private(&path, format!("{volume:.4}").as_bytes());
 }
 
 fn clear_restore_file() {

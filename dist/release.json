@@ -1,12 +1,13 @@
 {
   "schemaVersion": 1,
   "pluginId": "entroit.omaflow",
-  "version": "0.21.4",
-  "summary": "Public release builds and private text transport.",
+  "version": "0.21.5",
+  "summary": "Verify speech connections and protect private data.",
   "changes": [
-    "Build, attest, and publish releases automatically in GitHub Actions",
-    "Verify release downloads against the exact source commit before installation",
-    "Keep private journal and clipboard text out of process arguments"
+    "Verify the managed speech service before sending recorded audio",
+    "Protect model credentials, clipboard text, and shared-folder writes",
+    "Verify installed speech runtimes and prevent concurrent update races",
+    "Add runtime regressions for local service impersonation and private data handling"
   ],
   "binary": {
     "target": "x86_64-unknown-linux-gnu",

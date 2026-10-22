@@ -28,7 +28,7 @@ exist.
 | Path | Owns |
 |---|---|
 | `crates/omaflow-core/` | Everything without a desktop: `config.rs` (schema, defaults, atomic edits), `state.rs` (the recording state machine), `vocabulary.rs`, `history.rs`, `journal.rs` (Markdown days, recordings, search, light cleanup) and `date.rs`. |
-| `crates/omaflow-platform/` | The desktop adapters: `desktop.rs` (clipboard, focused window and paste through Hyprland), `ducking.rs` (`wpctl`), `sound.rs` (journal playback through `pw-cat`), `clock.rs` and `process.rs` (bounded child processes, the API key's owner-only curl config). Another platform replaces this crate. |
+| `crates/omaflow-platform/` | The desktop adapters: `desktop.rs` for clipboard and paste, `http.rs` for verified model connections, `ipc.rs` for socket peer checks, `ducking.rs`, `sound.rs`, `clock.rs`, and `process.rs` for bounded subprocesses and anonymous credential storage. |
 | `src/main.rs` | The daemon: socket, session handling, delivery, journal takes, published state. |
 | `src/backend.rs` | Microphone capture, speech server client and the managed NeMo server. |
 | `src/cleanup.rs` | Cleanup model requests and transport-completeness checks. |

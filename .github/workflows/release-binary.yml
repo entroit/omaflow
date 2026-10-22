@@ -30,7 +30,7 @@ jobs:
         run: |
           # shellcheck disable=SC2016
           printf 'Server = https://archive.archlinux.org/repos/2026/10/20/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist
-          pacman -Syyuu --noconfirm --needed git rust gcc jq diffutils python github-cli
+          pacman -Syyuu --noconfirm --needed git rust gcc jq diffutils python github-cli libxkbcommon xkeyboard-config
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
@@ -57,6 +57,13 @@ jobs:
       - name: Test the workspace and release boundaries
         run: |
           runuser -u builder -- cargo test --locked --workspace
+          runuser -u builder -- python3 tools/ui_privacy_lint.py
+          runuser -u builder -- python3 tools/clipboard_test.py
+          runuser -u builder -- python3 tools/http_test.py
+          runuser -u builder -- python3 tools/download_privacy_test.py
+          runuser -u builder -- python3 tools/speech_identity_test.py
+          runuser -u builder -- python3 tools/private_storage_test.py
+          runuser -u builder -- python3 tools/platform_test.py
           runuser -u builder -- python3 tools/release_artifact_test.py
           runuser -u builder -- python3 tools/release_github_test.py
       - name: Retain the built release and public log

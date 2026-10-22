@@ -596,6 +596,87 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         assert config.read_bytes() == before, "a journal save changed the private configuration"
         assert "This completed dictation must remain recoverable." in (shared / "2026-10-20.md").read_text()
 
+    def shared_folder_inputs(case, runtime, state, send):
+        env = dict(os.environ, OMAFLOW_CONFIG=str(case / "config.toml"),
+                   XDG_RUNTIME_DIR=str(runtime), XDG_STATE_HOME=str(case / "state"),
+                   PATH=f"{commands}:/usr/bin")
+        private = case / "private.txt"
+        private.write_text("SYNTHETIC_PRIVATE_DOCUMENT_CONTENT")
+        private.chmod(0o600)
+        for folder, name, args in [
+            ("Journal", "2026-10-20.md", ["journal", "add", "A regular journal note.", "2026-10-20"]),
+            ("To-dos", "To-dos.md", ["todos", "add", "A regular task."]),
+        ]:
+            shared = case / folder
+            shared.mkdir(exist_ok=True)
+            path = shared / name
+            for kind in ("symlink", "fifo", "oversized"):
+                if kind == "symlink":
+                    path.symlink_to(private)
+                elif kind == "fifo":
+                    os.mkfifo(path)
+                else:
+                    with path.open("wb") as file:
+                        file.truncate(8 * 1024 * 1024 + 1)
+                result = subprocess.run([str(BINARY), "--stdin"], input=json.dumps(args),
+                                        env=env, capture_output=True, text=True, timeout=3)
+                assert result.returncode != 0, (kind, result.stdout, result.stderr)
+                assert "SYNTHETIC_PRIVATE_DOCUMENT_CONTENT" not in result.stdout + result.stderr
+                assert private.read_text() == "SYNTHETIC_PRIVATE_DOCUMENT_CONTENT"
+                path.unlink()
+            result = subprocess.run([str(BINARY), "--stdin"], input=json.dumps(args),
+                                    env=env, capture_output=True, text=True, timeout=3)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert args[2] in path.read_text()
+
+            metadata = shared / ".omaflow"
+            kept = shared / ".omaflow-kept"
+            metadata.rename(kept)
+            outside = case / (folder + "-unrelated")
+            outside.mkdir(mode=0o755)
+            outside.chmod(0o755)
+            (outside / "private").write_text("SYNTHETIC_PRIVATE_DOCUMENT_CONTENT")
+            metadata.symlink_to(outside, target_is_directory=True)
+            result = subprocess.run([str(BINARY), "--stdin"], input=json.dumps(args),
+                                    env=env, capture_output=True, text=True, timeout=3)
+            assert result.returncode != 0, result.stdout + result.stderr
+            assert outside.stat().st_mode & 0o777 == 0o755
+            assert [entry.name for entry in outside.iterdir()] == ["private"]
+            metadata.unlink()
+            kept.rename(metadata)
+
+        # A FIFO cannot freeze the daemon during a completed journal take.
+        day = case / "Journal" / "2026-10-19.md"
+        os.mkfifo(day)
+        send("journal-toggle:2026-10-19")
+        wait_until(lambda: state()["phase"] == "recording")
+        send("journal-toggle")
+        wait_until(lambda: state()["phase"] == "error")
+        day.unlink()
+
+        metadata = case / "Journal" / ".omaflow"
+        kept = case / "Journal" / ".omaflow-kept"
+        metadata.rename(kept)
+        outside = case / "metadata-unrelated"
+        outside.mkdir(mode=0o755)
+        outside.chmod(0o755)
+        metadata.symlink_to(outside, target_is_directory=True)
+        send("journal-discard")
+        send("journal-toggle:2026-10-19")
+        wait_until(lambda: state()["phase"] == "recording")
+        send("journal-toggle")
+        wait_until(lambda: state()["phase"] == "error")
+        assert outside.stat().st_mode & 0o777 == 0o755
+        assert list(outside.iterdir()) == []
+        metadata.unlink()
+        kept.rename(metadata)
+        send("journal-discard")
+        send("journal-toggle:2026-10-19")
+        wait_until(lambda: state()["phase"] == "recording")
+        send("journal-toggle")
+        wait_until(lambda: state()["phase"] == "journal-saved")
+        assert "This completed dictation must remain recoverable." in day.read_text()
+
     def settings_temporary_symlink(case, runtime, state, send):
         private = case / "private.txt"
         private.write_text("keep this private file")
@@ -845,11 +926,12 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
 
     run_case("journal saves ignore planted temporary symlinks and preserve private configuration", True, journal_temporary_symlink)
     run_case("settings saves ignore planted temporary symlinks and preserve their targets", True, settings_temporary_symlink)
+    run_case("shared document links, FIFOs and oversized inputs fail without blocking or copying private files", True, shared_folder_inputs)
     run_case(
         "dictation audio is kept only when asked, played back, and deleted with its dictation",
         False,
         dictation_audio,
-        backend='engine="openai"\nendpoint="http://fixture.invalid/transcribe"\n',
+        backend='engine="openai"\nendpoint="https://fixture.invalid/transcribe"\n',
     )
     run_case("a journal take is written to the day's file, never pasted", True, journal_take)
     run_case("a to-do take is added to the list, and Undo takes it back out", True, todo_take)
@@ -857,7 +939,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         "a spoken journal entry keeps its recording and plays it back",
         False,
         journal_recording,
-        backend='engine="openai"\nendpoint="http://fixture.invalid/transcribe"\n',
+        backend='engine="openai"\nendpoint="https://fixture.invalid/transcribe"\n',
     )
     run_case("history changes survive failed storage without false success", True, failed_history_write)
     run_case("dictation ducks the sink and always restores it", False, audio_ducking)
@@ -871,19 +953,19 @@ with tempfile.TemporaryDirectory(prefix="omaflow-runtime-test-") as directory:
         "stop drains final recorder bytes into the transcription request",
         False,
         drained_capture,
-        backend='engine="openai"\nendpoint="http://fixture.invalid/transcribe"\n',
+        backend='engine="openai"\nendpoint="https://fixture.invalid/transcribe"\n',
     )
     run_case(
         "with History off, a failed transcription keeps its recording, and Try again sends it again",
         False,
         retry_failed,
-        backend='engine="openai"\nendpoint="http://fixture.invalid/transcribe"\n',
+        backend='engine="openai"\nendpoint="https://fixture.invalid/transcribe"\n',
     )
     run_case(
         "a failed dictation is saved in History, transcribed again there or from its card",
         False,
         saved_failure,
-        backend='engine="openai"\nendpoint="http://fixture.invalid/transcribe"\n',
+        backend='engine="openai"\nendpoint="https://fixture.invalid/transcribe"\n',
     )
     run_case("validated dictation preferences; unknown settings and commands rejected", True, settings)
 

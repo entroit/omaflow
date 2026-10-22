@@ -46,9 +46,22 @@ readonly runtime_url="https://github.com/NVIDIA/NeMo-Speech.cpp/releases/downloa
 readonly runtime_marker="$runtime_version linux x86_64 $variant"
 readonly expected_bytes="${runtime_bytes[$variant]}"
 readonly expected_sha256="${runtime_sha256[$variant]}"
+readonly integrity_manifest="$repo_dir/scripts/nemo-runtime/$variant.json"
+
+verify_runtime() {
+  python3 -I "$repo_dir/scripts/check-nemo-runtime.py" "$1" "$integrity_manifest" "$expected_sha256"
+}
+
+# The checked parent prevents another Unix user replacing this stable lock
+# between validation and open. Every model download holds the same inode.
+python3 -I "$repo_dir/scripts/check-nemo-runtime.py" --prepare-lock "$prefix.lock"
+exec {runtime_lock}<>"$prefix.lock"
+flock --exclusive "$runtime_lock"
 
 if [[ -f $marker && $(<"$marker") == "$runtime_marker" ]] &&
-  "$binary" --version >/dev/null 2>&1; then
+  verify_runtime "$prefix" 2>/dev/null &&
+  installed_version="$("$binary" --version 2>/dev/null)" &&
+  [[ $installed_version == "nemo-speech $runtime_version" ]]; then
   printf 'NeMo-Speech runtime (%s) already installed at %s\n' "$variant" "$prefix"
   exit 0
 fi
@@ -111,6 +124,7 @@ fi
 
 staged="$extract/$runtime_root"
 staged_binary="$staged/bin/nemo-speech"
+verify_runtime "$staged"
 if [[ ! -x $staged_binary ]]; then
   printf 'The verified NeMo-Speech runtime does not contain its executable.\n' >&2
   exit 1

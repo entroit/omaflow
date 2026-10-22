@@ -1,4 +1,5 @@
 import QtQuick
+import "ModelEndpoint.js" as ModelEndpoint
 
 // Your own speech model: a file OmaFlow runs, or a server you run. Every
 // field says what is wrong with it before a save bounces off the daemon.
@@ -44,10 +45,8 @@ Column {
   }
   function endpointProblem(value, loopback) {
     var url = String(value).trim()
-    if (url.length === 0) return "An address is required."
-    if (url.length > 2048) return "At most 2048 characters."
-    if (/\s/.test(url)) return "No spaces."
-    if (url.indexOf("http://") !== 0 && url.indexOf("https://") !== 0) return "Start with http:// or https://."
+    var problem = ModelEndpoint.problem(url)
+    if (problem) return problem
     if (loopback) {
       if (!/^http:\/\/(127\.0\.0\.1|localhost):[0-9]+\//.test(url)) return "A model file runs on http://127.0.0.1:PORT/ on this computer."
       if (url.indexOf("/v1/") < 0) return "The path has to contain /v1/, as in /v1/audio/transcriptions."
@@ -163,7 +162,7 @@ Column {
     password: true
     placeholderText: page.app.modelSettings.speech_api_key_set ? "A key is stored. Type to replace it." : "Leave empty if your server needs none"
     maximumLength: 512
-    hint: "Sent as a bearer token. Stored in your config file, which only your user can read."
+    hint: "Enter a new key when you change servers. Stored in your private config file."
   }
 
   EndpointTester {

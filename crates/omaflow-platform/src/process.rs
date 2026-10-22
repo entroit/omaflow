@@ -2,10 +2,12 @@
 use std::{
     fs,
     io::{self, Read, Write},
-    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
-    path::{Path, PathBuf},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::process::CommandExt as _,
+    },
     process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -37,64 +39,87 @@ impl CommandExt for Command {
     }
 }
 
-/// A bearer token for one curl invocation, handed over in an owner-only config
-/// file rather than argv: `/proc/<pid>/cmdline` is readable by every process on
-/// the machine, and a self-hosted server's key is a credential like any other.
-/// The file lives exactly as long as this value.
-pub struct CurlAuth {
-    path: Option<PathBuf>,
+/// A bearer token in sealed anonymous memory, inherited by curl without a
+/// filesystem path that another account can replace.
+pub(crate) struct CurlAuth {
+    config: Option<fs::File>,
 }
 
 impl CurlAuth {
     pub fn new(api_key: &str) -> Result<Self, String> {
+        omaflow_core::config::validate_api_key(api_key)?;
         if api_key.is_empty() {
-            return Ok(Self { path: None });
+            return Ok(Self { config: None });
         }
         let header = format!("Authorization: Bearer {api_key}");
-        let path = crate::runtime_dir().join(format!(
-            "omaflow-curl-{}-{}.conf",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        // Never fall back to exposing credentials in process arguments.
         let escaped = header.replace('\\', "\\\\").replace('"', "\\\"");
-        write_owner_only(&path, &format!("header = \"{escaped}\"\n"))
-            .map_err(|_| "Could not prepare private HTTP credentials".to_string())?;
-        Ok(Self { path: Some(path) })
+        let prepare = || -> io::Result<fs::File> {
+            // SAFETY: memfd_create returns a new owned descriptor on success.
+            let descriptor = unsafe {
+                libc::memfd_create(
+                    c"omaflow-curl-auth".as_ptr(),
+                    libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+                )
+            };
+            if descriptor < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: descriptor is valid and ownership moves into File once.
+            let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+            // SAFETY: fchmod changes only the new file owned by this value.
+            if unsafe { libc::fchmod(descriptor, 0o600) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            file.write_all(format!("header = \"{escaped}\"\n").as_bytes())?;
+            let seals =
+                libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+            // SAFETY: fcntl seals the live file descriptor without taking ownership.
+            if unsafe { libc::fcntl(descriptor, libc::F_ADD_SEALS, seals) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(file)
+        };
+        let config =
+            prepare().map_err(|_| "Could not prepare private HTTP credentials".to_string())?;
+        Ok(Self {
+            config: Some(config),
+        })
     }
 
     pub fn apply<'a>(&self, command: &'a mut Command) -> &'a mut Command {
         // Must be curl's first option. Personal curl defaults must not add
         // redirects, retries or destinations to an application-owned request.
-        command.arg("--disable");
-        if let Some(path) = &self.path {
-            command.arg("--config").arg(path);
+        command.args([
+            "--disable",
+            "--noproxy",
+            "*",
+            "--globoff",
+            "--proto",
+            "=http,https",
+            "--proto-redir",
+            "=https",
+        ]);
+        if let Some(file) = &self.config {
+            let descriptor = file.as_raw_fd();
+            command
+                .arg("--config")
+                .arg(format!("/proc/self/fd/{descriptor}"));
+            // SAFETY: pre_exec changes only this child's copy of the descriptor
+            // flags. fcntl is async-signal-safe and the file outlives spawning.
+            unsafe {
+                command.pre_exec(move || {
+                    let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                    if flags < 0
+                        || libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
         command
     }
-}
-
-impl Drop for CurlAuth {
-    fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn write_owner_only(path: &Path, contents: &str) -> io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    if let Err(error) = file.write_all(contents.as_bytes()) {
-        let _ = fs::remove_file(path);
-        return Err(error);
-    }
-    Ok(())
 }
 
 pub fn nonblocking(file: &impl AsRawFd) -> io::Result<()> {
@@ -344,7 +369,93 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn credentials_cannot_inject_curl_options() {
+        for key in [
+            "synthetic\nurl = http://127.0.0.1/injected\n#",
+            "synthetic\rheader",
+            "synthetic\0value",
+        ] {
+            assert!(CurlAuth::new(key).is_err());
+        }
+        assert!(CurlAuth::new(&"x".repeat(4097)).is_err());
+        assert!(CurlAuth::new("synthetic\\key\"quoted").is_ok());
+    }
+
+    #[test]
+    fn credentials_are_anonymous_owner_only_and_immutable() {
+        let mut auth = CurlAuth::new("synthetic-secret").unwrap();
+        let file = auth.config.as_mut().unwrap();
+        let metadata = file.metadata().unwrap();
+        assert_eq!(metadata.nlink(), 0);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            file.write_all(b"replacement").unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            file.set_len(0).unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            file.set_len(metadata.len() + 1).unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
+    }
+
+    #[test]
+    fn concurrent_requests_keep_credentials_separate_and_reusable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/request", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let authorization = request
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Authorization: "))
+                    .unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{authorization}",
+                    authorization.len()
+                )
+                .unwrap();
+            }
+        });
+        std::thread::scope(|scope| {
+            for key in ["first-secret", "second\\secret", "third-secret"] {
+                let endpoint = &endpoint;
+                scope.spawn(move || {
+                    let auth = CurlAuth::new(key).unwrap();
+                    for _ in 0..2 {
+                        let output = auth
+                            .apply(&mut Command::new("curl"))
+                            .args(["--silent", "--show-error", "--fail", endpoint])
+                            .bounded_output()
+                            .unwrap();
+                        assert!(output.status.success());
+                        assert_eq!(output.stdout, format!("Bearer {key}").as_bytes());
+                    }
+                });
+            }
+        });
+        server.join().unwrap();
+    }
+
     #[test]
     fn drains_more_than_pipe_capacity() {
         let child = Command::new("head")
@@ -356,6 +467,26 @@ mod tests {
         let output = wait(child, &AtomicBool::new(false), Duration::from_secs(3)).unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), 1_048_576);
+    }
+
+    #[test]
+    fn excessive_stdout_or_stderr_fails_and_reaps_the_child() {
+        for descriptor in [1, 2] {
+            let child = Command::new("python3")
+                .args([
+                    "-c",
+                    &format!("import os,time\nfor _ in range(1025): os.write({descriptor}, b'x'*4096)\ntime.sleep(30)"),
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let error = wait(child, &AtomicBool::new(false), Duration::from_secs(3)).unwrap_err();
+            assert_eq!(error, "subprocess response exceeds 4 MiB");
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
     }
     #[test]
     fn input_and_output_larger_than_a_pipe_do_not_deadlock() {
@@ -416,6 +547,11 @@ mod tests {
                         continue;
                     };
                     let headers = String::from_utf8_lossy(&request[..headers_end]);
+                    assert!(
+                        headers.lines().any(|line| {
+                            line == "Authorization: Bearer retry-secret\\credential"
+                        })
+                    );
                     let length: usize = headers
                         .lines()
                         .find_map(|line| {
@@ -447,10 +583,11 @@ mod tests {
             bodies
         });
         let input = br#"{"private":"same request"}"#;
+        let auth = CurlAuth::new("retry-secret\\credential").unwrap();
         let output = run_http(
             || {
                 let mut command = Command::new("curl");
-                command
+                auth.apply(&mut command)
                     .args([
                         "--silent",
                         "--show-error",

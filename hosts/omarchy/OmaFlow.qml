@@ -10,6 +10,7 @@ import "../../ui"
 import "../../ui/Keys.js" as KeyNames
 import "Copies.js" as Copies
 import "Setup.js" as Setup
+import "Notifications.js" as Notifications
 
 // OmaFlow inside the Omarchy shell: the bar icon, the window, and the card at
 // the bottom of the screen. Everything you see is the shared UI in ../../ui;
@@ -149,9 +150,13 @@ Panel {
       if (code !== 0) {
         var reason = String(stderr || "").trim()
         try { reason = JSON.parse(stdout).message || reason } catch (error) {}
-        // "--" ends the options, so a reason that starts with "-" is still text.
-        Quickshell.execDetached(["notify-send", "-a", "OmaFlow", "--", "config.toml was not applied",
-          (reason || "Check the file with: omaflow effective-config") + "\nThe previous settings stay in use."])
+        flow.toast(reason || "Check the file with: omaflow effective-config", true)
+        flow.spawn(Notifications.command("configuration"), function(stdout) {
+          if (String(stdout).trim() === "default") {
+            root.showWindow("settings")
+            flow.toast(reason || "Check the file with: omaflow effective-config", true)
+          }
+        })
       }
       flow.openJournalFolder()
     })
@@ -284,17 +289,15 @@ Panel {
     }
   }
 
-  // Notes you wrote ahead to today arrive as a notification, once each, with
-  // their first words. The shell asks when it starts and every half hour, so
-  // a day that begins while it is running is not missed.
+  // Notes you wrote ahead to today trigger a notification, once each.
+  // The shell asks at startup and every half hour, so it notices a new day.
   function deliverNotes() {
     flow.query(["journal", "due"], function(value) {
       if (!value || !value.notes) return
       var day = String(value.date || flow.todayIso())
       value.notes.forEach(function() {
         // "default" is the action Omarchy runs when the notification is clicked.
-        flow.spawn(["notify-send", "-a", "OmaFlow", "-A", "default=Open the journal", "--",
-          "A journal note is ready", "Open OmaFlow to read your note."],
+        flow.spawn(Notifications.command("journal"),
           function(stdout) { if (String(stdout).trim() === "default") root.showWindow("journal/" + day) })
       })
     })
@@ -308,15 +311,13 @@ Panel {
     flow.query(["todos", "reminders"], function(value) {
       if (!value || !value.reminders) return
       value.reminders.forEach(function(todo) {
-        flow.spawn(["notify-send", "-a", "OmaFlow", "-u", "critical", "-A", "default=Open", "-A", "done=Done", "--",
-          "A to-do needs your attention", "Open OmaFlow to see your reminder."],
+        flow.spawn(Notifications.command("reminder"),
           function(stdout) {
             var answer = String(stdout).trim()
             if (answer === "done") flow.query(["todos", "done", todo.index, todo.text], function(value, error) {
               flow.todosRevision += 1
               // The reminder is gone by now, so a tick that failed says so.
-              if (error) Quickshell.execDetached(["notify-send", "-a", "OmaFlow", "--", "A to-do is still open",
-                "Open OmaFlow to try again."])
+              if (error) flow.spawn(Notifications.command("reminderFailed"))
             })
             // A to-do that reminded you waits in Bubbled up, at the top of Today.
             else if (answer === "default") root.showWindow("todos/today")

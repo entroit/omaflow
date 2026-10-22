@@ -1,8 +1,11 @@
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    fs::{File, OpenOptions},
+    io::Write,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{FileExt, OpenOptionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -31,20 +34,11 @@ pub fn deferral_path() -> PathBuf {
 }
 
 pub fn read<T: DeserializeOwned>(path: &Path, limit: usize) -> Result<Option<T>, String> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
+    let bytes = match omaflow_core::fsutil::read_limited(path, limit as u64) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("could not open {}: {error}", path.display())),
+        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
     };
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
-    if metadata.len() > limit as u64 {
-        return Err(format!("{} is too large", path.display()));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|error| format!("could not parse {}: {error}", path.display()))
@@ -54,101 +48,87 @@ pub fn replace<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent", path.display()))?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("could not protect {}: {error}", parent.display()))?;
-    let temporary = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("state"),
-        std::process::id()
-    ));
+    omaflow_core::fsutil::private_dir(parent)?;
     let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(|error| format!("could not create {}: {error}", temporary.display()))?;
-    let result = (|| {
-        file.write_all(&bytes)
-            .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
-        file.sync_all()
-            .map_err(|error| format!("could not sync {}: {error}", temporary.display()))?;
-        fs::rename(&temporary, path)
-            .map_err(|error| format!("could not replace {}: {error}", path.display()))?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| format!("could not sync {}: {error}", parent.display()))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
-    }
-    result
+    omaflow_core::fsutil::write_private(path, &bytes)?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("could not sync {}: {error}", parent.display()))
 }
 
 pub struct UpdateLock {
-    path: PathBuf,
+    _file: File,
 }
 
 fn lock_path() -> PathBuf {
     update_dir().join("runner.lock")
 }
 
-/// Whether an updater holds the lock now. The lock file names its pid, and
-/// a runner that was killed leaves the file behind.
+/// The kernel releases the lock when its holder exits, including after a crash.
 pub fn runner_alive() -> bool {
     holder_alive(&lock_path())
 }
 
-fn holder_alive(path: &Path) -> bool {
-    fs::read_to_string(path)
+fn legacy_holder_alive(file: &File) -> bool {
+    let mut bytes = [0; 64];
+    file.read_at(&mut bytes, 0)
         .ok()
+        .and_then(|count| std::str::from_utf8(&bytes[..count]).ok())
         .and_then(|value| value.trim().parse::<u32>().ok())
         .is_some_and(|pid| Path::new("/proc").join(pid.to_string()).exists())
 }
 
-impl UpdateLock {
-    pub fn acquire() -> Result<Self, String> {
-        let path = lock_path();
-        fs::create_dir_all(update_dir()).map_err(|error| error.to_string())?;
-        fs::set_permissions(update_dir(), fs::Permissions::from_mode(0o700))
-            .map_err(|error| error.to_string())?;
-        for attempt in 0..2 {
-            match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    writeln!(file, "{}", std::process::id()).map_err(|error| error.to_string())?;
-                    return Ok(Self { path });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
-                    if !holder_alive(&path) {
-                        fs::remove_file(&path).map_err(|error| {
-                            format!("could not remove stale update lock: {error}")
-                        })?;
-                        continue;
-                    }
-                    return Err("another OmaFlow update is already running".into());
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return Err("another OmaFlow update is already running".into());
-                }
-                Err(error) => return Err(format!("could not create {}: {error}", path.display())),
-            }
-        }
-        unreachable!()
+fn try_lock(file: &File) -> Result<bool, String> {
+    // SAFETY: flock acts only on this open descriptor and touches no memory.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(format!("could not lock the updater: {error}"))
     }
 }
 
-impl Drop for UpdateLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+fn holder_alive(path: &Path) -> bool {
+    let Ok(file) = omaflow_core::fsutil::open_private(path) else {
+        return false;
+    };
+    !matches!(try_lock(&file), Ok(true)) || legacy_holder_alive(&file)
+}
+
+impl UpdateLock {
+    pub fn acquire() -> Result<Self, String> {
+        Self::acquire_at(&lock_path())
+    }
+
+    fn acquire_at(path: &Path) -> Result<Self, String> {
+        let parent = path.parent().ok_or("the update lock has no parent")?;
+        omaflow_core::fsutil::private_dir(parent)?;
+        let mut file = match OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                omaflow_core::fsutil::open_private(path)?
+            }
+            Err(error) => return Err(format!("could not create {}: {error}", path.display())),
+        };
+        if !try_lock(&file)? || legacy_holder_alive(&file) {
+            return Err("another OmaFlow update is already running".into());
+        }
+        // A live old updater still owns a numeric PID file. Migrate only after
+        // it exits; new holders use flock and never unlink the shared inode.
+        file.set_len(0).map_err(|error| error.to_string())?;
+        file.write_all(b"flock\n")
+            .map_err(|error| error.to_string())?;
+        Ok(Self { _file: file })
     }
 }
 
@@ -156,6 +136,20 @@ impl Drop for UpdateLock {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    fn lock_directory() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "omaflow-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
 
     #[test]
     fn atomic_store_replaces_a_complete_json_value() {
@@ -174,21 +168,138 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_left_by_a_dead_runner_has_no_holder() {
-        let directory = std::env::temp_dir().join(format!("omaflow-lock-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("runner.lock");
-        assert!(!holder_alive(&path), "no lock file");
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let dead = child.id();
-        child.wait().unwrap();
-        fs::write(&path, format!("{dead}\n")).unwrap();
-        assert!(!holder_alive(&path), "the runner exited");
-        fs::write(&path, format!("{}\n", std::process::id())).unwrap();
-        assert!(holder_alive(&path), "the runner is this process");
-        fs::write(&path, "not a pid\n").unwrap();
-        assert!(!holder_alive(&path));
+    fn update_state_reads_refuse_pipes_links_and_oversized_files() {
+        let directory = lock_directory();
+        let path = directory.join("transaction.json");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let pipe = path.clone();
+        std::thread::spawn(move || sender.send(read::<serde_json::Value>(&pipe, 256)).unwrap());
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("the update reader blocked on a FIFO")
+                .is_err()
+        );
+        fs::remove_file(&path).unwrap();
+        let target = directory.join("target.json");
+        fs::write(&target, b"{}").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read::<serde_json::Value>(&path, 256).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"{}  ").unwrap();
+        assert!(read::<serde_json::Value>(&path, 3).is_err());
+        assert_eq!(
+            read::<serde_json::Value>(&path, 4).unwrap(),
+            Some(json!({}))
+        );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_live_pid_blocks_until_exit_and_stale_files_recover() {
+        let directory = lock_directory();
+        let path = directory.join("runner.lock");
+        assert!(!holder_alive(&path));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        fs::write(&path, format!("{}\n", child.id())).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(holder_alive(&path));
+        assert!(UpdateLock::acquire_at(&path).is_err());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!holder_alive(&path));
+        for contents in [fs::read(&path).unwrap(), Vec::new()] {
+            fs::write(&path, contents).unwrap();
+            let lock = UpdateLock::acquire_at(&path).unwrap();
+            assert!(holder_alive(&path));
+            assert!(UpdateLock::acquire_at(&path).is_err());
+            drop(lock);
+            assert!(path.is_file());
+            assert!(!holder_alive(&path));
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_update_callers_never_hold_the_lock_together() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let directory = lock_directory();
+        let path = Arc::new(directory.join("runner.lock"));
+        let barrier = Arc::new(Barrier::new(8));
+        let holders = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let (path, barrier, holders) = (path.clone(), barrier.clone(), holders.clone());
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..1000 {
+                        if let Ok(_lock) = UpdateLock::acquire_at(&path) {
+                            assert_eq!(holders.fetch_add(1, Ordering::SeqCst), 0);
+                            std::thread::yield_now();
+                            assert_eq!(holders.fetch_sub(1, Ordering::SeqCst), 1);
+                        }
+                    }
+                });
+            }
+        });
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_crashed_process_releases_the_kernel_lock() {
+        let directory = lock_directory();
+        let path = directory.join("runner.lock");
+        drop(UpdateLock::acquire_at(&path).unwrap());
+        let mut child = std::process::Command::new("/usr/bin/python3")
+            .args(["-c", "import fcntl,sys,time; f=open(sys.argv[1], 'r+'); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(30)"])
+            .arg(&path)
+            .stdout(std::process::Stdio::piped())
+            .spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        assert_eq!(line, "locked\n");
+        assert!(holder_alive(&path));
+        assert!(UpdateLock::acquire_at(&path).is_err());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!holder_alive(&path));
+        assert!(UpdateLock::acquire_at(&path).is_ok());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn updater_lock_rejects_linked_files_without_changing_them() {
+        for symbolic in [false, true] {
+            let directory = lock_directory();
+            let target = directory.join("target");
+            fs::write(&target, b"keep this file").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            let path = directory.join("runner.lock");
+            if symbolic {
+                std::os::unix::fs::symlink(&target, &path).unwrap();
+            } else {
+                fs::hard_link(&target, &path).unwrap();
+            }
+            assert!(UpdateLock::acquire_at(&path).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"keep this file");
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 }

@@ -3,7 +3,7 @@
 //! they are transcribed again.
 use crate::fsutil::{private_dir, write_private};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
@@ -127,13 +127,18 @@ pub fn load(path: &Path, limit: usize) -> Vec<HistoryEntry> {
     if limit == 0 {
         return Vec::new();
     }
-    let Ok(text) = fs::read_to_string(path) else {
+    let Ok(text) = crate::fsutil::read_text(path) else {
         return Vec::new();
     };
     let mut entries: Vec<HistoryEntry> = match serde_json::from_str(&text) {
         Ok(entries) => entries,
         Err(error) => {
-            eprintln!("omaflow: ignoring invalid {}: {error}", path.display());
+            eprintln!(
+                "omaflow: ignoring invalid {} at line {}, column {}",
+                path.display(),
+                error.line(),
+                error.column()
+            );
             return Vec::new();
         }
     };
@@ -148,12 +153,16 @@ pub fn write(path: &Path, history: &[HistoryEntry]) -> Result<(), String> {
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
     private_dir(parent)?;
     let bytes = serde_json::to_vec(history).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > crate::fsutil::DOCUMENT_LIMIT {
+        return Err("History exceeds the 8 MiB limit".into());
+    }
     write_private(path, &bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn filled(text: &str, keep_audio: bool) -> Filled {
         Filled {

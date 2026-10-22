@@ -484,7 +484,8 @@ pub fn run() -> ExitCode {
         "test-cleanup" => {
             // With `-`, the fields as typed in Settings, before they are
             // saved: {"cleanup_engine","cleanup_model","cleanup_endpoint",
-            // "cleanup_api_key"?}. Without a key, the saved one is used.
+            // "cleanup_api_key"?}. A saved key belongs only to its original host,
+            // port and scheme.
             let typed = if args.next().as_deref() == Some("-") {
                 let mut input = String::new();
                 match std::io::stdin()
@@ -517,13 +518,24 @@ pub fn run() -> ExitCode {
                             config.cleanup.model = model.trim().into();
                         }
                         if let Some(endpoint) = field("cleanup_endpoint") {
+                            if !crate::config::same_model_origin(
+                                &config.cleanup.endpoint,
+                                endpoint.trim(),
+                            ) {
+                                config.cleanup.api_key.clear();
+                            }
                             config.cleanup.endpoint = endpoint.trim().into();
                         }
-                        if let Some(key) = field("cleanup_api_key").filter(|key| !key.is_empty()) {
+                        if let Some(key) = field("cleanup_api_key") {
                             config.cleanup.api_key = key.trim().into();
                         }
                     }
-                    crate::cleanup::test_connection(&config)
+                    match config.validate() {
+                        Ok(()) => crate::cleanup::test_connection(&config),
+                        Err(error) => {
+                            serde_json::json!({"ok":false,"kind":"configuration","message":error})
+                        }
+                    }
                 }
                 Err(_) => {
                     serde_json::json!({"ok":false,"kind":"configuration","message":"Could not load saved configuration. Fix the configuration before testing."})
@@ -756,9 +768,18 @@ fn model_install(kind: Option<String>, id: Option<String>) -> ExitCode {
     unsafe {
         libc::setpgid(0, 0);
     }
-    let marker = download_marker(kind, entry);
+    let marker = match download_marker(kind, entry) {
+        Ok(marker) => marker,
+        Err(error) => {
+            eprintln!("omaflow: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let fresh = kind == Kind::Speech && !catalog::speech_installed(entry.id);
-    let _ = fs::write(&marker, format!("{}\n{fresh}\n", std::process::id()));
+    let _ = omaflow_core::fsutil::write_private(
+        &marker,
+        format!("{}\n{fresh}\n", std::process::id()).as_bytes(),
+    );
     let mut reporter = DownloadReporter::new(entry.id);
     reporter.publish("downloading", None, &format!("Downloading {}", entry.label));
     let downloaded = catalog::download(kind, entry, |percent, line| {
@@ -838,23 +859,23 @@ fn ready_next_step(kind: Kind, config: Option<&Config>) -> String {
 /// Trying again only helps once nothing is missing: without Ollama, the
 /// Cleanup page shows the command that installs it.
 fn download_failed_body(error: &str) -> String {
-    let error = error.trim_end_matches('.');
     if error.starts_with("Ollama is not installed") {
-        format!("{error}. Settings, Advanced, Cleanup in OmaFlow shows how to install it.")
+        "Ollama is not installed, so cleanup models cannot be downloaded. Settings, Advanced, Cleanup in OmaFlow shows how to install it.".into()
     } else {
-        format!("{error}. To try again, open Settings, Advanced, Models in OmaFlow.")
+        "The model could not be downloaded. To try again, open Settings, Advanced, Models in OmaFlow.".into()
     }
 }
 
 /// Where a running download leaves its process id, and whether its files
 /// are new, for model-cancel.
-fn download_marker(kind: Kind, entry: &CatalogEntry) -> std::path::PathBuf {
+fn download_marker(kind: Kind, entry: &CatalogEntry) -> Result<std::path::PathBuf, String> {
     let name: String = entry
         .id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    omaflow_platform::runtime_dir().join(format!("omaflow-download-{}-{name}", kind.as_str()))
+    Ok(omaflow_platform::private_runtime_dir()?
+        .join(format!("omaflow-download-{}-{name}", kind.as_str())))
 }
 
 /// Stops a catalog download that is running, and removes what it wrote of
@@ -868,8 +889,24 @@ fn model_cancel(kind: Option<String>, id: Option<String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let marker = download_marker(kind, entry);
-    let Ok(text) = fs::read_to_string(&marker) else {
+    let marker = match download_marker(kind, entry) {
+        Ok(marker) => marker,
+        Err(error) => {
+            eprintln!("omaflow: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let text = omaflow_core::fsutil::open_private(&marker).and_then(|file| {
+        let mut text = String::new();
+        file.take(129)
+            .read_to_string(&mut text)
+            .map_err(|error| error.to_string())?;
+        if text.len() > 128 {
+            return Err("the download marker is too large".into());
+        }
+        Ok(text)
+    });
+    let Ok(text) = text else {
         eprintln!("{} is not downloading.", entry.label);
         return ExitCode::FAILURE;
     };
@@ -1075,7 +1112,7 @@ mod tests {
         );
         assert_eq!(
             download_failed_body("The connection dropped."),
-            "The connection dropped. To try again, open Settings, Advanced, Models in OmaFlow."
+            "The model could not be downloaded. To try again, open Settings, Advanced, Models in OmaFlow."
         );
     }
 }

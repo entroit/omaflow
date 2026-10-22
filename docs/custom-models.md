@@ -34,8 +34,15 @@ without rebuilding OmaFlow, so finish or discard an active recording first. A
 replacement model needs its own accuracy and hardware evaluation; a reachable
 server is not an accurate one.
 
-Some limits apply everywhere. Endpoints must be `http://` or `https://` URLs,
-at most 2048 characters, with no whitespace. A model name or path is at most
+Some limits apply everywhere. Remote endpoints require HTTPS. Plain HTTP is
+available for `localhost` and loopback IP addresses, with connection ownership
+checked before sending credentials or private data. A local server must run as
+your user, except that cleanup also supports the system Ollama service account.
+Managed speech must belong to your running `omaflow-asr.service` process.
+
+URLs have at most 2048 characters and cannot contain whitespace, credentials,
+queries, fragments, or backslashes. Put credentials in the API key field.
+A model name or path is at most
 512 characters and may not begin with `-`, though whisper.cpp may leave it
 empty because it never sends one. The language is `auto` or a code of ASCII
 letters and hyphens, at most 32 characters.
@@ -53,13 +60,16 @@ never publishes: the window and `omaflow effective-config` see a
 `speech_api_key_set` or `cleanup_api_key_set` boolean and nothing more. It
 never appears as a process argument, where anyone reading `/proc` would find
 it: the window hands it to `omaflow configure models -` on stdin, that passes it
-to the daemon over its owner-only socket, and it reaches curl through an
-owner-only file that is deleted after the request. A key must be
-one line without quotes, at most 4096 characters, so it cannot smuggle a second
-header in.
+to the daemon over a socket with a verified peer UID, and it reaches curl through
+sealed anonymous memory. A key must be one line without control characters,
+at most 4096 bytes, so it cannot inject another header or curl option.
 
-The field is write-only. Leaving it empty on save keeps the key you already
-stored; typing replaces it; **Remove the stored key** clears it.
+The field is write-only. Leaving it empty on save keeps the stored key when the
+server's scheme, host and port stay the same. Changing any of those clears the
+old key unless you enter a replacement. Changing only the path or model keeps
+the key. Selecting a built-in model clears the custom server's key.
+**Remove the stored key** clears it explicitly. A speech health check sends the
+key only when its scheme, host and port match the transcription server.
 
 ## A model file
 
@@ -84,6 +94,11 @@ splitting at `/v1/` and asking for `/health` on what precedes it, so keep the
 save it rather than saving and then never reporting ready. A health address is
 refused here too: this engine has its own, and a URL left over from another
 server would otherwise decide whether NeMo is running.
+
+OmaFlow verifies the receiving connection against the service's Unix user and
+process before each request. Another program answering the same health URL does
+not qualify as the managed server. If ownership cannot be verified, no audio is
+sent. Linux process and socket information must be available to the client.
 
 `speech_device` accepts `auto`, `cpu`, `cuda`, `vulkan` or `metal`. It selects
 a mode in the runtime you have installed; it does not fetch a different build.
@@ -190,8 +205,8 @@ The first request keeps its full remaining deadline. A server's `Retry-After`
 delay is respected in seconds or HTTP-date form. If that delay uses up the
 deadline, OmaFlow stops without another request. OpenAI-compatible cleanup
 servers receive no automatic warm-up or unload requests.
-Application HTTP requests ignore personal curl configuration files so those
-files cannot add retries or redirects. Put endpoint and credential settings in
+Application HTTP requests ignore personal curl configuration and proxy environment
+variables. They do not follow redirects. Put endpoint and credential settings in
 OmaFlow's configuration rather than `.curlrc`.
 
 Cleanup quality is not something a connection check can tell you. The gates in
@@ -252,7 +267,7 @@ The result distinguishes denied credentials, unavailable models when the server
 identifies them, endpoint/request errors, rate limits and invalid replies. A
 successful test means the saved model returned text, not that its cleanup
 quality is good. You can run the same test with `omaflow test-cleanup`.
-Credentials use a private temporary curl configuration, never process arguments;
+Credentials use sealed anonymous memory, never process arguments;
 if private credential storage fails, the request is not sent.
 
 A failure at dictation time appears on the recording result instead: a request

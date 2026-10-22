@@ -1,4 +1,5 @@
 import QtQuick
+import "ModelEndpoint.js" as ModelEndpoint
 
 // Asks an address whether anything is listening, and says so in words.
 // A transcription endpoint only answers POST, so a 405 to a GET still proves
@@ -19,14 +20,17 @@ Row {
   spacing: 12
 
   function check() {
-    if (!cleanupTest && url.trim().length === 0) { failed = true; status = "Enter an address first."; return }
+    var typed = cleanupTest && cleanupSettings !== null
+    var problem = !cleanupTest ? ModelEndpoint.problem(url)
+      : typed ? ModelEndpoint.problem(cleanupSettings.cleanup_endpoint || "") : ""
+    if (problem) { failed = true; status = problem; return }
     status = ""
     failed = false
     busy = true
-    var typed = cleanupTest && cleanupSettings !== null
     var argv = typed ? ["omaflow", "test-cleanup", "-"]
       : cleanupTest ? ["omaflow", "test-cleanup"]
-      : ["curl", "--disable", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", url.trim()]
+      : ["curl", "--disable", "--noproxy", "*", "--globoff", "--proto", "=http,https", "--proto-redir", "=https",
+         "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", "--url", url.trim()]
     var address = (url.trim().match(/^https?:\/\/([^\/]+)/) || [])[1] || url.trim()
     app.spawn(argv, function(stdout, stderr, code) {
       busy = false

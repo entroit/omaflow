@@ -45,6 +45,7 @@ Item {
   SettingsAudio { id: audio; y: 2400; width: 660; app: audioApp }
   SettingsOwnModel { id: own; y: 3000; width: 660; app: app }
   SettingsPrivacy { id: privacy; y: 3600; width: 660; app: audioApp }
+  SettingsCleanup { id: cleanup; y: 4200; width: 660; app: app }
   // A daemon one state version behind this window, which nothing republishes.
   App {
     id: olderApp
@@ -71,10 +72,85 @@ Item {
     for (var i = 0; i < item.children.length; i++) { var found = first(item.children[i], type); if (found) return found }
     return null
   }
+  function field(item, label) {
+    if (String(item).indexOf("Field") === 0 && item.label === label) return item
+    for (var i = 0; i < item.children.length; i++) { var found = field(item.children[i], label); if (found) return found }
+    return null
+  }
 
   TestCase {
     name: "HotkeysTable"
     when: windowShown
+    function test_endpoint_rules_data() {
+      return [
+        { tag: "remote TLS", origin: "https://models.example", valid: true },
+        { tag: "IPv4 loopback", origin: "http://127.12.0.1:8000", valid: true },
+        { tag: "localhost", origin: "http://localhost:8000", valid: true },
+        { tag: "IPv6 loopback", origin: "http://[::1]:8000", valid: true },
+        { tag: "expanded IPv6 loopback", origin: "http://[0:0:0:0:0:0:0:1]:8000", valid: true },
+        { tag: "remote HTTP", origin: "http://models.example", valid: false },
+        { tag: "LAN HTTP", origin: "http://192.168.1.2:8000", valid: false },
+        { tag: "abbreviated IPv4", origin: "http://127.1:8000", valid: false },
+        { tag: "integer IPv4", origin: "http://2130706433:8000", valid: false },
+        { tag: "hex IPv4", origin: "http://0x7f000001:8000", valid: false },
+        { tag: "userinfo", origin: "https://user:sk-secret@models.example", valid: false },
+        { tag: "encoded host", origin: "https://models%2eexample", valid: false },
+        { tag: "host glob", origin: "https://{one,two}.example", valid: false },
+        { tag: "query", origin: "https://models.example?key=secret", valid: false },
+        { tag: "fragment", origin: "https://models.example#secret", valid: false },
+        { tag: "backslash", origin: "https://models.example\\secret", valid: false },
+        { tag: "control", origin: "https://models.example/\u0001", valid: false },
+        { tag: "space", origin: "https://models.example/secret text", valid: false },
+        { tag: "invalid IPv6", origin: "https://[::gg]:8000", valid: false },
+        { tag: "zero port", origin: "http://127.0.0.1:0", valid: false },
+        { tag: "large port", origin: "http://127.0.0.1:65536", valid: false },
+        { tag: "long UTF-8 address", origin: "https://models.example/" + "é".repeat(1025), valid: false }
+      ]
+    }
+    function test_endpoint_rules(data) {
+      own.engine = "openai"
+      cleanup.engine = "openai"
+      var address = data.origin + "/v1/chat/completions"
+      root.field(own, "Model name").text = "test-model"
+      root.field(cleanup, "Model").text = "test-model"
+      root.field(own, "Address").text = address
+      root.field(cleanup, "Address").text = address
+      compare(own.ready, data.valid)
+      compare(cleanup.ready, data.valid)
+      if (!data.valid) {
+        root.spawned = []
+        tester.cleanupTest = false
+        tester.url = address
+        tester.check()
+        verify(tester.failed)
+        verify(tester.status.length > 0)
+        compare(root.spawned.length, 0, "invalid URLs never reach curl")
+        tester.cleanupTest = true
+        tester.cleanupSettings = { cleanup_endpoint: address, cleanup_api_key: "sk-secret" }
+        tester.check()
+        compare(root.spawned.length, 0, "invalid cleanup URLs never carry credentials to a process")
+      }
+      root.field(own, "Address").text = ""
+      root.field(own, "Model name").text = ""
+      own.engine = "nemo"
+      tester.cleanupTest = true
+      tester.cleanupSettings = null
+      tester.url = ""
+    }
+    function test_endpoint_probe_uses_a_validated_public_address() {
+      root.spawned = []
+      root.reply = "200"
+      tester.cleanupTest = false
+      tester.url = "https://models.example/health"
+      tester.check()
+      compare(root.spawned[0], ["curl", "--disable", "--noproxy", "*", "--globoff", "--proto", "=http,https", "--proto-redir", "=https",
+        "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", "--url", "https://models.example/health"])
+      tryCompare(tester, "busy", false)
+      verify(!tester.failed)
+      compare(tester.status, "Answered. Something is listening there.")
+      tester.cleanupTest = true
+      tester.url = ""
+    }
     function test_basics_records_the_dictation_keys_in_place() {
       root.spawned = []
       root.reply = '{"ok": true, "message": "saved"}'

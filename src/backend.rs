@@ -9,6 +9,7 @@ use omaflow_platform::desktop::{
     DELIVERY_LOCK, active_window, active_window_matches, paste, set_clipboard,
 };
 pub use omaflow_platform::desktop::{copy_text, paste_shortcut, paste_text_now};
+use omaflow_platform::http::{HttpEndpoint, LocalPolicy};
 use omaflow_platform::process::CommandExt;
 use serde_json::Value;
 use std::{
@@ -16,10 +17,7 @@ use std::{
     ffi::CString,
     fs,
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::fs::OpenOptionsExt,
-    },
+    os::fd::{AsRawFd, FromRawFd},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -318,14 +316,8 @@ impl CapturedAudio {
 impl AudioMeter {
     fn open(gate: MeterGate) -> Result<Self, String> {
         let path = meter_path();
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        omaflow_core::fsutil::write_private(&path, METER_SILENCE)?;
+        let file = omaflow_core::fsutil::open_private(&path)?;
         let floor = NoiseFloor::new(gate.floor_centi_db.load(Ordering::Relaxed) as f32 / 100.0);
         let gate_db = if gate.auto.load(Ordering::Relaxed) {
             floor.gate_db()
@@ -467,25 +459,12 @@ fn voice_above_threshold(dbfs: f32, gate_db: f32) -> bool {
 }
 
 fn meter_path() -> PathBuf {
-    env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            env::temp_dir().join(format!("omaflow-{}", env::var("USER").unwrap_or_default()))
-        })
-        .join("omaflow-level")
+    omaflow_platform::runtime_dir().join("omaflow-level")
 }
 
 pub fn reset_meter() -> Result<(), String> {
     let path = meter_path();
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    file.write_all(METER_SILENCE)
-        .map_err(|error| format!("{}: {error}", path.display()))
+    omaflow_core::fsutil::write_private(&path, METER_SILENCE)
 }
 
 struct CaptureSession {
@@ -1097,10 +1076,16 @@ pub fn speech_server_ready(config: &crate::config::Backend) -> bool {
     } else {
         config.endpoint.clone()
     };
-    let Ok(auth) = crate::process::CurlAuth::new(&config.api_key) else {
+    let key = if crate::config::same_model_origin(&endpoint, &config.endpoint) {
+        &config.api_key
+    } else {
+        ""
+    };
+    let Ok(endpoint) = HttpEndpoint::prepare(&endpoint, speech_policy(config), key) else {
         return false;
     };
-    auth.apply(&mut Command::new("curl"))
+    endpoint
+        .command()
         .args([
             "--silent",
             "--max-time",
@@ -1109,15 +1094,23 @@ pub fn speech_server_ready(config: &crate::config::Backend) -> bool {
             "/dev/null",
             "-w",
             "%{http_code}",
-            &endpoint,
         ])
         .bounded_output()
         .ok()
         .is_some_and(|out| {
             let code = String::from_utf8_lossy(&out.stdout);
-            out.status.success()
+            endpoint.check().is_ok()
+                && out.status.success()
                 && (code.starts_with('2') || (config.health_endpoint.is_empty() && code == "405"))
         })
+}
+
+fn speech_policy(config: &crate::config::Backend) -> LocalPolicy {
+    if config.managed() {
+        LocalPolicy::ManagedSpeech
+    } else {
+        LocalPolicy::SameUser
+    }
 }
 
 /// The scheme and authority of a URL, without its path.
@@ -1326,13 +1319,34 @@ fn transcribe_speech(config: &Config, pcm: &[u8], cancel: &AtomicBool) -> Result
     let mut captured = CapturedAudio::new()?;
     captured.push(pcm)?;
     captured.finish()?;
-    transcribe_audio(config, &captured, cancel)
+    // Adapter tests own their server in this process. The executable regression
+    // exercises the systemd identity policy through transcribe-file.
+    let endpoint = HttpEndpoint::prepare(
+        &config.backend.endpoint,
+        LocalPolicy::SameUser,
+        &config.backend.api_key,
+    )?;
+    transcribe_audio_to(config, &captured, cancel, &endpoint)
 }
 
 fn transcribe_audio(
     config: &Config,
     captured: &CapturedAudio,
     cancel: &AtomicBool,
+) -> Result<String, String> {
+    let endpoint = HttpEndpoint::prepare(
+        &config.backend.endpoint,
+        speech_policy(&config.backend),
+        &config.backend.api_key,
+    )?;
+    transcribe_audio_to(config, captured, cancel, &endpoint)
+}
+
+fn transcribe_audio_to(
+    config: &Config,
+    captured: &CapturedAudio,
+    cancel: &AtomicBool,
+    endpoint: &HttpEndpoint,
 ) -> Result<String, String> {
     if captured.is_empty() {
         return Err("recording contained no microphone audio".into());
@@ -1367,6 +1381,7 @@ fn transcribe_audio(
             segment.finish()?;
             let part = transcribe_request(
                 config,
+                endpoint,
                 &segment.curl_form(),
                 Some(segment.file.as_raw_fd()),
                 b"",
@@ -1380,6 +1395,7 @@ fn transcribe_audio(
     } else {
         transcribe_request(
             config,
+            endpoint,
             &captured.curl_form(),
             Some(captured.file.as_raw_fd()),
             b"",
@@ -1465,6 +1481,7 @@ fn quiet_segment_boundaries(captured: &CapturedAudio) -> Result<Vec<usize>, Stri
 
 fn transcribe_request(
     config: &Config,
+    endpoint: &HttpEndpoint,
     file_form: &str,
     inherited_fd: Option<libc::c_int>,
     input: &[u8],
@@ -1474,11 +1491,10 @@ fn transcribe_request(
     let timeout = timeout_seconds.to_string();
     let model = format!("model={}", config.backend.model);
     let language = format!("language={}", config.backend.language);
-    let auth = crate::process::CurlAuth::new(&config.backend.api_key)?;
     let output = crate::process::run_http(
         || {
-            let mut command = Command::new("curl");
-            auth.apply(&mut command)
+            let mut command = endpoint.command();
+            command
                 .args([
                     "--silent",
                     "--show-error",
@@ -1489,7 +1505,6 @@ fn transcribe_request(
                     file_form,
                     "--form-string",
                     "response_format=json",
-                    &config.backend.endpoint,
                 ])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1510,6 +1525,7 @@ fn transcribe_request(
         Duration::from_secs(timeout_seconds),
     )
     .map_err(|error| format!("local transcription: {error}"))?;
+    endpoint.check()?;
     if !output.status.success() {
         return Err(format!(
             "speech server request failed: {}",
@@ -1944,10 +1960,12 @@ pub fn unload_cleanup(config: &Config) -> bool {
     }
     let payload =
         serde_json::json!({"model":config.cleanup.model,"messages":[],"keep_alive":0}).to_string();
-    let Ok(auth) = crate::process::CurlAuth::new(&config.cleanup.api_key) else {
+    let Ok(endpoint) = crate::cleanup::cleanup_endpoint(&config.cleanup, &config.cleanup.endpoint)
+    else {
         return false;
     };
-    auth.apply(&mut Command::new("curl"))
+    endpoint
+        .command()
         .args([
             "-fsS",
             "--max-time",
@@ -1958,10 +1976,9 @@ pub fn unload_cleanup(config: &Config) -> bool {
             "Content-Type: application/json",
             "--data-binary",
             &payload,
-            &config.cleanup.endpoint,
         ])
         .bounded_status()
-        .map(|status| status.success())
+        .map(|status| endpoint.check().is_ok() && status.success())
         .unwrap_or(false)
 }
 

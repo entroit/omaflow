@@ -213,11 +213,13 @@ pub fn selection_settings(kind: Kind, entry: &CatalogEntry) -> Value {
             "speech_model": entry.id,
             "speech_endpoint": SPEECH_ENDPOINT,
             "speech_health_endpoint": "",
+            "speech_api_key": "",
         }),
         Kind::Cleanup => json!({
             "cleanup_engine": "ollama",
             "cleanup_model": entry.id,
             "cleanup_endpoint": CLEANUP_ENDPOINT,
+            "cleanup_api_key": "",
         }),
     }
 }
@@ -309,20 +311,8 @@ pub fn installed_cleanup_ids(endpoint: &str) -> Vec<String> {
 /// True when a URL points at this machine, so a local binary and a local
 /// model list are actually the right things to look at.
 pub fn endpoint_is_local(endpoint: &str) -> bool {
-    let Some(authority) = endpoint
-        .split_once("://")
-        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
-    else {
-        return false;
-    };
-    let host = authority
-        .rsplit_once(':')
-        .filter(|(head, _)| !head.ends_with(']'))
-        .map_or(authority, |(head, _)| head);
-    matches!(
-        host.trim_matches(['[', ']']),
-        "127.0.0.1" | "::1" | "localhost"
-    ) || host.starts_with("127.")
+    crate::config::model_endpoint(endpoint)
+        .is_ok_and(|(host, _, _)| crate::config::model_host_is_loopback(host))
 }
 
 pub fn ollama_on_path() -> bool {
@@ -452,17 +442,7 @@ pub fn download(
             // be pressing Download on a machine where it was never set up, or
             // one that gained or lost its NVIDIA driver since. The installer
             // picks the build and does nothing when the right one is in place.
-            // A runtime that still works is good enough to download with,
-            // even if switching builds failed.
-            let installed = install_speech_runtime(&mut report);
-            if !speech_runtime_ready(&binary) {
-                return Err(installed.err().unwrap_or_else(|| {
-                    format!(
-                        "The speech runtime is still not usable at {}. Run scripts/install-nemo.sh in the OmaFlow folder.",
-                        binary.display()
-                    )
-                }));
-            }
+            install_speech_runtime(&mut report)?;
             let mut command = Command::new(binary);
             command.args(["pull", entry.id]);
             // nemo-speech prints nothing but two banner lines when its output
@@ -547,16 +527,6 @@ fn speech_downloader() -> Result<PathBuf, String> {
     Ok(prefix.join("bin/nemo-speech"))
 }
 
-/// The binary existing is not enough: a half-finished install leaves a file
-/// that cannot run, and the pull would fail with a much worse message.
-fn speech_runtime_ready(binary: &Path) -> bool {
-    binary.is_file()
-        && Command::new(binary)
-            .arg("--version")
-            .bounded_status()
-            .is_ok_and(|status| status.success())
-}
-
 fn install_speech_runtime(report: &mut impl FnMut(Option<u8>, &str)) -> Result<(), String> {
     report(None, "Setting up the speech runtime");
     let root = crate::update::repo_root().ok_or(
@@ -608,8 +578,8 @@ fn directory_bytes(directory: &Path, depth: u8) -> u64 {
         .sum()
 }
 
-/// Runs a child to completion, forwarding whatever it prints. Downloads and
-/// runtime installs both take minutes, so nothing here imposes a deadline.
+/// Reads bounded progress from a child without exposing its raw output.
+/// Downloads and runtime installs can take minutes, so there is no deadline.
 fn stream(
     mut command: Command,
     label: &str,
@@ -623,7 +593,7 @@ fn stream(
         .spawn()
         .map_err(|error| format!("{label} could not be started: {error}"))?;
 
-    let (lines, receiver) = mpsc::channel::<String>();
+    let (lines, receiver) = mpsc::sync_channel::<String>(32);
     for pipe in [
         child.stdout.take().map(PipeSource::Out),
         child.stderr.take().map(PipeSource::Err),
@@ -636,13 +606,10 @@ fn stream(
     }
     drop(lines);
 
-    let mut last = String::new();
     let mut highest: Option<u8> = None;
     loop {
         match receiver.recv_timeout(Duration::from_millis(500)) {
             Ok(line) => {
-                // The raw child output is the log; the panel gets a summary.
-                eprintln!("{line}");
                 if let Some(probe) = probe.as_mut()
                     && let Some(total) = parse_total_bytes(&line)
                 {
@@ -651,7 +618,6 @@ fn stream(
                 // A multi-layer pull restarts at 0% for every layer, and a bar
                 // that jumps backwards reads as a fault.
                 highest = highest.max(parse_percent(&line));
-                last = line;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -677,12 +643,7 @@ fn stream(
     if status.success() {
         return Ok(());
     }
-    let reason = last.trim();
-    if reason.is_empty() {
-        Err(format!("{label} stopped before it finished."))
-    } else {
-        Err(format!("{label} failed: {reason}"))
-    }
+    Err(format!("{label} stopped before it finished."))
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -700,7 +661,7 @@ enum PipeSource {
 }
 
 impl PipeSource {
-    fn forward(self, lines: &mpsc::Sender<String>) {
+    fn forward(self, lines: &mpsc::SyncSender<String>) {
         match self {
             Self::Out(pipe) => forward_lines(pipe, lines),
             Self::Err(pipe) => forward_lines(pipe, lines),
@@ -711,7 +672,7 @@ impl PipeSource {
 /// Progress bars separate their updates with carriage returns and repaint with
 /// escape sequences, so this splits on both terminators and drops the escapes;
 /// a plain line reader would hold the whole download in one unfinished line.
-fn forward_lines(pipe: impl Read, lines: &mpsc::Sender<String>) {
+fn forward_lines(pipe: impl Read, lines: &mpsc::SyncSender<String>) {
     let mut reader = BufReader::new(pipe);
     let mut buffer = [0_u8; 4096];
     let mut pending = Vec::new();
@@ -733,15 +694,14 @@ fn forward_lines(pipe: impl Read, lines: &mpsc::Sender<String>) {
     send_line(&mut pending, lines);
 }
 
-fn send_line(pending: &mut Vec<u8>, lines: &mpsc::Sender<String>) -> bool {
+fn send_line(pending: &mut Vec<u8>, lines: &mpsc::SyncSender<String>) -> bool {
     let text = strip_escapes(&String::from_utf8_lossy(pending));
     pending.clear();
     let text = text.trim();
     text.is_empty() || lines.send(text.to_string()).is_ok()
 }
 
-/// Terminal repaint codes (`ESC[K`, `ESC[?25h`, `ESC]…BEL`) would otherwise
-/// end up in the panel and in error messages.
+/// Strip terminal repaint codes before parsing progress.
 fn strip_escapes(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut characters = text.chars();
@@ -823,6 +783,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn loopback_looking_hostnames_do_not_use_the_local_model_catalog() {
+        assert!(!endpoint_is_local("https://127.models.example/api/chat"));
+        assert!(!endpoint_is_local("https://localhost.example/api/chat"));
+        assert!(endpoint_is_local("http://127.0.0.2:11434/api/chat"));
+        assert!(endpoint_is_local("http://[::1]:11434/api/chat"));
+    }
+
+    #[test]
     fn every_entry_is_unique_and_described() {
         for kind in [Kind::Speech, Kind::Cleanup] {
             let list = entries(kind);
@@ -863,13 +831,36 @@ mod tests {
 
     #[test]
     fn splits_progress_bars_on_carriage_returns_without_escape_codes() {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(32);
         let raw = "pulling manifest\u{1b}[K\rpulling abc: 42% \u{1b}[?25h\rsuccess\n";
         forward_lines(raw.as_bytes(), &sender);
         drop(sender);
         let lines: Vec<String> = receiver.iter().collect();
         assert_eq!(lines, ["pulling manifest", "pulling abc: 42%", "success"]);
         assert_eq!(parse_percent(&lines[1]), Some(42));
+    }
+
+    #[test]
+    fn download_output_queue_applies_backpressure() {
+        let (sender, receiver) = mpsc::sync_channel(32);
+        for _ in 0..32 {
+            sender.send("queued".to_string()).unwrap();
+        }
+        let (finished, completion) = mpsc::channel();
+        let producer = thread::spawn(move || {
+            forward_lines("next\nlast\n".as_bytes(), &sender);
+            finished.send(()).unwrap();
+        });
+        assert!(matches!(
+            completion.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let lines: Vec<_> = receiver.iter().collect();
+        producer.join().unwrap();
+        completion.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(lines.len(), 34);
+        assert!(lines[..32].iter().all(|line| line == "queued"));
+        assert_eq!(&lines[32..], ["next", "last"]);
     }
 
     #[test]
@@ -886,9 +877,11 @@ mod tests {
                         "speech_model",
                         "speech_endpoint",
                         "speech_health_endpoint",
+                        "speech_api_key",
                         "cleanup_engine",
                         "cleanup_model",
-                        "cleanup_endpoint"
+                        "cleanup_endpoint",
+                        "cleanup_api_key"
                     ]
                     .contains(&key.as_str())
                 );

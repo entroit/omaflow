@@ -1,4 +1,5 @@
 import QtQuick
+import "ModelEndpoint.js" as ModelEndpoint
 
 // Medium cleanup's model. The level itself is chosen in Basics; this page is
 // for which model does the work and where it runs.
@@ -29,9 +30,8 @@ Column {
 
   function endpointProblem(value) {
     var url = String(value).trim()
-    if (url.length === 0) return "An address is required."
-    if (/\s/.test(url)) return "No spaces."
-    if (url.indexOf("http://") !== 0 && url.indexOf("https://") !== 0) return "Start with http:// or https://."
+    var problem = ModelEndpoint.problem(url)
+    if (problem) return problem
     if (page.engine === "openai" && !/\/v1\/chat\/completions$/.test(url)) return "The address has to end in /v1/chat/completions."
     if (page.engine !== "openai" && !/\/api\/chat$/.test(url)) return "The address has to end in /api/chat."
     return ""
@@ -179,7 +179,7 @@ Column {
       password: true
       placeholderText: page.app.modelSettings.cleanup_api_key_set ? "A key is stored. Type to replace it." : "Leave empty if your server needs none"
       maximumLength: 512
-      hint: "Sent as a bearer token. Stored in your config file, which only your user can read."
+      hint: "Enter a new key when you change servers. Stored in your private config file."
     }
     // Tried before it is saved, as on Your own model.
     EndpointTester {

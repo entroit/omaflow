@@ -4,6 +4,8 @@
 pub mod clock;
 pub mod desktop;
 pub mod ducking;
+pub mod http;
+pub mod ipc;
 pub mod process;
 pub mod sound;
 
@@ -16,4 +18,14 @@ pub fn runtime_dir() -> PathBuf {
         .unwrap_or_else(|| {
             env::temp_dir().join(format!("omaflow-{}", env::var("USER").unwrap_or_default()))
         })
+}
+
+/// Creates session storage only when it is a directory owned by this user.
+pub fn private_runtime_dir() -> Result<PathBuf, String> {
+    let path = runtime_dir();
+    if !path.is_absolute() {
+        return Err("the runtime directory must be an absolute path".into());
+    }
+    omaflow_core::fsutil::private_dir(&path)?;
+    Ok(path)
 }

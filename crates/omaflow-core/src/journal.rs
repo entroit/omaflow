@@ -10,7 +10,7 @@
 //! so notes apps that open the journal folder skip them.
 use crate::{
     date::Date,
-    fsutil::{Made, copy_all, owned_dir, remove_moved, same_folder, write_owned},
+    fsutil::{Made, copy_all, remove_moved, same_folder, write_owned},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -234,21 +234,24 @@ impl Journal {
     /// How many entries have a kept recording, so turning recordings off
     /// can say what it deletes.
     pub fn recording_count(&self) -> usize {
-        let Ok(days) = fs::read_dir(self.folder.join(".recordings")) else {
-            return 0;
-        };
-        days.flatten()
-            .filter_map(|day| fs::read_dir(day.path()).ok())
-            .flat_map(|files| files.flatten())
-            .filter(|file| file.path().extension().is_some_and(|ext| ext == "wav"))
+        let recordings = self.folder.join(".recordings");
+        crate::fsutil::directory_names(&self.folder, &recordings)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|day| {
+                crate::fsutil::directory_names(&self.folder, &recordings.join(day)).ok()
+            })
+            .flatten()
+            .filter(|name| Path::new(name).extension().is_some_and(|ext| ext == "wav"))
             .count()
     }
 
     /// Deletes every kept recording. The words and waveform outlines stay.
     pub fn delete_recordings(&self) -> Result<(), String> {
-        let _ = fs::remove_file(self.trash_dir().join("recording.wav"));
+        let _ =
+            crate::fsutil::remove_file_at(&self.folder, &self.trash_dir().join("recording.wav"));
         let recordings = self.folder.join(".recordings");
-        match fs::remove_dir_all(&recordings) {
+        match crate::fsutil::remove_dir_at(&self.folder, &recordings) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("{}: {error}", recordings.display())),
@@ -261,12 +264,12 @@ impl Journal {
 
     pub fn day(&self, date: Date) -> Result<Day, String> {
         let path = self.day_path(date);
-        let (document, exists) = match fs::read_to_string(&path) {
+        let (document, exists) = match crate::fsutil::read_text_at(&self.folder, &path) {
             Ok(text) => (parse(&text), true),
             Err(error) if error.kind() == ErrorKind::NotFound => (Document::default(), false),
             Err(error) => return Err(format!("could not read {}: {error}", path.display())),
         };
-        let sidecar = self.read_sidecar(date);
+        let sidecar = self.read_sidecar(date)?;
         let entries = document
             .sections
             .iter()
@@ -284,7 +287,12 @@ impl Journal {
                     raw_text: meta.raw_text,
                     duration_ms: meta.duration_ms,
                     peaks: meta.peaks,
-                    audio: section.marked && self.recording_path(date, section.id).is_file(),
+                    audio: section.marked
+                        && crate::fsutil::open_regular_at(
+                            &self.folder,
+                            &self.recording_path(date, section.id),
+                        )
+                        .is_ok(),
                     written: written_on(&section.heading)
                         .map(|day| day.to_string())
                         .unwrap_or_default(),
@@ -312,9 +320,10 @@ impl Journal {
             if !name.starts_with(&prefix) {
                 continue;
             }
-            let count = fs::read_to_string(self.day_path(date))
-                .map(|text| parse(&text).sections.len())
-                .unwrap_or(0);
+            let path = self.day_path(date);
+            let text = crate::fsutil::read_text_at(&self.folder, &path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            let count = parse(&text).sections.len();
             if count > 0 {
                 days.push(DayCount {
                     date: name,
@@ -361,7 +370,7 @@ impl Journal {
         })?;
         let _lock = self.lock()?;
         let path = self.day_path(date);
-        let mut document = match fs::read_to_string(&path) {
+        let mut document = match crate::fsutil::read_text_at(&self.folder, &path) {
             Ok(text) => parse(&text),
             Err(error) if error.kind() == ErrorKind::NotFound => Document::default(),
             Err(error) => return Err(format!("could not read {}: {error}", path.display())),
@@ -370,19 +379,20 @@ impl Journal {
         while document.sections.iter().any(|section| section.id == id) {
             id += 1;
         }
+        let mut sidecar = if entry.typed {
+            None
+        } else {
+            Some(self.read_sidecar(date)?)
+        };
         let audio = match entry.recording {
             Some(wav) => {
                 let recording = self.recording_path(date, id);
-                if let Some(parent) = recording.parent() {
-                    owned_dir(parent)?;
-                }
-                write_owned(&recording, wav)?;
+                crate::fsutil::write_owned_at(&self.folder, &recording, wav)?;
                 true
             }
             None => false,
         };
-        if !entry.typed {
-            let mut sidecar = self.read_sidecar(date);
+        if let Some(sidecar) = &mut sidecar {
             sidecar.entries.insert(
                 id,
                 Meta {
@@ -391,7 +401,7 @@ impl Journal {
                     peaks: entry.peaks.clone(),
                 },
             );
-            self.write_sidecar(date, &sidecar)?;
+            self.write_sidecar(date, sidecar)?;
         }
         // An entry added to a past day goes in among that day's entries by
         // its time; one written on its own day is the latest anyway.
@@ -413,7 +423,7 @@ impl Journal {
                 body: escape_body(text),
             },
         );
-        write_owned(&path, render(&document, date).as_bytes())?;
+        crate::fsutil::write_document_at(&self.folder, &path, render(&document, date).as_bytes())?;
         Ok(Entry {
             id,
             time: shown_time(entry.time),
@@ -453,6 +463,7 @@ impl Journal {
     /// one-entry trash first, so `restore` can undo it for ten seconds.
     pub fn delete(&self, date: Date, id: u64) -> Result<(), String> {
         let _lock = self.lock()?;
+        let mut sidecar = self.read_sidecar(date)?;
         self.empty_trash();
         let mut removed = None;
         self.rewrite(date, |document| {
@@ -465,13 +476,11 @@ impl Journal {
             Ok(())
         })?;
         let (index, section) = removed.expect("rewrite found the entry");
-        let mut sidecar = self.read_sidecar(date);
         let meta = sidecar.entries.remove(&id);
         if meta.is_some() {
             self.write_sidecar(date, &sidecar)?;
         }
         let trash = self.trash_dir();
-        owned_dir(&trash)?;
         let trashed = Trashed {
             date: date.to_string(),
             id,
@@ -484,8 +493,12 @@ impl Journal {
             deleted_at_ms: now_ms(),
         };
         let record = serde_json::to_vec(&trashed).map_err(|error| error.to_string())?;
-        write_owned(&trash.join("entry.json"), &record)?;
-        match fs::rename(self.recording_path(date, id), trash.join("recording.wav")) {
+        crate::fsutil::write_document_at(&self.folder, &trash.join("entry.json"), &record)?;
+        match crate::fsutil::rename_at(
+            &self.folder,
+            &self.recording_path(date, id),
+            &trash.join("recording.wav"),
+        ) {
             Err(error) if error.kind() != ErrorKind::NotFound => Err(format!(
                 "The entry is gone but its recording is not: {error}"
             )),
@@ -498,13 +511,15 @@ impl Journal {
         let _lock = self.lock()?;
         self.forget_stale_trash();
         let trash = self.trash_dir();
-        let trashed: Trashed = fs::read(trash.join("entry.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .filter(|trashed: &Trashed| trashed.date == date.to_string() && trashed.id == id)
-            .ok_or("That entry can no longer be brought back")?;
+        let trashed: Trashed =
+            crate::fsutil::read_document_at(&self.folder, trash.join("entry.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .filter(|trashed: &Trashed| trashed.date == date.to_string() && trashed.id == id)
+                .ok_or("That entry can no longer be brought back")?;
         let path = self.day_path(date);
-        let mut document = match fs::read_to_string(&path) {
+        let mut sidecar = self.read_sidecar(date)?;
+        let mut document = match crate::fsutil::read_text_at(&self.folder, &path) {
             Ok(text) => parse(&text),
             Err(error) if error.kind() == ErrorKind::NotFound => Document::default(),
             Err(error) => return Err(format!("could not read {}: {error}", path.display())),
@@ -523,19 +538,15 @@ impl Journal {
                 body: trashed.body,
             },
         );
-        write_owned(&path, render(&document, date).as_bytes())?;
+        crate::fsutil::write_document_at(&self.folder, &path, render(&document, date).as_bytes())?;
         if let Some(meta) = trashed.meta {
-            let mut sidecar = self.read_sidecar(date);
             sidecar.entries.insert(id, meta);
             self.write_sidecar(date, &sidecar)?;
         }
         let recording = trash.join("recording.wav");
         if recording.exists() {
             let destination = self.recording_path(date, id);
-            if let Some(parent) = destination.parent() {
-                owned_dir(parent)?;
-            }
-            fs::rename(&recording, &destination)
+            crate::fsutil::rename_at(&self.folder, &recording, &destination)
                 .map_err(|error| format!("The entry is back but its recording is not: {error}"))?;
         }
         self.empty_trash();
@@ -548,14 +559,18 @@ impl Journal {
 
     /// Deletes the last deleted entry for good, words and recording.
     pub fn empty_trash(&self) {
-        let _ = fs::remove_dir_all(self.trash_dir());
+        let _ = crate::fsutil::remove_dir_at(&self.folder, &self.trash_dir());
     }
 
     /// Deleted entries are only kept for Undo; after that they are gone.
     pub fn forget_stale_trash(&self) {
-        let deleted_at = fs::read(self.trash_dir().join("entry.json"))
+        let Ok(bytes) =
+            crate::fsutil::read_document_at(&self.folder, self.trash_dir().join("entry.json"))
+        else {
+            return;
+        };
+        let deleted_at = serde_json::from_slice::<Trashed>(&bytes)
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<Trashed>(&bytes).ok())
             .map(|trashed| trashed.deleted_at_ms);
         match deleted_at {
             Some(at) if now_ms().saturating_sub(at) < TRASH_KEEP_MS => {}
@@ -569,11 +584,11 @@ impl Journal {
         change: impl FnOnce(&mut Document) -> Result<(), String>,
     ) -> Result<(), String> {
         let path = self.day_path(date);
-        let text = fs::read_to_string(&path)
+        let text = crate::fsutil::read_text_at(&self.folder, &path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
         let mut document = parse(&text);
         change(&mut document)?;
-        write_owned(&path, render(&document, date).as_bytes())
+        crate::fsutil::write_document_at(&self.folder, &path, render(&document, date).as_bytes())
     }
 
     /// The first entry written on this day a year ago.
@@ -597,9 +612,9 @@ impl Journal {
             return Ok(result);
         }
         for date in self.dates()?.into_iter().rev() {
-            let Ok(text) = fs::read_to_string(self.day_path(date)) else {
-                continue;
-            };
+            let path = self.day_path(date);
+            let text = crate::fsutil::read_text_at(&self.folder, &path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
             let mut matched_day = false;
             for section in parse(&text).sections.into_iter().rev() {
                 let haystack: Vec<char> = section.body.chars().collect();
@@ -643,9 +658,9 @@ impl Journal {
         let dates = self.dates()?;
         let mut out = String::new();
         for &date in &dates {
-            let Ok(text) = fs::read_to_string(self.day_path(date)) else {
-                continue;
-            };
+            let path = self.day_path(date);
+            let text = crate::fsutil::read_text_at(&self.folder, &path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
             let document = parse(&text);
             if document.sections.is_empty() && document.preamble.trim().is_empty() {
                 continue;
@@ -679,18 +694,16 @@ impl Journal {
             .iter()
             .map(|&date| (date, self.day_path(date), target.day_path(date)))
             .collect();
-        for date in dated(&self.folder.join(".omaflow"), ".json") {
+        for date in dated(&self.folder, &self.folder.join(".omaflow"), ".json").map_err(failed)? {
             files.push((date, self.sidecar_path(date), target.sidecar_path(date)));
         }
-        for date in dated(&self.folder.join(".recordings"), "") {
+        for date in dated(&self.folder, &self.folder.join(".recordings"), "").map_err(failed)? {
             let folder = self.folder.join(".recordings").join(date.to_string());
-            let Ok(recordings) = fs::read_dir(&folder) else {
-                continue;
-            };
-            for recording in recordings.flatten() {
-                let name = recording.file_name();
+            let recordings = crate::fsutil::directory_names(&self.folder, &folder)
+                .map_err(|error| failed(format!("{}: {error}", folder.display())))?;
+            for name in recordings {
                 let into = target.folder.join(".recordings").join(date.to_string());
-                files.push((date, recording.path(), into.join(name)));
+                files.push((date, folder.join(&name), into.join(name)));
             }
         }
         let mut clashes: Vec<String> = files
@@ -708,7 +721,7 @@ impl Journal {
         let pairs = files
             .iter()
             .map(|(_, from, to)| (from.as_path(), to.as_path()));
-        if let Err(error) = copy_all(pairs, destination, &mut made) {
+        if let Err(error) = copy_all(pairs, &self.folder, destination, &mut made) {
             made.undo();
             return Err(failed(error));
         }
@@ -717,18 +730,21 @@ impl Journal {
             files.iter().map(|(_, from, _)| from.as_path()),
             &self.folder,
         );
-        for date in dated(&self.folder.join(".recordings"), "") {
-            let _ = fs::remove_dir(self.folder.join(".recordings").join(date.to_string()));
+        for date in dated(&self.folder, &self.folder.join(".recordings"), "").map_err(failed)? {
+            let _ = crate::fsutil::remove_empty_dir_at(
+                &self.folder,
+                &self.folder.join(".recordings").join(date.to_string()),
+            );
         }
-        let _ = fs::remove_dir(self.folder.join(".recordings"));
+        let _ = crate::fsutil::remove_empty_dir_at(&self.folder, &self.folder.join(".recordings"));
         // The lock is ours; the folder it is in may hold the to-do list's too.
         drop(lock);
         let own = self.folder.join(".omaflow");
-        let left = fs::read_dir(&own)
-            .map(|names| names.flatten().count())
+        let left = crate::fsutil::directory_names(&self.folder, &own)
+            .map(|names| names.len())
             .unwrap_or(0);
-        if left == 1 && fs::remove_file(own.join("lock")).is_ok() {
-            let _ = fs::remove_dir(&own);
+        if left == 1 && crate::fsutil::remove_file_at(&self.folder, &own.join("lock")).is_ok() {
+            let _ = crate::fsutil::remove_empty_dir_at(&self.folder, &own);
         }
         Ok(Moved {
             days: days.len(),
@@ -740,33 +756,24 @@ impl Journal {
     /// spoken entries while the window may be saving a typed one.
     fn lock(&self) -> Result<fs::File, String> {
         let directory = self.folder.join(".omaflow");
-        owned_dir(&directory)?;
         let path = directory.join("lock");
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        file.lock()
-            .map_err(|error| format!("could not lock {}: {error}", path.display()))?;
-        Ok(file)
+        crate::fsutil::lock_at(&self.folder, &path)
     }
 
-    fn read_sidecar(&self, date: Date) -> Sidecar {
-        fs::read(self.sidecar_path(date))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+    fn read_sidecar(&self, date: Date) -> Result<Sidecar, String> {
+        let path = self.sidecar_path(date);
+        match crate::fsutil::read_document_at(&self.folder, &path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|_| format!("{} contains invalid recording metadata", path.display())),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Sidecar::default()),
+            Err(error) => Err(format!("could not read {}: {error}", path.display())),
+        }
     }
 
     fn write_sidecar(&self, date: Date, sidecar: &Sidecar) -> Result<(), String> {
         let path = self.sidecar_path(date);
-        if let Some(parent) = path.parent() {
-            owned_dir(parent)?;
-        }
         let bytes = serde_json::to_vec(sidecar).map_err(|error| error.to_string())?;
-        write_owned(&path, &bytes)
+        crate::fsutil::write_document_at(&self.folder, &path, &bytes)
     }
 }
 
@@ -790,19 +797,21 @@ pub enum MoveError {
 
 /// Dates named by the entries of `folder` that end in `suffix`, such as the
 /// sidecars "2026-09-24.json" or the recording folders "2026-09-24".
-fn dated(folder: &Path, suffix: &str) -> Vec<Date> {
-    let Ok(names) = fs::read_dir(folder) else {
-        return Vec::new();
+fn dated(root: &Path, folder: &Path, suffix: &str) -> Result<Vec<Date>, String> {
+    let names = match crate::fsutil::directory_names(root, folder) {
+        Ok(names) => names,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("could not read {}: {error}", folder.display())),
     };
     let mut dates: Vec<Date> = names
-        .flatten()
+        .into_iter()
         .filter_map(|name| {
-            let name = name.file_name().to_string_lossy().into_owned();
+            let name = name.to_string_lossy();
             name.strip_suffix(suffix)?.parse().ok()
         })
         .collect();
     dates.sort();
-    dates
+    Ok(dates)
 }
 
 fn parse(text: &str) -> Document {
@@ -1249,6 +1258,85 @@ fn capitalize(word: &str) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn nested_storage_links_never_change_their_targets_but_selected_folder_links_work() {
+        let date: Date = "2026-10-22".parse().unwrap();
+        for child in [".omaflow", ".recordings"] {
+            let base = tempfile::tempdir().unwrap();
+            let folder = base.path().join("journal");
+            let outside = base.path().join("outside");
+            fs::create_dir(&folder).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(outside.join("private"), b"leave this file alone").unwrap();
+            std::os::unix::fs::symlink(&outside, folder.join(child)).unwrap();
+            let journal = Journal::new(&folder);
+            assert!(
+                journal
+                    .add(
+                        date,
+                        spoken(1_000_000_001, "12:00", "new entry", Some(b"wav"))
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+            assert_eq!(
+                fs::read(outside.join("private")).unwrap(),
+                b"leave this file alone"
+            );
+            assert!(!journal.day_path(date).exists());
+        }
+        let base = tempfile::tempdir().unwrap();
+        let actual = base.path().join("selected");
+        let link = base.path().join("folder-link");
+        fs::create_dir(&actual).unwrap();
+        std::os::unix::fs::symlink(&actual, &link).unwrap();
+        let journal = Journal::new(&link);
+        journal
+            .add(
+                date,
+                spoken(
+                    1_000_000_001,
+                    "12:00",
+                    "saved through folder link",
+                    Some(b"wav"),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            journal.day(date).unwrap().entries[0].text,
+            "saved through folder link"
+        );
+        let destination = base.path().join("moved");
+        journal.move_to(&destination).unwrap();
+        assert_eq!(
+            Journal::new(destination).day(date).unwrap().entries[0].text,
+            "saved through folder link"
+        );
+    }
+
+    #[test]
+    fn a_nested_recording_link_cannot_copy_an_unrelated_directory_during_a_move() {
+        let base = tempfile::tempdir().unwrap();
+        let folder = base.path().join("journal");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(folder.join(".recordings")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("private.wav"), b"private recording").unwrap();
+        std::os::unix::fs::symlink(&outside, folder.join(".recordings/2026-10-22")).unwrap();
+        let destination = base.path().join("moved");
+        assert!(Journal::new(&folder).move_to(&destination).is_err());
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read(outside.join("private.wav")).unwrap(),
+            b"private recording"
+        );
+    }
 
     fn temp_journal(name: &str) -> Journal {
         let folder =

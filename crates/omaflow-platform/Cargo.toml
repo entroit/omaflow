@@ -1,6 +1,6 @@
 [package]
 name = "omaflow-platform"
-version = "0.21.4"
+version = "0.21.5"
 edition = "2024"
 description = "OmaFlow's desktop adapters: clipboard, paste, focused window, audio ducking and subprocess I/O"
 license = "MIT"
@@ -11,3 +11,6 @@ omaflow-core = { path = "../omaflow-core" }
 httpdate = "1.0.3"
 libc = "0.2.189"
 serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

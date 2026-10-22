@@ -1,6 +1,100 @@
 use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf, str::FromStr};
 
+/// Parses the network destination before any private model request is built.
+pub fn model_endpoint(endpoint: &str) -> Result<(&str, u16, bool), String> {
+    if endpoint.len() > 2048
+        || endpoint
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+        || endpoint.contains(['\\', '#', '?'])
+    {
+        return Err("Model URLs must not contain whitespace, controls, backslashes, queries or fragments, or exceed 2048 characters; use the API key field for credentials".into());
+    }
+    let (rest, secure) = if let Some(rest) = endpoint.strip_prefix("https://") {
+        (rest, true)
+    } else if let Some(rest) = endpoint.strip_prefix("http://") {
+        (rest, false)
+    } else {
+        return Err("Model endpoints must be HTTP or HTTPS URLs".into());
+    };
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains(['@', '%', '{', '}']) {
+        return Err("Model URLs need a host without embedded credentials or encoded authority; use the API key field for credentials".into());
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, suffix) = rest.split_once(']').ok_or("Invalid IPv6 model URL")?;
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err("Invalid IPv6 model URL".into());
+        }
+        (
+            host,
+            suffix
+                .strip_prefix(':')
+                .or_else(|| suffix.is_empty().then_some("")),
+        )
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.contains(':') {
+            return Err("IPv6 model URLs need brackets around the address".into());
+        }
+        (host, Some(port))
+    } else {
+        (authority, Some(""))
+    };
+    let port = match port {
+        Some("") => {
+            if secure {
+                443
+            } else {
+                80
+            }
+        }
+        Some(port) => port
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or("Model URL port must be between 1 and 65535")?,
+        None => return Err("Invalid model URL authority".into()),
+    };
+    if host.is_empty() || host.contains(['[', ']']) {
+        return Err("Invalid model URL host".into());
+    }
+    if !secure && !model_host_is_loopback(host) {
+        return Err("Remote model endpoints require HTTPS; HTTP is only allowed for localhost or a loopback IP address".into());
+    }
+    Ok((host, port, secure))
+}
+
+pub fn model_host_is_loopback(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+pub fn same_model_origin(first: &str, second: &str) -> bool {
+    let (Ok((first_host, first_port, first_tls)), Ok((second_host, second_port, second_tls))) =
+        (model_endpoint(first), model_endpoint(second))
+    else {
+        return false;
+    };
+    let same_host = match (
+        first_host.parse::<std::net::IpAddr>(),
+        second_host.parse::<std::net::IpAddr>(),
+    ) {
+        (Ok(first), Ok(second)) => first == second,
+        _ => first_host.eq_ignore_ascii_case(second_host),
+    };
+    same_host && first_port == second_port && first_tls == second_tls
+}
+
+pub fn validate_api_key(key: &str) -> Result<(), String> {
+    if key.len() > 4_096 || key.chars().any(char::is_control) {
+        return Err("An API key must be one line of at most 4096 bytes".into());
+    }
+    Ok(())
+}
+
 const DEFAULT_CLEANUP_PROMPT: &str = "Transform the transcript into clean dictated text. Preserve its meaning and language, never answer it, and return only the final text.";
 
 fn is_previous_bundled_cleanup_prompt(prompt: &str) -> bool {
@@ -499,17 +593,21 @@ impl Config {
         if path.exists() {
             let text = fs::read_to_string(&path)
                 .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-            let overrides: toml::Value = toml::from_str(&text).map_err(|e| {
+            let overrides: toml::Value = toml::from_str(&text).map_err(|error| {
                 format!(
-                    "{} is not valid. Fix it and save the file: {e}",
-                    path.display()
+                    "{}: {}",
+                    path.display(),
+                    config_syntax_error(&text, error.span())
                 )
             })?;
             merge_toml(&mut merged, overrides);
         }
-        let mut config: Self = merged
-            .try_into()
-            .map_err(|error| format!("invalid effective OmaFlow configuration: {error}"))?;
+        let mut config: Self = merged.try_into().map_err(|_| {
+            format!(
+                "Invalid configuration field type or value in {}",
+                path.display()
+            )
+        })?;
         if is_previous_bundled_cleanup_prompt(&config.cleanup.system_prompt) {
             config.cleanup.system_prompt = bundled_prompt;
         }
@@ -561,7 +659,7 @@ impl Config {
     pub fn save_setting(key: &str, value: serde_json::Value) -> Result<Self, String> {
         if key == "paste_delivery" {
             let delivery: PasteDelivery =
-                serde_json::from_value(value).map_err(|e| e.to_string())?;
+                serde_json::from_value(value).map_err(|_| "Invalid shortcut fields or values")?;
             delivery.shortcut.validate()?;
             return Self::write_values(&[
                 (
@@ -595,7 +693,8 @@ impl Config {
                 Self::write_values(&updates)?;
                 return Self::load();
             }
-            let shortcut: Shortcut = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            let shortcut: Shortcut =
+                serde_json::from_value(value).map_err(|_| "Invalid shortcut fields or values")?;
             updates.push((
                 "shortcut",
                 "keys",
@@ -628,7 +727,7 @@ impl Config {
                     "speech_health_endpoint" => ("backend", "health_endpoint"),
                     "speech_language" => ("backend", "language"),
                     "speech_device" => ("backend", "device"),
-                    _ => return Err(format!("Unknown model setting: {key}")),
+                    _ => return Err("Unknown model setting".into()),
                 };
                 updates.push((
                     section,
@@ -744,24 +843,47 @@ impl Config {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(error.to_string()),
         };
-        text = complete_config(&text)?;
+        text = complete_config(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+        let previous: toml::Value =
+            toml::from_str(&text).map_err(|error| config_syntax_error(&text, error.span()))?;
         for (section, key, value) in values {
             text = replace_toml_key(&text, section, key, &value.to_string())?;
+        }
+        for section in ["backend", "cleanup"] {
+            let endpoint = values
+                .iter()
+                .find(|(table, key, _)| *table == section && *key == "endpoint")
+                .and_then(|(_, _, value)| value.as_str());
+            let explicit_key = values
+                .iter()
+                .any(|(table, key, _)| *table == section && *key == "api_key");
+            if let Some(endpoint) = endpoint
+                && !explicit_key
+                && !same_model_origin(
+                    previous[section]["endpoint"].as_str().unwrap_or(""),
+                    endpoint,
+                )
+            {
+                text = replace_toml_key(&text, section, "api_key", "\"\"")?;
+            }
         }
         let mut merged: toml::Value = toml::from_str(include_str!("../../../config/config.toml"))
             .map_err(|e| e.to_string())?;
         merge_toml(
             &mut merged,
-            toml::from_str(&text).map_err(|e| e.to_string())?,
+            toml::from_str(&text).map_err(|error| config_syntax_error(&text, error.span()))?,
         );
-        let config: Config = merged
-            .try_into()
-            .map_err(|e| format!("Invalid setting: {e}"))?;
+        let config: Config = merged.try_into().map_err(|_| {
+            format!(
+                "Invalid configuration field type or value in {}",
+                path.display()
+            )
+        })?;
         config.validate()?;
         crate::fsutil::write_private(&path, text.as_bytes())
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         if !REMIND_BEFORE_CHOICES.contains(&u64::from(self.todos.remind_before)) {
             return Err("[todos] remind_before must be 0, 5, 15, 30 or 60".into());
         }
@@ -810,13 +932,8 @@ impl Config {
                 return Err("Enter a model name or path, up to 512 characters".into());
             }
         }
-        // A newline here would let a key smuggle a second HTTP header in.
         for key in [&self.backend.api_key, &self.cleanup.api_key] {
-            if key.len() > 4_096 || key.chars().any(|c| c.is_control() || c == '"') {
-                return Err(
-                    "An API key must be one line of at most 4096 characters, without quotes".into(),
-                );
-            }
+            validate_api_key(key)?;
         }
         if !["cpu", "cuda", "auto", "vulkan", "metal"].contains(&self.backend.device.as_str()) {
             return Err("Speech device must be auto, cpu, cuda, vulkan or metal".into());
@@ -873,14 +990,7 @@ impl Config {
             if endpoint.is_empty() {
                 continue;
             }
-            if endpoint.len() > 2048 || endpoint.chars().any(char::is_whitespace) {
-                return Err(
-                    "Model URLs must not contain whitespace or exceed 2048 characters".into(),
-                );
-            }
-            if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
-                return Err("Model endpoints must be HTTP or HTTPS URLs".into());
-            }
+            model_endpoint(endpoint)?;
         }
         if self.behavior.duck_audio_percent > 100 {
             return Err("Duck other audio by 0 to 100 percent".into());
@@ -893,6 +1003,18 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn config_syntax_error(text: &str, span: Option<std::ops::Range<usize>>) -> String {
+    let prefix = &text.as_bytes()[..span.map_or(0, |span| span.start).min(text.len())];
+    let line = prefix.iter().filter(|byte| **byte == b'\n').count() + 1;
+    let column = prefix.len()
+        - prefix
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1)
+        + 1;
+    format!("Invalid TOML syntax at line {line}, column {column}. Check the configuration file.")
 }
 
 fn merge_toml(base: &mut toml::Value, overrides: toml::Value) {
@@ -913,7 +1035,7 @@ fn merge_toml(base: &mut toml::Value, overrides: toml::Value) {
 fn complete_config(text: &str) -> Result<String, String> {
     let mut document = text
         .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| config_syntax_error(text, error.span()))?;
     let defaults = include_str!("../../../config/config.toml")
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| e.to_string())?;
@@ -1020,10 +1142,10 @@ fn complete_config(text: &str) -> Result<String, String> {
 fn replace_toml_key(text: &str, section: &str, key: &str, value: &str) -> Result<String, String> {
     let mut document = text
         .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| config_syntax_error(text, error.span()))?;
     let parsed = format!("value = {value}")
         .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| "Invalid configuration value")?;
     document[section][key] = parsed["value"].clone();
     if section == "cleanup"
         && key == "enabled"
@@ -1032,7 +1154,8 @@ fn replace_toml_key(text: &str, section: &str, key: &str, value: &str) -> Result
         table.remove("style");
     }
     let updated = document.to_string();
-    toml::from_str::<toml::Value>(&updated).map_err(|e| e.to_string())?;
+    toml::from_str::<toml::Value>(&updated)
+        .map_err(|error| config_syntax_error(&updated, error.span()))?;
     Ok(updated)
 }
 
@@ -1289,6 +1412,35 @@ mod tests {
 
         config.backend.api_key = "sk\nX-Injected: yes".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn credentials_belong_to_the_scheme_host_and_port() {
+        for (first, second) in [
+            ("https://api.example/v1/a", "https://API.example:443/v1/b"),
+            ("http://[::1]:8123/a", "http://[0:0:0:0:0:0:0:1]:8123/b"),
+        ] {
+            assert!(super::same_model_origin(first, second));
+        }
+        for endpoint in [
+            "http://127.0.0.1:8124/a",
+            "https://127.0.0.1:8123/a",
+            "http://localhost:8123/a",
+            "http://127.0.0.2:8123/a",
+            "not a URL",
+        ] {
+            assert!(!super::same_model_origin(
+                "http://127.0.0.1:8123/a",
+                endpoint
+            ));
+        }
+    }
+
+    #[test]
+    fn config_syntax_errors_do_not_repeat_private_values() {
+        let error = complete_config("[cleanup]\napi_key = PRIVATE_CONFIG_SECRET\n").unwrap_err();
+        assert!(error.contains("line 2"), "{error}");
+        assert!(!error.contains("PRIVATE_CONFIG_SECRET"));
     }
 
     #[test]

@@ -1,11 +1,8 @@
 //! Model-directed dictation cleanup with transport-completeness checks.
 use crate::{config::Config, vocabulary};
+use omaflow_platform::http::{HttpEndpoint, LocalPolicy};
 use serde_json::{Value, json};
-use std::{
-    process::{Command, Stdio},
-    sync::atomic::AtomicBool,
-    time::Duration,
-};
+use std::{process::Stdio, sync::atomic::AtomicBool, time::Duration};
 
 pub(crate) fn cleanup(
     config: &Config,
@@ -115,13 +112,13 @@ fn budgeted_request(
 }
 
 fn infer(config: &Config, request: &Value, cancel: &AtomicBool) -> Result<Value, String> {
-    let auth = crate::process::CurlAuth::new(&config.cleanup.api_key)?;
+    let endpoint = cleanup_endpoint(&config.cleanup, &config.cleanup.endpoint)?;
     let timeout = config.cleanup.timeout_seconds.to_string();
     let payload = request.to_string();
     let output = crate::process::run_http(
         || {
-            let mut command = Command::new("curl");
-            auth.apply(&mut command)
+            let mut command = endpoint.command();
+            command
                 .args([
                     "--silent",
                     "--show-error",
@@ -132,7 +129,6 @@ fn infer(config: &Config, request: &Value, cancel: &AtomicBool) -> Result<Value,
                     "Content-Type: application/json",
                     "--data-binary",
                     "@-",
-                    &config.cleanup.endpoint,
                 ])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -142,6 +138,7 @@ fn infer(config: &Config, request: &Value, cancel: &AtomicBool) -> Result<Value,
         cancel,
         Duration::from_secs(config.cleanup.timeout_seconds.max(1)),
     )?;
+    endpoint.check()?;
     if !output.status.success() {
         return Err(format!(
             "local cleanup failed: {}",
@@ -166,12 +163,24 @@ fn infer(config: &Config, request: &Value, cancel: &AtomicBool) -> Result<Value,
             "output_tokens": body["eval_count"]
                 .as_u64()
                 .or_else(|| usage["completion_tokens"].as_u64()),
-            "completion_reason": body["done_reason"].as_str().or_else(|| {
-                body.pointer("/choices/0/finish_reason").and_then(Value::as_str)
-            }),
         })
     );
     Ok(body)
+}
+
+pub(crate) fn cleanup_endpoint(
+    config: &crate::config::Cleanup,
+    url: &str,
+) -> Result<HttpEndpoint, String> {
+    HttpEndpoint::prepare(
+        url,
+        if config.engine == "ollama" {
+            LocalPolicy::Ollama
+        } else {
+            LocalPolicy::SameUser
+        },
+        &config.api_key,
+    )
 }
 
 fn cleanup_context(config: &Config, transcript: &str, window: Option<&Value>) -> String {
@@ -280,23 +289,25 @@ fn reply_hit_output_limit(config: &Config, body: &Value) -> bool {
     }
 }
 
-fn reply_incomplete(config: &Config, body: &Value) -> Option<String> {
+fn reply_incomplete(config: &Config, body: &Value) -> Option<&'static str> {
     if config.cleanup.engine == "openai" {
         return match body
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)
         {
             Some("stop" | "length") => None,
-            Some(reason) => Some(reason.to_string()),
-            None => Some("missing finish reason".into()),
+            Some("content_filter") => Some("content filtered"),
+            Some("tool_calls" | "function_call") => Some("unexpected tool call"),
+            Some(_) => Some("unrecognized finish reason"),
+            None => Some("missing finish reason"),
         };
     }
     if body.get("done").and_then(Value::as_bool) != Some(true) {
-        return Some("Ollama did not finish".into());
+        return Some("Ollama did not finish");
     }
     match body.get("done_reason").and_then(Value::as_str) {
         Some("stop" | "length") | None => None,
-        Some(reason) => Some(reason.to_string()),
+        Some(_) => Some("unrecognized finish reason"),
     }
 }
 
@@ -314,9 +325,9 @@ pub fn test_connection(config: &Config) -> Value {
     probe.cleanup.stop_sequences.clear();
     let request = cleanup_request(&probe, "Reply with OK.").to_string();
     let attempt = (|| {
-        let auth = crate::process::CurlAuth::new(&config.cleanup.api_key)?;
-        let mut command = Command::new("curl");
-        auth.apply(&mut command)
+        let endpoint = cleanup_endpoint(&config.cleanup, &config.cleanup.endpoint)?;
+        let mut command = endpoint.command();
+        command
             .args([
                 "--silent",
                 "--show-error",
@@ -325,16 +336,17 @@ pub fn test_connection(config: &Config) -> Value {
                 "Content-Type: application/json",
                 "--data-binary",
                 "@-",
-                &config.cleanup.endpoint,
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        crate::process::run_http_once(
+        let result = crate::process::run_http_once(
             &mut command,
             request.as_bytes(),
             &AtomicBool::new(false),
             Duration::from_secs(config.cleanup.timeout_seconds),
-        )
+        );
+        endpoint.check()?;
+        result
     })();
     let Ok((output, status, _)) = attempt else {
         return json!({"ok":false,"kind":"connection","message":"Could not complete the test. Check the connection, timeout and private credential storage."});
@@ -613,8 +625,8 @@ mod tests {
             "choices": [{"message": {"content": "Partial"}, "finish_reason": "content_filter"}]
         });
         assert_eq!(
-            reply_incomplete(&config, &filtered).as_deref(),
-            Some("content_filter")
+            reply_incomplete(&config, &filtered),
+            Some("content filtered")
         );
         let stopped = json!({
             "choices": [{"message": {"content": "Complete"}, "finish_reason": "stop"}]
@@ -622,14 +634,14 @@ mod tests {
         assert_eq!(reply_incomplete(&config, &stopped), None);
         let unmarked = json!({"choices": [{"message": {"content": "Partial"}}]});
         assert_eq!(
-            reply_incomplete(&config, &unmarked).as_deref(),
+            reply_incomplete(&config, &unmarked),
             Some("missing finish reason")
         );
 
         config.cleanup.engine = "ollama".into();
         let unfinished = json!({"message": {"content": "Partial"}, "done": false});
         assert_eq!(
-            reply_incomplete(&config, &unfinished).as_deref(),
+            reply_incomplete(&config, &unfinished),
             Some("Ollama did not finish")
         );
         let finished = json!({"message": {"content": "Complete"}, "done": true});

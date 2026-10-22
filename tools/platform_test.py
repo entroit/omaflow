@@ -5,9 +5,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 from unittest.mock import patch
 import set_hotkey
 
@@ -228,6 +230,11 @@ printf 'nemo-speech {reported_version}\\n'
         (source/'bin/nemo-speech').chmod(0o755)
         (source/'share').mkdir()
         (source/'share/runtime.txt').write_text(f'verified {variant} fixture\n')
+        (source/'lib').mkdir()
+        (source/'lib/libnemo.so.1').write_text(f'verified {variant} library\n')
+        (source/'lib/libnemo.so').symlink_to('libnemo.so.1')
+        (source/'share/nemo-speech').mkdir()
+        (source/'share/nemo-speech/model-index.json').write_text('{"models": []}\n')
         archive_path = base/f'runtime-{variant}-{reported_version}.tar.gz'
         with tarfile.open(archive_path, 'w:gz') as archive:
             archive.add(source, arcname=runtime_root(variant))
@@ -240,6 +247,23 @@ printf 'nemo-speech {reported_version}\\n'
             text = (text
                 .replace(f'[{variant}]={runtime_bytes[variant]}', f'[{variant}]={archive_path.stat().st_size}')
                 .replace(runtime_sha256[variant], hashlib.sha256(archive_path.read_bytes()).hexdigest()))
+        manifests = fixture_repo/'scripts'/(name + '-integrity')
+        manifests.mkdir()
+        for variant, archive_path in archives.items():
+            files, symlinks = {}, {}
+            with tarfile.open(archive_path) as archive:
+                for member in archive.getmembers():
+                    relative = str(Path(member.name).relative_to(runtime_root(variant)))
+                    if member.isfile():
+                        files[relative] = hashlib.sha256(archive.extractfile(member).read()).hexdigest()
+                    elif member.issym():
+                        symlinks[relative] = member.linkname
+            (manifests/(variant + '.json')).write_text(json.dumps({
+                'archiveSha256': hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+                'files': files, 'symlinks': symlinks,
+            }))
+        text = text.replace('$repo_dir/scripts/nemo-runtime/$variant.json',
+                            '$repo_dir/scripts/' + manifests.name + '/$variant.json')
         script.write_text(text)
         script.chmod(0o755)
         return script
@@ -247,6 +271,7 @@ printf 'nemo-speech {reported_version}\\n'
     archives = {variant: fixture_archive(variant, runtime_version) for variant in ['cuda', 'cpu']}
     fixture_repo = base/'nemo-fixture-repo'
     (fixture_repo/'scripts').mkdir(parents=True)
+    shutil.copy2(ROOT/'scripts/check-nemo-runtime.py', fixture_repo/'scripts/check-nemo-runtime.py')
     fixture_script = pinned_to(archives, 'install-nemo.sh')
     receipt_script = fixture_repo/'tools/install_receipt.py'
     receipt_script.parent.mkdir()
@@ -263,6 +288,10 @@ Path(os.environ["TEST_RECEIPT"]).write_text(" ".join(sys.argv[1:]))
     (nemo_commands/'curl').write_text(r'''#!/usr/bin/bash
 set -euo pipefail
 printf '%s\n' "$@" > "$TEST_CURL_ARGS"
+if [[ -n ${TEST_CURL_CALLS:-} ]]; then
+  printf 'download\n' >> "$TEST_CURL_CALLS"
+  sleep 0.3
+fi
 output=''
 url=''
 while (($#)); do
@@ -333,12 +362,83 @@ fi
     assert '--tlsv1.2' in arguments
     assert arguments[arguments.index('--retry')+1] == '3'
 
+    concurrent = base/'nemo-runtime-concurrent'
+    calls = base/'runtime-concurrent-downloads'
+    concurrent_env = dict(nemo_env, TEST_CURL_CALLS=str(calls))
+    first = subprocess.Popen([str(fixture_script), str(concurrent)], env=concurrent_env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + 5
+    while not calls.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert calls.exists(), 'The first runtime download never started'
+    second = subprocess.Popen([str(fixture_script), str(concurrent)], env=concurrent_env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    for process in [first, second]:
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stdout + stderr
+    assert calls.read_text().splitlines() == ['download'], 'Concurrent runtime installers both acquired an archive'
+    assert not Path(str(concurrent) + '.new').exists()
+    assert not Path(str(concurrent) + '.old').exists()
+    print('PASS concurrent model downloads share one serialized runtime installation')
+
+    lock_victim = base/'runtime-lock-victim'
+    lock_victim.write_text('keep this file\n'); lock_victim.chmod(0o600)
+    for symbolic in [False, True]:
+        locked_prefix = base/('nemo-linked-lock-' + str(symbolic))
+        lock = Path(str(locked_prefix) + '.lock')
+        if symbolic:
+            lock.symlink_to(lock_victim)
+        else:
+            os.link(lock_victim, lock)
+        result = install(locked_prefix)
+        assert result.returncode != 0 and not locked_prefix.exists(), result.stdout + result.stderr
+        assert lock_victim.read_text() == 'keep this file\n'
+        lock.unlink()
+    print('PASS runtime installer locking refuses planted links without changing their targets')
+
     # Running it again on the same machine downloads nothing.
     curl_args.unlink(); receipt.unlink()
     result = install(prefix)
     assert result.returncode == 0, result.stderr
     assert result.stdout == f'NeMo-Speech runtime (cpu) already installed at {prefix}\n'
     assert not curl_args.exists() and not receipt.exists()
+
+    for name, relative in [('executable', 'bin/nemo-speech'),
+                           ('library', 'lib/libnemo.so.1'),
+                           ('model-index', 'share/nemo-speech/model-index.json')]:
+        damaged = base/('nemo-tampered-' + name)
+        shutil.copytree(prefix, damaged, symlinks=True)
+        (damaged/relative).write_text('unverified bytes\n')
+        executed.unlink(missing_ok=True)
+        result = install(damaged, TEST_CURL_MODE='fail')
+        assert result.returncode != 0 and not executed.exists(), result.stdout + result.stderr
+    for name in ['library-link', 'extra-library', 'linked-prefix', 'shared-parent']:
+        damaged = base/('nemo-tampered-' + name)
+        if name == 'linked-prefix':
+            damaged.symlink_to(prefix, target_is_directory=True)
+        elif name == 'shared-parent':
+            shared = base/'shared-runtime-parent'; shared.mkdir(); shared.chmod(0o777)
+            damaged = shared/'runtime'
+            shutil.copytree(prefix, damaged, symlinks=True)
+        else:
+            shutil.copytree(prefix, damaged, symlinks=True)
+            if name == 'library-link':
+                (damaged/'lib/libnemo.so').unlink()
+                (damaged/'lib/libnemo.so').symlink_to(prefix/'lib/libnemo.so.1')
+            else:
+                (damaged/'lib/injected.so').write_text('unverified library\n')
+        executed.unlink(missing_ok=True)
+        result = install(damaged, TEST_CURL_MODE='fail')
+        assert result.returncode != 0 and not executed.exists(), result.stdout + result.stderr
+    executed.unlink(missing_ok=True)
+    forged = base/'nemo-forged-marker'; (forged/'bin').mkdir(parents=True)
+    (forged/'.nemo-speech-install').write_text('0.1.0 linux x86_64 cpu\n')
+    forged_binary = forged/'bin/nemo-speech'
+    forged_binary.write_text('#!/bin/sh\n: > "$TEST_RUNTIME_EXECUTED"\necho "nemo-speech 0.1.0"\n')
+    forged_binary.chmod(0o755)
+    result = install(forged, TEST_CURL_MODE='fail')
+    assert result.returncode != 0 and not executed.exists(), result.stdout + result.stderr
+    print('PASS forged markers, changed runtime bytes, added libraries and unsafe links fail before existing code executes')
 
     # With the driver library present, the build follows the kernel driver:
     # a machine with an NVIDIA GPU switches to the CUDA build, one without
@@ -360,7 +460,7 @@ fi
     # Switching builds keeps the prefix OmaFlow created, so no second receipt.
     assert not receipt.exists()
 
-    executed.unlink()
+    executed.unlink(missing_ok=True)
     wrong_version_script = pinned_to({'cpu': fixture_archive('cpu', '9.9.9')}, 'install-nemo-wrong-version.sh')
     result = install(base/'nemo-runtime-wrong-version', script=wrong_version_script,
                      TEST_RUNTIME_ARCHIVE_CPU=str(base/'runtime-cpu-9.9.9.tar.gz'))
@@ -383,6 +483,46 @@ fi
     result = subprocess.run(['bash','-c',program,'test',str(temporary)], start_new_session=True, timeout=3)
     assert result.returncode == 0 and not temporary.exists()
     print("PASS the NeMo runtime is one exact, bounded, verified release artifact per build, chosen by the NVIDIA driver, with no source fallback")
+
+    # Call the real catalog module without CLI notifications or a desktop session.
+    # Only its checkout lookup and unused daemon callback need adapters here.
+    fallback_home = base/'runtime-fallback-home'
+    unverified = fallback_home/'.local/lib/nemo-speech/bin/nemo-speech'
+    unverified.parent.mkdir(parents=True)
+    unverified.write_text('#!/bin/sh\n: > "$TEST_RUNTIME_EXECUTED"\necho "nemo-speech 0.1.0"\n')
+    unverified.chmod(0o755)
+    fallback_source = base/'runtime-fallback.rs'
+    fallback_source.write_text('''
+mod config { pub use omaflow_core::config::*; }
+mod process { pub use omaflow_platform::process::CommandExt; }
+mod update {
+    pub fn repo_root() -> Option<std::path::PathBuf> {
+        Some(std::path::PathBuf::from(ROOT_PATH))
+    }
+}
+fn send_command_quiet(_: &str) -> bool { false }
+#[path = CATALOG_PATH] mod catalog;
+fn main() {
+    let entry = catalog::find(catalog::Kind::Speech, "nvidia/parakeet-tdt-0.6b-v3").unwrap();
+    assert!(catalog::download(catalog::Kind::Speech, entry, |_, _| {}).is_err());
+}
+'''.replace('ROOT_PATH', json.dumps(str(ROOT)))
+       .replace('CATALOG_PATH', json.dumps(str(ROOT/'src/catalog.rs'))))
+    fallback_runner = base/'runtime-fallback'
+    build = ['rustc', '--edition=2024', '-A', 'dead_code', str(fallback_source),
+             '-L', 'dependency=' + str(ROOT/'target/debug/deps'), '-o', str(fallback_runner)]
+    for name in ['serde', 'serde_json', 'omaflow_core', 'omaflow_platform']:
+        library = max((ROOT/'target/debug/deps').glob('lib' + name + '-*.rlib'),
+                      key=lambda path: path.stat().st_mtime_ns)
+        build += ['--extern', name + '=' + str(library)]
+    result = subprocess.run(build, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    executed.unlink(missing_ok=True)
+    result = subprocess.run([str(fallback_runner)],
+        env=dict(nemo_env, HOME=str(fallback_home), TEST_CURL_MODE='fail'),
+        capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0 and not executed.exists(), result.stdout + result.stderr
+    print('PASS a failed verified runtime installation never falls back to an existing executable')
 
 # The sandboxed daemon can only write a journal folder opened to it: the tool
 # creates the folder, writes the drop-in once, and leaves it alone after.
@@ -413,18 +553,3 @@ assert set_hotkey.label("MOD5 + period") == "AltGr+."
 assert set_hotkey.label(" + ".join(["ISO_Level3_Shift", "Menu"])) == "AltGr+Menu"
 assert set_hotkey.parse_binding("super + mod5 + j") == "SUPER + MOD5 + J"
 print("PASS AltGr bindings and physical keys are named the way Hyprland matches them")
-
-# Notes and reminders are marked delivered before the shell sends them, so a
-# title or body that notify-send took for an option ("- call mom", "-v renew
-# the cert") would be lost for good. Every notify-send in the host ends its
-# options with "--" before the words.
-host = (ROOT / "hosts/omarchy/OmaFlow.qml").read_text()
-calls = re.findall(r'\["notify-send",(.*?)\]', host, flags=re.S)
-assert len(calls) >= 3, calls
-for call in calls:
-    arguments = [part.strip() for part in call.split(",")]
-    assert '"--"' in arguments, call
-    options = arguments[:arguments.index('"--"')]
-    # Only literal flags and their literal values may come before "--".
-    assert all(part.startswith('"') and part.endswith('"') for part in options), call
-print('PASS every notify-send in the shell ends its options before the words')

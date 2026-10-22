@@ -13,10 +13,10 @@ import argparse
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import tempfile
+from ui_privacy_lint import check as check_ui_privacy
 
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
@@ -31,19 +31,7 @@ missing = sorted(path.name for path in (ROOT / "ui").glob("*.qml") if path.name 
 if missing:
     raise SystemExit("Add these to ui/qmldir: " + ", ".join(missing))
 
-# 0. Every editable text item pastes through PasteGuard, and a Controls one
-#    drops Qt's own right-click menu, so the shell never reads the clipboard.
-#    No TextInput or TextField at all: Qt 6.11 and 6.12 read the whole
-#    clipboard for one on every change, so one line is a LineEdit.
-for path in sorted([*(ROOT / "ui").glob("*.qml"), *(ROOT / "hosts").rglob("*.qml")]):
-    source = re.sub(r"//.*$", "", path.read_text(), flags=re.M)
-    if re.search(r"\b(?:TextInput|TextField)\b", source):
-        raise SystemExit(f"{path.relative_to(ROOT)}: use LineEdit, not a TextInput or TextField (see ui/LineEdit.qml)")
-    editors = len(re.findall(r"^\s*(?:\w+\.)?(?:TextArea|TextEdit) \{", source, re.M))
-    controls = len(re.findall(r"^\s*Controls\.TextArea \{", source, re.M))
-    if source.count("PasteGuard {") != editors or source.count("ContextMenu.menu: null") != controls:
-        raise SystemExit(f"{path.relative_to(ROOT)}: give each text field a PasteGuard, and each Controls one "
-                         "ContextMenu.menu: null (see ui/PasteGuard.qml)")
+check_ui_privacy()
 
 # 1. Every screen, rendered.
 result = subprocess.run([str(ROOT / "tools/preview/render.sh"), str(output)], text=True)
@@ -65,6 +53,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-host-") as staging:
     shutil.copy(ROOT / "hosts/omarchy/Job.qml", host)
     shutil.copy(ROOT / "hosts/omarchy/Copies.js", host)
     shutil.copy(ROOT / "hosts/omarchy/Setup.js", host)
+    shutil.copy(ROOT / "hosts/omarchy/Notifications.js", host)
     # Offscreen Qt has no layer shell, so the overlay window becomes an Item;
     # everything inside it is still created and bound.
     source = (ROOT / "hosts/omarchy/OmaFlow.qml").read_text()

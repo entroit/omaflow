@@ -26,13 +26,18 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 cargo build --locked --release
 python3 tools/http_test.py
+python3 tools/download_privacy_test.py
+python3 tools/speech_identity_test.py
 python3 tools/runtime_test.py
+python3 tools/private_storage_test.py
+python3 tools/clipboard_test.py
 python3 tools/platform_test.py
 python3 tools/installation_test.py
 python3 tools/release_artifact_test.py
 python3 tools/release_github_test.py
 python3 tools/scoring_test.py
 python3 tools/copy_lint.py
+python3 tools/ui_privacy_lint.py
 lua tools/hotkey_test.lua
 shellcheck install link-local scripts/preflight.sh scripts/install-nemo.sh scripts/install-release scripts/setup-status scripts/package-release scripts/check-local.sh
 for script in install link-local scripts/preflight.sh scripts/install-nemo.sh scripts/install-release scripts/setup-status scripts/package-release scripts/check-local.sh; do

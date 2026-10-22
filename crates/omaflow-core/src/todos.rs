@@ -12,7 +12,7 @@
 //! by its place among the tasks and its words, so a file edited in another
 //! app since it was read is never changed in the wrong place.
 use crate::date::Date;
-use crate::fsutil::{Made, copy_all, owned_dir, remove_moved, same_folder, write_owned};
+use crate::fsutil::{Made, copy_all, remove_moved, same_folder};
 use crate::journal::MoveError;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -364,7 +364,7 @@ impl TodoList {
     }
 
     fn lines(&self) -> Result<Vec<String>, String> {
-        match fs::read_to_string(self.path()) {
+        match crate::fsutil::read_text_at(&self.folder, self.path()) {
             Ok(text) => Ok(text.lines().map(str::to_string).collect()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(Vec::new()),
             Err(error) => Err(format!("could not read {}: {error}", self.path().display())),
@@ -374,7 +374,7 @@ impl TodoList {
     fn write(&self, lines: &[String]) -> Result<(), String> {
         let mut text = lines.join("\n");
         text.push('\n');
-        write_owned(&self.path(), text.as_bytes())
+        crate::fsutil::write_document_at(&self.folder, &self.path(), text.as_bytes())
     }
 
     fn lock(&self) -> Result<fs::File, String> {
@@ -388,17 +388,8 @@ impl TodoList {
             _ => format!("could not create {}: {error}", self.folder.display()),
         })?;
         let directory = self.folder.join(".omaflow");
-        owned_dir(&directory)?;
         let path = directory.join("todos.lock");
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        file.lock()
-            .map_err(|error| format!("could not lock {}: {error}", path.display()))?;
-        Ok(file)
+        crate::fsutil::lock_at(&self.folder, &path)
     }
 
     pub fn list(&self) -> Result<Vec<Todo>, String> {
@@ -690,7 +681,9 @@ impl TodoList {
             .ok_or("That list is no longer in the file")?;
         lines[at] = format!("## {new_name}");
         self.write(&lines)?;
-        if fs::read_to_string(self.current_path()).is_ok_and(|current| current.trim() == name) {
+        if crate::fsutil::read_text_at(&self.folder, self.current_path())
+            .is_ok_and(|current| current.trim() == name)
+        {
             self.set_current_list(&new_name)?;
         }
         Ok(new_name)
@@ -744,9 +737,8 @@ impl TodoList {
 
     fn save_trash(&self, trash: Trashed) -> Result<(), String> {
         let directory = self.folder.join(".omaflow");
-        owned_dir(&directory)?;
         let record = serde_json::to_vec(&trash).map_err(|error| error.to_string())?;
-        write_owned(&directory.join("todo-trash.json"), &record)
+        crate::fsutil::write_document_at(&self.folder, &directory.join("todo-trash.json"), &record)
     }
 
     /// Takes tasks out of the file. With `undoable`, they wait in the trash
@@ -801,19 +793,20 @@ impl TodoList {
     pub fn restore(&self) -> Result<usize, String> {
         let _lock = self.lock()?;
         self.forget_stale_trash();
-        let trash: Trashed = fs::read(self.trash_path())
+        let trash: Trashed = crate::fsutil::read_document_at(&self.folder, self.trash_path())
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .ok_or("Those to-dos can no longer be brought back")?;
         if let Some((before, after)) = &trash.snapshot {
-            let now = fs::read_to_string(self.path()).unwrap_or_default();
+            let now = crate::fsutil::read_text_at(&self.folder, self.path())
+                .map_err(|error| format!("could not read {}: {error}", self.path().display()))?;
             if &now != after {
                 self.empty_trash();
                 return Err(
                     "The list changed since it was deleted, so it can't be brought back".into(),
                 );
             }
-            write_owned(&self.path(), before.as_bytes())?;
+            crate::fsutil::write_document_at(&self.folder, &self.path(), before.as_bytes())?;
             self.empty_trash();
             return Ok(1);
         }
@@ -832,14 +825,16 @@ impl TodoList {
 
     /// Deletes the last deleted tasks for good.
     pub fn empty_trash(&self) {
-        let _ = fs::remove_file(self.trash_path());
+        let _ = crate::fsutil::remove_file_at(&self.folder, &self.trash_path());
     }
 
     /// Deleted tasks are only kept for Undo; after that they are gone.
     pub fn forget_stale_trash(&self) {
-        let deleted_at = fs::read(self.trash_path())
+        let Ok(bytes) = crate::fsutil::read_document_at(&self.folder, self.trash_path()) else {
+            return;
+        };
+        let deleted_at = serde_json::from_slice::<Trashed>(&bytes)
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<Trashed>(&bytes).ok())
             .map(|trash| trash.deleted_at_ms);
         match deleted_at {
             Some(at) if now_ms().saturating_sub(at) < TRASH_KEEP_MS => {}
@@ -854,7 +849,8 @@ impl TodoList {
     /// Where a new to-do goes when nothing says otherwise: the list last
     /// added to or picked, if it still exists, or the Inbox.
     pub fn current_list(&self) -> String {
-        let name = fs::read_to_string(self.current_path()).unwrap_or_default();
+        let name =
+            crate::fsutil::read_text_at(&self.folder, self.current_path()).unwrap_or_default();
         let name = name.trim();
         if !name.is_empty()
             && self
@@ -868,10 +864,8 @@ impl TodoList {
     }
 
     pub fn set_current_list(&self, name: &str) -> Result<(), String> {
-        let directory = self.folder.join(".omaflow");
         fs::create_dir_all(&self.folder).map_err(|error| error.to_string())?;
-        owned_dir(&directory)?;
-        write_owned(&self.current_path(), name.trim().as_bytes())
+        crate::fsutil::write_document_at(&self.folder, &self.current_path(), name.trim().as_bytes())
     }
 
     fn reminded_path(&self) -> PathBuf {
@@ -895,7 +889,7 @@ impl TodoList {
                 (at <= now && now - at < 24 * 60).then(|| (todo, reminder_key(todo, at)))
             })
             .collect();
-        let mut reminded = self.reminded_keys();
+        let mut reminded = self.reminded_keys()?;
         let due: Vec<Todo> = waiting
             .iter()
             .filter(|(_, key)| !reminded.contains(key))
@@ -911,23 +905,25 @@ impl TodoList {
                 .map(|(_, key)| key.clone()),
         );
         reminded.dedup();
-        owned_dir(&self.folder.join(".omaflow"))?;
         let bytes = serde_json::to_vec(&reminded).map_err(|error| error.to_string())?;
-        write_owned(&self.reminded_path(), &bytes)?;
+        crate::fsutil::write_document_at(&self.folder, &self.reminded_path(), &bytes)?;
         Ok(due)
     }
 
-    fn reminded_keys(&self) -> Vec<String> {
-        fs::read(self.reminded_path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+    fn reminded_keys(&self) -> Result<Vec<String>, String> {
+        let path = self.reminded_path();
+        match crate::fsutil::read_document_at(&self.folder, &path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|_| format!("{} contains invalid reminder metadata", path.display())),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(format!("could not read {}: {error}", path.display())),
+        }
     }
 
     /// The open to-dos whose reminder has gone off and that are still
     /// waiting to be done: Today offers to snooze them.
     pub fn reminded(&self, before: u32) -> Result<Vec<usize>, String> {
-        let keys = self.reminded_keys();
+        let keys = self.reminded_keys()?;
         Ok(self
             .list()?
             .iter()
@@ -968,13 +964,13 @@ impl TodoList {
         let files: Vec<(PathBuf, PathBuf)> = own(self)
             .into_iter()
             .zip(own(&target))
-            .filter(|(from, to)| from.is_file() && to.symlink_metadata().is_err())
+            .filter(|(from, to)| from.symlink_metadata().is_ok() && to.symlink_metadata().is_err())
             .collect();
         let mut made = Made::default();
         let pairs = files
             .iter()
             .map(|(from, to)| (from.as_path(), to.as_path()));
-        if let Err(error) = copy_all(pairs, destination, &mut made) {
+        if let Err(error) = copy_all(pairs, &self.folder, destination, &mut made) {
             made.undo();
             return Err(failed(error));
         }
@@ -982,8 +978,8 @@ impl TodoList {
         // The lock is ours; the folder it is in may hold the journal's too.
         drop(lock);
         let own = self.folder.join(".omaflow");
-        let _ = fs::remove_file(own.join("todos.lock"));
-        let _ = fs::remove_dir(&own);
+        let _ = crate::fsutil::remove_file_at(&self.folder, &own.join("todos.lock"));
+        let _ = crate::fsutil::remove_empty_dir_at(&self.folder, &own);
         Ok(left_behind)
     }
 }
