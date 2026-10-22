@@ -112,12 +112,12 @@ def publish(bundle_path):
         if release is None:
             notes = f"Built and attested from `{commit}`.\n\n" + manifest["summary"]
             notes += "\n\n" + "\n".join("- " + item for item in manifest["changes"])
-            run("gh", "release", "create", tag, "--repo", REPOSITORY, "--verify-tag",
-                "--target", commit, "--draft", "--latest=false", "--title",
-                f"OmaFlow {manifest['version']}", "--notes", notes)
-            release = find_release(tag)
-            if release is None:
-                raise ValueError("The created release draft could not be found.")
+            release = json.loads(run("gh", "api", f"repos/{REPOSITORY}/releases",
+                "--method", "POST", "--input", "-", input=json.dumps({
+                    "tag_name": tag, "target_commitish": commit, "draft": True,
+                    "make_latest": "false", "name": f"OmaFlow {manifest['version']}",
+                    "body": notes,
+                })))
         existing = {asset["name"]: asset for asset in release["assets"]}
         for path in list(assets.iterdir()):
             if path.name not in existing:

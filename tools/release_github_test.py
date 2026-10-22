@@ -83,9 +83,24 @@ if args[:2] == ["attestation", "verify"]:
         assert evidence["sha256"] == hashlib.sha256(Path(args[2]).read_bytes()).hexdigest()
         sys.exit(0)
 if configuration.get("synthetic_verification"):
+    if (args[0] == "api" and "repos/entroit/omaflow/releases" in args
+            and "--method" in args and args[args.index("--method") + 1] == "POST"):
+        assert os.environ.get("GH_TOKEN") == "synthetic-api-token"
+        assert args[args.index("--input") + 1] == "-"
+        payload = json.load(sys.stdin)
+        assert payload["tag_name"] == "commit-" + configuration["sha"]
+        assert payload["target_commitish"] == configuration["sha"]
+        assert payload["draft"] is True and payload["make_latest"] == "false"
+        assert not any(release["tag_name"] == payload["tag_name"] for release in releases)
+        release = {{"tag_name": payload["tag_name"], "draft": True, "assets": [], "newly_created": True}}
+        releases.append(release)
+        state_file.write_text(json.dumps(releases))
+        print(json.dumps(release))
+        sys.exit(0)
     if args == ["api", "--paginate", "--slurp", "repos/entroit/omaflow/releases?per_page=100"]:
         assert os.environ.get("GH_TOKEN") == "synthetic-api-token"
-        print(json.dumps([releases[:1], releases[1:]]))
+        visible = [release for release in releases if not release.get("newly_created")]
+        print(json.dumps([visible[:1], visible[1:]]))
         sys.exit(0)
     if args[0] == "api" and args[1].startswith("repos/entroit/omaflow/releases/tags/"):
         tag = args[1].split("/")[-1]
@@ -98,7 +113,7 @@ if configuration.get("synthetic_verification"):
     if args[:2] == ["release", "create"]:
         assert not any(release["tag_name"] == args[2] for release in releases)
         assert "--draft" in args and "--verify-tag" in args
-        releases.append({{"tag_name": args[2], "draft": True, "assets": []}})
+        releases.append({{"tag_name": args[2], "draft": True, "assets": [], "newly_created": True}})
         state_file.write_text(json.dumps(releases))
         sys.exit(0)
     if args[:2] in (["release", "upload"], ["release", "download"], ["release", "edit"]):
@@ -328,12 +343,14 @@ with tempfile.TemporaryDirectory(prefix="omaflow-release-github-") as directory:
     for name, source in fixture.files.items():
         assert (fixture.storage / name).read_bytes() == source.read_bytes()
     operations = [call[:2] for call in fixture.calls() if call[0] == "release"]
-    assert operations.count(["release", "create"]) == 1
+    assert operations.count(["release", "create"]) == 0
     assert operations.count(["release", "upload"]) == 4
     assert operations[-1] == ["release", "edit"]
-    assert all("--paginate" in call and "--slurp" in call for call in fixture.calls()
-               if call[0] == "api" and "releases?per_page=100" in call[-1])
-    print("PASS synthetic lifecycle publishes a fresh draft only after all evidence is uploaded")
+    listings = [call for call in fixture.calls()
+                if call[0] == "api" and "releases?per_page=100" in call[-1]]
+    assert len(listings) == 1 and "--paginate" in listings[0] and "--slurp" in listings[0]
+    assert sum(call[0] == "api" and "POST" in call for call in fixture.calls()) == 1
+    print("PASS synthetic lifecycle uses the creation response when a new draft is absent from release listings")
 
     fixture = Fixture(base, "partial-draft")
     fixture.publication()
@@ -346,6 +363,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-release-github-") as directory:
     assert {asset["name"] for asset in fixture.published()["assets"]} == set(fixture.files)
     calls = fixture.calls()
     assert not any(call[:2] == ["release", "create"] for call in calls)
+    assert not any(call[0] == "api" and "POST" in call for call in calls)
     uploads = [Path(call[3]).name for call in calls if call[:2] == ["release", "upload"]]
     assert set(uploads) == {"release.json", "release-build.txt"}
     assert sum(call[:2] == ["attestation", "verify"] for call in calls) == 2
@@ -365,6 +383,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-release-github-") as directory:
     calls = fixture.calls()
     assert not any(call[:2] in (["release", "create"], ["release", "upload"], ["release", "edit"])
                    for call in calls)
+    assert not any(call[0] == "api" and "POST" in call for call in calls)
     verified = [Path(call[call.index("--bundle") + 1]) for call in calls
                 if call[:2] == ["attestation", "verify"]]
     assert len(verified) == 2 and verified[0] == bundle and verified[1].parent.name == "retained-bundle"
