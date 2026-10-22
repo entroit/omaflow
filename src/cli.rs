@@ -15,7 +15,34 @@ use std::{
 };
 
 pub fn run() -> ExitCode {
-    let mut args = env::args().skip(1);
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--stdin") {
+        const INPUT_LIMIT: u64 = 4 * 1024 * 1024;
+        let mut input = String::new();
+        let result = std::io::stdin()
+            .take(INPUT_LIMIT + 1)
+            .read_to_string(&mut input)
+            .map_err(|error| format!("could not read the private command: {error}"))
+            .and_then(|_| {
+                if input.len() as u64 > INPUT_LIMIT {
+                    return Err("the private command is too large".to_string());
+                }
+                serde_json::from_str::<Vec<String>>(&input)
+                    .map_err(|_| "the private command is invalid".to_string())
+            });
+        args = match result {
+            Ok(args) if !args.is_empty() => args,
+            Ok(_) => {
+                eprintln!("omaflow: the private command is empty");
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("omaflow: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+    }
+    let mut args = args.into_iter();
     let command = args.next().unwrap_or_else(|| "daemon".into());
     match command.as_str() {
         "daemon" => run_daemon(),

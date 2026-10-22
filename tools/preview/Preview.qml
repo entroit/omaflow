@@ -33,7 +33,8 @@ Window {
     pluginDir: "/home/you/.config/omarchy/plugins/entroit.omaflow"
     nowMs: Fixtures.NOW
     host: QtObject {
-      function spawn(argv, callback) {
+      function spawn(argv, callback, input) {
+        if (argv[0] === "omaflow" && argv[1] === "--stdin") argv = ["omaflow"].concat(JSON.parse(input))
         var reply = ""
         if (argv[1] === "journal") {
           var command = argv[2]

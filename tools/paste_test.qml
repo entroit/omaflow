@@ -29,7 +29,8 @@ Item {
   App {
     id: app
     host: QtObject {
-      function spawn(argv, callback) {
+      function spawn(argv, callback, input) {
+        if (argv[0] === "omaflow" && argv[1] === "--stdin") argv = ["omaflow"].concat(JSON.parse(input))
         root.sent.push(argv.join(" "))
         var reply = argv.indexOf("--primary") >= 0 ? root.primary : root.clipboard
         if (root.hold) root.held = function() { callback(reply, "", 0) }

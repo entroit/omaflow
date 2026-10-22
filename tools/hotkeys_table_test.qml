@@ -24,6 +24,7 @@ Item {
     pluginDir: "/plugin"
     host: QtObject {
       function spawn(argv, callback, input) {
+        if (argv[0] === "omaflow" && argv[1] === "--stdin") argv = ["omaflow"].concat(JSON.parse(input))
         root.spawned.push(argv)
         root.inputs.push(input || "")
         if (callback) Qt.callLater(function() { callback(root.reply, root.replyError, root.replyCode) })
@@ -39,7 +40,7 @@ Item {
   // Its own state, which nothing republishes, so a switched setting stays.
   App {
     id: audioApp
-    host: QtObject { function spawn(argv, callback, input) { root.spawned.push(argv) } }
+    host: QtObject { function spawn(argv, callback, input) { root.spawned.push(argv[0] === "omaflow" && argv[1] === "--stdin" ? ["omaflow"].concat(JSON.parse(input)) : argv) } }
   }
   SettingsAudio { id: audio; y: 2400; width: 660; app: audioApp }
   SettingsOwnModel { id: own; y: 3000; width: 660; app: app }

@@ -100,7 +100,25 @@ ShellRoot {
     bin_dir = stage / "bin"
     bin_dir.mkdir()
     stub = bin_dir / "omaflow"
-    stub.write_text("#!/bin/sh\ncase \"$1 $2\" in\n  'journal day') echo '{\"date\":\"'$3'\",\"title\":\"\",\"file\":\"\",\"exists\":false,\"entries\":[]}';;\n  'journal month') echo '{\"month\":\"'$3'\",\"days\":[]}';;\n  'journal stats') echo '{\"days\":0}';;\n  'journal year-ago') echo null;;\n  'configure models') read -r line; echo \"$* $line\" > \"$XDG_RUNTIME_DIR/configure-stdin\";;\n  'todos list') echo '{\"path\":\"\",\"todos\":[{\"index\":0,\"text\":\"Buy milk\",\"done\":false}]}';;\n  *) true;;\nesac\n")
+    stub.write_text("""#!/usr/bin/python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if args == ["--stdin"]:
+    args = json.load(sys.stdin)
+if args[:2] == ["journal", "day"]:
+    print(json.dumps({"date":args[2], "title":"", "file":"", "exists":False, "entries":[]}))
+elif args[:2] == ["journal", "month"]:
+    print(json.dumps({"month":args[2], "days":[]}))
+elif args[:2] == ["journal", "stats"]:
+    print('{"days":0}')
+elif args[:2] == ["journal", "year-ago"]:
+    print('null')
+elif args[:2] == ["configure", "models"]:
+    Path(os.environ["XDG_RUNTIME_DIR"], "configure-stdin").write_text(" ".join(args) + " " + sys.stdin.readline().strip())
+elif args[:2] == ["todos", "list"]:
+    print('{"path":"","todos":[{"index":0,"text":"Buy milk","done":false}]}')
+""")
     stub.chmod(0o755)
     headless = {key: value for key, value in os.environ.items() if key not in ("WAYLAND_DISPLAY", "DISPLAY")}
     run = subprocess.run(
@@ -162,6 +180,10 @@ paste = subprocess.run(["/usr/lib/qt6/bin/qmltestrunner", "-input", str(ROOT / "
 if paste.returncode != 0:
     raise SystemExit("The paste test failed:\n" + paste.stdout + paste.stderr)
 print("PASS fields paste through omaflow clipboard-text by key, middle button and menu, never through Qt", flush=True)
+
+privacy = subprocess.run(["python3", str(ROOT / "tools/private_transport_test.py")], text=True)
+if privacy.returncode:
+    raise SystemExit("The private UI transport check failed")
 
 # 3. The connection tester's handling of real replies.
 probe = ROOT / "tools/preview/Probe.qml"

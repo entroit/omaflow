@@ -7,7 +7,6 @@ import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
 import "../../ui"
-import "../../ui/Dates.js" as Dates
 import "../../ui/Keys.js" as KeyNames
 import "Copies.js" as Copies
 import "Setup.js" as Setup
@@ -83,7 +82,7 @@ Panel {
         var job = jobComponent.createObject(root, { command: argv, callback: callback, input: input || "" })
         job.running = true
       }
-      function copy(text) { Quickshell.execDetached(["wl-copy", "--", text]) }
+      function copy(text) { spawn(["wl-copy", "--"], null, String(text)) }
       function openInEditor(path) { window.visible = false; Quickshell.execDetached(["omarchy-launch-editor", path]) }
       function openExternally(target) { Quickshell.execDetached(["xdg-open", target]) }
       function hideWindow() { window.visible = false }
@@ -292,14 +291,10 @@ Panel {
     flow.query(["journal", "due"], function(value) {
       if (!value || !value.notes) return
       var day = String(value.date || flow.todayIso())
-      value.notes.forEach(function(note) {
-        var text = String(note.text || "").replace(/\s+/g, " ").trim()
+      value.notes.forEach(function() {
         // "default" is the action Omarchy runs when the notification is clicked.
-        // "--" ends the options: a note such as "- call mom" is text, and
-        // notify-send would otherwise refuse it after it was marked delivered.
         flow.spawn(["notify-send", "-a", "OmaFlow", "-A", "default=Open the journal", "--",
-          "A note you wrote on " + Dates.long(note.written, day),
-          text.length > 120 ? text.slice(0, 119).trim() + "\u2026" : text],
+          "A journal note is ready", "Open OmaFlow to read your note."],
           function(stdout) { if (String(stdout).trim() === "default") root.showWindow("journal/" + day) })
       })
     })
@@ -312,32 +307,16 @@ Panel {
   function deliverReminders() {
     flow.query(["todos", "reminders"], function(value) {
       if (!value || !value.reminders) return
-      var today = flow.todayIso()
-      var now = Dates.momentText(new Date())
       value.reminders.forEach(function(todo) {
-        // Said from the to-do's time, whether the reminder is the default
-        // or one set on this to-do: "In 30 minutes, at 15:00".
-        var minutes = Dates.minutesBetween(now, todo.due + " " + todo.time)
-        var day = Dates.due(todo.due, today)
-        if (["Today", "Tomorrow", "Yesterday"].indexOf(day) >= 0) day = day.toLowerCase()
-        var hours = Math.floor(minutes / 60)
-        var lead = "In " + (hours > 0 ? hours + (hours === 1 ? " hour" : " hours") : "")
-          + (hours > 0 && minutes % 60 > 0 ? " " : "")
-          + (minutes % 60 > 0 ? minutes % 60 + (minutes % 60 === 1 ? " minute" : " minutes") : "")
-        var when = minutes < 0 ? (todo.due === today ? "Was due at " : "Was due " + day + " at ") + todo.time
-          : minutes === 0 ? "Due at " + todo.time
-          : todo.due === today ? lead + ", at " + todo.time
-          : "Due " + day + " at " + todo.time
-        // "--" so a to-do that starts with "-" is shown, not taken as an option.
         flow.spawn(["notify-send", "-a", "OmaFlow", "-u", "critical", "-A", "default=Open", "-A", "done=Done", "--",
-          todo.text, when + (todo.list ? ", in " + todo.list : "")],
+          "A to-do needs your attention", "Open OmaFlow to see your reminder."],
           function(stdout) {
             var answer = String(stdout).trim()
             if (answer === "done") flow.query(["todos", "done", todo.index, todo.text], function(value, error) {
               flow.todosRevision += 1
               // The reminder is gone by now, so a tick that failed says so.
-              if (error) Quickshell.execDetached(["notify-send", "-a", "OmaFlow", "--", "\u201c" + todo.text + "\u201d is still open",
-                error.replace(/\.$/, "") + ". Open the to-dos to tick it."])
+              if (error) Quickshell.execDetached(["notify-send", "-a", "OmaFlow", "--", "A to-do is still open",
+                "Open OmaFlow to try again."])
             })
             // A to-do that reminded you waits in Bubbled up, at the top of Today.
             else if (answer === "default") root.showWindow("todos/today")

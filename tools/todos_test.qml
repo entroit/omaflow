@@ -27,7 +27,8 @@ Item {
     clockOverride: Fixtures.NOW
     nowMs: Fixtures.NOW
     host: QtObject {
-      function spawn(argv, callback) {
+      function spawn(argv, callback, input) {
+        if (argv[0] === "omaflow" && argv[1] === "--stdin") argv = ["omaflow"].concat(JSON.parse(input))
         var args = argv.slice(1)
         root.sent.push(args.join(" "))
         var failed = root.listFails && (args[1] === "new-list" || args[1] === "rename-list")

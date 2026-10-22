@@ -24,7 +24,8 @@ Item {
     nowMs: Fixtures.NOW
     host: QtObject {
       // Replies wait in `pending` until a test answers them.
-      function spawn(argv, callback) {
+      function spawn(argv, callback, input) {
+        if (argv[0] === "omaflow" && argv[1] === "--stdin") argv = ["omaflow"].concat(JSON.parse(input))
         root.sent.push(argv.slice(1).join(" "))
         if (callback) root.pending.push(callback)
       }

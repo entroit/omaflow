@@ -465,6 +465,10 @@ Item {
   // `input` goes to the command's stdin: secrets never go in its arguments,
   // which every local user can read in /proc.
   function spawn(argv, callback, input) {
+    if (argv[0] === "omaflow" && !input) {
+      input = JSON.stringify(argv.slice(1).map(String)) + "\n"
+      argv = ["omaflow", "--stdin"]
+    }
     if (host && host.spawn) host.spawn(argv, callback || function() {}, input || "")
   }
   function command(args) { spawn(["omaflow"].concat(args.map(String))) }

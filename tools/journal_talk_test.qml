@@ -23,7 +23,8 @@ Item {
     clockOverride: Fixtures.NOW
     nowMs: Fixtures.NOW
     host: QtObject {
-      function spawn(argv, callback) {
+      function spawn(argv, callback, input) {
+        if (argv[0] === "omaflow" && argv[1] === "--stdin") argv = ["omaflow"].concat(JSON.parse(input))
         root.sent.push(argv.slice(1).join(" "))
         var reply = argv[1] === "journal" && root.replies[argv[2]] !== undefined ? JSON.stringify(root.replies[argv[2]]) : ""
         callback(reply, "", 0)
