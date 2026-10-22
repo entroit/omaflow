@@ -25,6 +25,7 @@ jobs:
         shell: bash
     env:
       PACKAGE_MODE: ${{ inputs.publish && '--verify' || 'write' }}
+      PYTHONUNBUFFERED: "1"
     steps:
       - name: Install the pinned build environment
         run: |
@@ -62,7 +63,7 @@ jobs:
           runuser -u builder -- python3 tools/http_test.py
           runuser -u builder -- python3 tools/download_privacy_test.py
           runuser -u builder -- python3 tools/speech_identity_test.py
-          runuser -u builder -- python3 tools/private_storage_test.py
+          runuser -u builder -- python3 tools/private_storage_test.py -v
           runuser -u builder -- python3 tools/platform_test.py
           runuser -u builder -- python3 tools/release_artifact_test.py
           runuser -u builder -- python3 tools/release_github_test.py

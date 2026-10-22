@@ -15,6 +15,8 @@ import threading
 import time
 import wave
 
+from namespace_probe import namespace_available
+
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get("OMAFLOW_TEST_BINARY", ROOT / "target/release/omaflow"))
 PCM = b"\x01\x40" * 1600
@@ -305,10 +307,7 @@ if __name__ == "__main__":
         uid_mapping_suite()
     else:
         namespace = ["unshare", "--user", "--map-auto", "--map-root-user", "--"]
-        try:
-            available = subprocess.run(namespace + ["true"], capture_output=True, timeout=5).returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            available = False
+        available = namespace_available(namespace + ["true"])
         suite(available)
         if available:
             subprocess.run(namespace + [sys.executable, __file__, "--uid-mapping"], check=True, timeout=30)

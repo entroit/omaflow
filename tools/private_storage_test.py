@@ -5,12 +5,13 @@ import json
 import os
 from pathlib import Path
 import signal
-import shutil
 import socket
 import subprocess
 import tempfile
 import time
 import unittest
+
+from namespace_probe import namespace_available
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,11 +200,7 @@ class PrivateIpcTests(unittest.TestCase):
     def setUpClass(cls):
         cls.foreign = ["unshare", "--user", "--map-auto", "--map-root-user", "python3", "-c"]
         cls.drop_user = "import os; os.setgid(1); os.setuid(1); "
-        if not shutil.which("unshare"):
-            raise unittest.SkipTest("unshare is required for the different-user IPC checks")
-        probe = subprocess.run(cls.foreign + [cls.drop_user + "print(os.getuid())"],
-                               capture_output=True, text=True)
-        if probe.returncode or probe.stdout.strip() != "1":
+        if not namespace_available(cls.foreign + [cls.drop_user + "assert os.getuid() == 1"]):
             raise unittest.SkipTest("the different-user IPC checks require delegated subordinate UIDs")
 
     def test_daemon_rejects_other_users_even_if_socket_permissions_are_relaxed(self):

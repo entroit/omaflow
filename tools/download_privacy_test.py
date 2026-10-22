@@ -5,13 +5,14 @@ import json
 import os
 from pathlib import Path
 import signal
-import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+
+from namespace_probe import namespace_available
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get("OMAFLOW_TEST_BINARY", ROOT / "target/release/omaflow"))
@@ -177,8 +178,7 @@ def main():
         suite(isolate_notifier=True)
     elif NOTIFIER.exists():
         command = ["unshare", "--user", "--map-root-user", "--mount", "--net", "--pid", "--fork", "--"]
-        available = shutil.which("unshare") and subprocess.run(
-            command + ["true"], capture_output=True).returncode == 0
+        available = namespace_available(command + ["true"])
         if available:
             with tempfile.TemporaryDirectory(prefix="omaflow-download-root-") as root:
                 result = subprocess.run(command + [sys.executable, __file__, "--isolated-notifications", root],
