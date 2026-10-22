@@ -48,6 +48,7 @@ require() {
 }
 
 if ((bundled == 0)); then require cargo 'sudo pacman -S rust'; fi
+if ((bundled)); then require gh 'sudo pacman -S github-cli'; fi
 require python3 'sudo pacman -S python'
 require jq 'sudo pacman -S jq'
 require pw-cat 'sudo pacman -S pipewire-audio'

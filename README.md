@@ -39,7 +39,7 @@ omarchy plugin add https://github.com/entroit/omaflow.git
 ```
 
 Enable it when asked. The OmaFlow window opens by itself on **Finish setup**;
-choose it. It installs the OmaFlow app that came with the plugin and two user
+choose it. It downloads and verifies the OmaFlow app, installs two user
 services, and sets your dictation key to AltGr+Menu. The top bar restarts
 once, and the window opens again to choose a speech model; it downloads there.
 If a system package is missing, the window names it and changes nothing until
@@ -53,6 +53,10 @@ the same. It shows the plan before it changes your system. Neither asks for a
 password, neither downloads a speech model, and you do not need Rust
 or Cargo.
 
+The app is built and signed in [public GitHub Actions](https://github.com/entroit/omaflow/actions/workflows/release-binary.yml).
+Setup verifies the exact release's checksum and signed source identity before
+running it. This needs the `github-cli` package, but no GitHub account or login.
+
 ## Updates stay inside OmaFlow
 
 OmaFlow checks the official Omarchy plugin marketplace once a day. When the
@@ -62,8 +66,8 @@ Updates and app** shows the release summary and changes. Click **Update and rest
 to install it, or **Later** to be reminded tomorrow.
 
 Omarchy's own `omarchy plugin update` works too. The window then shows
-**Finish updating to** the new version, and one click installs the app that
-came with it and restarts its services.
+**Finish updating to** the new version, and one click downloads and verifies
+that release's app and restarts its services.
 
 An update waits for an active dictation to finish. OmaFlow then switches the
 plugin and daemon together, checks the new service, and restores the previous
@@ -73,8 +77,8 @@ or an unreviewed GitHub release.
 ## Nothing else is downloaded behind your back
 
 No model weights come with the install. **Settings → Advanced → Models** lists every model
-with its size, the hardware it needs and its licence. You pick one, and only
-then does anything download.
+with its size, the hardware it needs and its licence. A model's weights download
+only after you choose it.
 
 The first speech model also brings the speech runtime. A computer with an
 NVIDIA driver gets the CUDA build, which runs on the GPU. Any other computer

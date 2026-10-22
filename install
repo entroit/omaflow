@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # OmaFlow bootstrap. Takes a fresh Omarchy machine to a working app:
-# the bundled app, its services, the hotkey and the bar icon.
+# the verified release, its services, the hotkey and the bar icon.
 #
 # It deliberately installs no models. Weights and the ASR runtime are about
 # 10 GB and used to stand between a fresh clone and the first screen. Which
@@ -187,6 +187,7 @@ want_package pipewire-audio
 want_package wl-clipboard
 want_package git
 want_package curl
+want_package github-cli
 
 hotkey_file="$config_home/hypr/omaflow-hotkey.lua"
 need_hotkey=0
@@ -196,9 +197,7 @@ bindings="$config_home/hypr/bindings.lua"
 need_bindings=0
 if [[ ! -f $bindings ]] || ! grep -q 'require("omaflow")' "$bindings"; then need_bindings=1; fi
 
-# OmaFlow never asks for a password. Omarchy ships every one of these, so
-# this only stops a system where one was removed: before any change, with
-# the command that puts it back.
+# Missing prerequisites stop before installation and show the command to run.
 if ((${#packages[@]})); then
   if ((from_window)); then
     report state=needs-packages missing="${packages[*]}" command="sudo pacman -S --needed ${packages[*]}"
@@ -209,8 +208,7 @@ if ((${#packages[@]})); then
 fi
 if ((from_window && dry_run)); then report state=checked; fi
 
-# The install copies this folder's own release, so a changed folder would
-# stop it partway; say so before anything runs.
+# Check the source snapshot before downloading its verified release.
 folder_changed=0
 if ! "$repo_dir/scripts/install-release" --check-folder; then
   ((dry_run)) || exit 1
@@ -221,7 +219,7 @@ fi
 say 'Plan'
 ((need_hotkey)) && step "Set the dictation key to $(key_label "${hotkey:-ISO_Level3_Shift,Menu}") in $hotkey_file"
 ((need_bindings)) && step "Add require(\"omaflow\") to $bindings"
-step 'Install the bundled OmaFlow app and its services'
+step 'Download and verify the OmaFlow release, then install its services'
 step 'Restart the Omarchy shell and add the OmaFlow icon to the top bar'
 if ((first_install)); then
   step 'Download no models. You choose a speech model in the OmaFlow window afterwards.'

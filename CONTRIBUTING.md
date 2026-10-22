@@ -39,7 +39,7 @@ exist.
 | `hosts/omarchy/` | The Omarchy shell plugin: bar icon, window and overlay, and the only QML that imports Quickshell. |
 | `tools/preview/` | Renders any screen of `ui/` with sample data on plain Qt: `tools/preview/render.sh OUT [MODE…]`. |
 | `scripts/` | Preflight, the release installer, the status file of the window's Finish setup, the NeMo-Speech runtime installer and the local check runner. |
-| `dist/` | The bundled binary, release manifest, user units and desktop entry. |
+| `dist/` | The CI-generated compatibility binary, release manifest, user units and desktop entry. |
 | `integrations/hyprland.lua` | Hotkey adapter; reads the generated shortcut file. |
 | `config/config.toml` | Bundled defaults and the cleanup prompt, embedded in the binary. |
 | `tools/` | Evaluation gates and regression tests. |
@@ -60,37 +60,57 @@ and `git diff --check`. `scripts/check-local.sh --full` adds the model
 evaluation gates, the QML smoke test and `omarchy plugin validate .`; those
 need the cleanup model downloaded and an installed Omarchy shell.
 
-## Verify a release build
+## Publish a release
 
-The [Release binary workflow](.github/workflows/release-binary.yml) runs when
-the bundled executable, release metadata, packaging script, or workflow changes
-on `main`. You can also start it manually:
+Update the package versions, `manifest.json`, and the version and notes in
+`dist/release.json`, then push the source to `main`. Do not build or commit
+production executables locally.
+
+The [Public releases workflow](.github/workflows/release-binary.yml) runs on
+`main` pushes. It builds and tests the source in a pinned Arch environment as
+an unprivileged user. CI commits the generated executable and its metadata for
+older installed updaters, then starts a final run at `commit-<full SHA>`.
+The final run rebuilds that exact commit, requires the compatibility copy to
+match byte for byte, tests, attests, and publishes the executable and its
+signature bundle as GitHub release assets. Both builds are public.
+
+You can retry preparation through Actions or the CLI:
 
 ```bash
 gh workflow run release-binary.yml --ref main --repo entroit/omaflow
 ```
 
-The workflow builds as an unprivileged user from a fresh checkout in a pinned
-Arch Linux image using the October 20, 2026 package archive. It runs
-`scripts/package-release --verify` to require a byte-for-byte match with the
-committed executable and its release metadata, then runs all Rust workspace
-tests. It restores no compiled cache.
-The public run logs record the source commit, tool versions, and binary hashes.
-Each successful run retains the rebuilt executable and comparison log for 90
-days and publishes a signed build attestation.
-
-To verify the committed executable's attestation for your checked-out commit:
+To retry publication, use its existing commit tag:
 
 ```bash
-gh attestation verify dist/bin/x86_64-unknown-linux-gnu/omaflow \
-  --repo entroit/omaflow \
-  --signer-workflow entroit/omaflow/.github/workflows/release-binary.yml \
-  --source-digest "$(git rev-parse HEAD)" \
-  --deny-self-hosted-runners
+gh workflow run release-binary.yml --ref commit-FULL_SHA \
+  --field publish=true --repo entroit/omaflow
 ```
 
-For marketplace review, link the successful run for the exact submitted commit.
-A workflow file or an unsuccessful run does not establish build provenance.
+Existing published assets are verified and reused. Publication never replaces
+an asset with different bytes. A draft becomes public only after all required
+assets are present. The executable, committed release metadata, attestation
+bundle, and build log remain attached to the release.
+
+Installation downloads only the artifact at the checkout's exact commit.
+The installed updater uses the marketplace-approved commit and its own embedded
+verifier. Both verify size, digest, source commit, signer workflow and signature
+before running the executable. Signature verification needs `github-cli`, but
+no GitHub login. Repeat setup rechecks cached bytes and their signature.
+
+To verify a downloaded executable and bundle yourself:
+
+```bash
+gh attestation verify omaflow-x86_64-unknown-linux-gnu \
+  --bundle omaflow-x86_64-unknown-linux-gnu.sigstore.json \
+  --repo entroit/omaflow \
+  --signer-workflow entroit/omaflow/.github/workflows/release-binary.yml \
+  --source-digest FULL_SHA --signer-digest FULL_SHA \
+  --source-ref refs/tags/commit-FULL_SHA --deny-self-hosted-runners
+```
+
+Submit the final CI-generated commit and public release/run links for
+marketplace review. GitHub publication does not grant marketplace approval.
 
 ## Changes that need extra care
 
@@ -103,10 +123,10 @@ A workflow file or an unsuccessful run does not establish build provenance.
   breaking change, and provide an explicit staged migration for that update.
 - **Defaults.** They are embedded in the binary and only fill missing keys, so
   a changed default reaches new installs, not existing personal configs.
-- **Release binary.** Run `scripts/package-release` after the source and version
-  are final, then run `scripts/package-release --verify`. Commit
-  `dist/release.json` and the binary together. The script records the size and
-  SHA-256 digest that both the installer and updater require.
+- **Release binary.** CI runs `scripts/package-release` and commits the generated
+  compatibility copy and its size/SHA-256 together. Production installation uses
+  the matching attested release asset. Keep schema 1 and the compatibility path
+  so older installations can still update.
 
 ## Model gates
 

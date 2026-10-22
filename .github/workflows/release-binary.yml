@@ -1,41 +1,47 @@
-name: Release binary
+name: Public releases
 
 on:
-  workflow_dispatch:
   push:
     branches: [main]
-    paths:
-      - .github/workflows/release-binary.yml
-      - scripts/package-release
-      - dist/release.json
-      - dist/bin/**
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the exact CI-prepared commit tag
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
-  verify:
+  build:
+    if: github.repository == 'entroit/omaflow'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
     container:
       image: archlinux@sha256:dfb01267da058e5d08ffdc543bf484c9b404655b0bac1d0201d972bf950cdfd0
     defaults:
       run:
         shell: bash
+    env:
+      PACKAGE_MODE: ${{ inputs.publish && '--verify' || 'write' }}
     steps:
       - name: Install the pinned build environment
         run: |
           # shellcheck disable=SC2016
           printf 'Server = https://archive.archlinux.org/repos/2026/10/20/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist
-          pacman -Syyuu --noconfirm --needed git rust gcc jq diffutils
+          pacman -Syyuu --noconfirm --needed git rust gcc jq diffutils python github-cli
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - name: Rebuild and compare the bundled executable
+      - name: Check the release source
+        run: |
+          if [[ $PACKAGE_MODE == --verify ]]; then
+            [[ $GITHUB_REF == refs/tags/commit-"$GITHUB_SHA" ]]
+          else
+            [[ $GITHUB_REF == refs/heads/main ]]
+          fi
+      - name: Build the release as an unprivileged user
         run: |
           useradd --create-home builder
           chown -R builder:builder "$GITHUB_WORKSPACE"
@@ -43,25 +49,67 @@ jobs:
             id
             printf 'Source commit: %s\n' "$(git rev-parse HEAD)"
             rustc -Vv
-            pacman -Q rust gcc binutils glibc
+            pacman -Q rust gcc binutils glibc github-cli
             test ! -e target
-            scripts/package-release --verify
+            scripts/package-release "$PACKAGE_MODE"
             sha256sum target/release/omaflow dist/bin/x86_64-unknown-linux-gnu/omaflow
-            printf 'PASS: clean source build matches the committed executable and release metadata.\n'
           BUILD
-      - name: Test the workspace
-        run: runuser -u builder -- cargo test --locked --workspace
-      - name: Attest the rebuilt executable
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
-        with:
-          subject-path: target/release/omaflow
-      - name: Retain the executable and comparison evidence
+      - name: Test the workspace and release boundaries
+        run: |
+          runuser -u builder -- cargo test --locked --workspace
+          runuser -u builder -- python3 tools/release_artifact_test.py
+          runuser -u builder -- python3 tools/release_github_test.py
+      - name: Retain the built release and public log
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: omaflow-${{ github.sha }}
+          name: release-build-${{ github.sha }}-${{ github.run_id }}
           retention-days: 90
           if-no-files-found: error
           path: |
             target/release/omaflow
+            dist/bin/x86_64-unknown-linux-gnu/omaflow
             dist/release.json
             release-build.txt
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-build-${{ github.sha }}-${{ github.run_id }}
+      - name: Check the prepared files
+        env:
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          chmod +x target/release/omaflow dist/bin/x86_64-unknown-linux-gnu/omaflow
+          if [[ $PUBLISH == true ]]; then
+            [[ $GITHUB_REF == refs/tags/commit-"$GITHUB_SHA" ]]
+            git diff --exit-code HEAD -- dist/release.json dist/bin/x86_64-unknown-linux-gnu/omaflow
+          fi
+      - name: Commit the CI compatibility copy and start final publication
+        if: ${{ !inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release-github.py prepare
+      - name: Attest the final source build
+        if: ${{ inputs.publish }}
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: target/release/omaflow
+      - name: Publish the verified executable and evidence
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: python3 scripts/release-github.py publish --bundle "$BUNDLE_PATH"

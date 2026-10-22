@@ -29,6 +29,8 @@ python3 tools/http_test.py
 python3 tools/runtime_test.py
 python3 tools/platform_test.py
 python3 tools/installation_test.py
+python3 tools/release_artifact_test.py
+python3 tools/release_github_test.py
 python3 tools/scoring_test.py
 python3 tools/copy_lint.py
 lua tools/hotkey_test.lua

@@ -37,10 +37,13 @@ fi
 
 mkdir -p "$(dirname "$destination")"
 install -m 755 "$built" "$destination"
-jq -n \
+metadata_tmp="$(mktemp "$repo_dir/dist/.release.XXXXXX")"
+trap 'rm -f -- "$metadata_tmp"' EXIT
+jq \
   --arg version "$version" \
   --arg sha "$sha" \
   --argjson bytes "$bytes" \
-  '{schemaVersion:1,pluginId:"entroit.omaflow",version:$version,summary:"Protect private files when saving to shared folders.",changes:["Fix a temporary-file symlink vulnerability that could overwrite private files during journal saves","Apply the same protected writes to to-dos, history, and settings"],binary:{target:"x86_64-unknown-linux-gnu",path:"dist/bin/x86_64-unknown-linux-gnu/omaflow",bytes:$bytes,sha256:$sha},stateSchemaVersion:4}' \
-  >"$repo_dir/dist/release.json"
+  '.version=$version | .binary.bytes=$bytes | .binary.sha256=$sha' \
+  "$repo_dir/dist/release.json" >"$metadata_tmp"
+mv "$metadata_tmp" "$repo_dir/dist/release.json"
 printf 'Wrote %s (%s bytes, %s).\n' "$destination" "$bytes" "$sha"

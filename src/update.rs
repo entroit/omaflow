@@ -2,6 +2,7 @@
 
 mod installed_release;
 mod notification;
+mod release_artifact;
 mod release_manifest;
 mod store;
 mod update_offer;
@@ -1068,29 +1069,6 @@ fn validate_candidate(stage: &Path, snapshot: &VerifiedSnapshot) -> Result<(), S
     {
         return Err("the staged release does not match the marketplace snapshot".into());
     }
-    let binary = stage.join(&snapshot.binary_path);
-    require_regular_file(stage, Path::new(&snapshot.binary_path))?;
-    let metadata = fs::metadata(&binary)
-        .map_err(|error| format!("could not inspect the release binary: {error}"))?;
-    if metadata.len() != snapshot.binary_bytes || metadata.permissions().mode() & 0o111 == 0 {
-        return Err("the release binary has the wrong size or permissions".into());
-    }
-    if sha256(&binary)? != snapshot.binary_sha256 {
-        return Err("the release binary checksum does not match".into());
-    }
-    let output = Command::new(&binary)
-        .args(["version", "--json"])
-        .bounded_output_for(Duration::from_secs(15))
-        .map_err(|error| format!("could not inspect the release binary: {error}"))?;
-    let version: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|_| "the release binary returned invalid version data".to_string())?;
-    if !output.status.success()
-        || version["pluginId"] != "entroit.omaflow"
-        || version["version"] != snapshot.version
-        || version["target"] != "x86_64-unknown-linux-gnu"
-    {
-        return Err("the release binary identity does not match".into());
-    }
     validate_plugin(stage)
 }
 
@@ -1182,18 +1160,7 @@ fn prepare_release(stage: &Path, snapshot: &VerifiedSnapshot) -> Result<PathBuf,
     fs::create_dir_all(&destination).map_err(|error| error.to_string())?;
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
         .map_err(|error| error.to_string())?;
-    let source = stage.join(&snapshot.binary_path);
-    let temporary = destination.join(format!(".omaflow.{}.tmp", std::process::id()));
-    fs::copy(&source, &temporary)
-        .map_err(|error| format!("could not stage the release binary: {error}"))?;
-    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))
-        .map_err(|error| error.to_string())?;
-    if sha256(&temporary)? != snapshot.binary_sha256 {
-        let _ = fs::remove_file(&temporary);
-        return Err("the copied release binary checksum does not match".into());
-    }
-    sync_file(&temporary)?;
-    fs::rename(temporary, destination.join("omaflow")).map_err(|error| error.to_string())?;
+    release_artifact::acquire(&destination, snapshot)?;
     fs::copy(
         stage.join("dist/release.json"),
         destination.join("release.json"),
@@ -1202,6 +1169,7 @@ fn prepare_release(stage: &Path, snapshot: &VerifiedSnapshot) -> Result<PathBuf,
     fs::write(destination.join("commit"), format!("{}\n", snapshot.commit))
         .map_err(|error| error.to_string())?;
     sync_file(&destination.join("omaflow"))?;
+    sync_file(&destination.join("omaflow.sigstore.json"))?;
     sync_file(&destination.join("release.json"))?;
     sync_file(&destination.join("commit"))?;
     sync_dir(&destination)?;
