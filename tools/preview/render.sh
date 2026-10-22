@@ -29,7 +29,7 @@ if ((${#modes[@]} == 0)); then
     history-failed history-failed-transcribing history-failed-gone overlay-journal-warning overlay-notice-update overlay-notice-update-failed
     history-skipped history-stopped-narrow settings-updates-paused
     history-long history-cleanupoff history-vocab history-firstdownload history-stoppedempty history-clipboard history-update history-update-failed history-restarting
-    settings-basics-stopped settings-updates-folder settings-updates-checking
+    settings-basics-stopped settings-updates-folder settings-updates-checking settings-updates-stale settings-updates-available
     settings-basics-cleanmissing settings-cleanup-cleanmissing settings-cleanup-serverdown settings-privacy-nohist settings-models-own
     settings-privacy-erase settings-ownmodel-whisper settings-hotkeys-window settings-hotkeys-dictate
     overlay-todos-saved-moved overlay-notice-long

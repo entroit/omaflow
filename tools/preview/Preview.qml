@@ -186,6 +186,13 @@ Window {
         // The folder moved off the installed version, and a check under way.
         if (window.mode === "settings-updates-folder") appState.updateOffer = Object.assign({}, appState.updateOffer, { externalCheckoutWarning: "Updates are paused. Review the changes in /home/you/.config/omarchy/plugins/entroit.omaflow with git, then choose Check now. To go back to OmaFlow 0.19.0, run: git -C /home/you/.config/omarchy/plugins/entroit.omaflow checkout 3f9c2a1b7d4e" })
         if (window.mode === "settings-updates-checking") { appState.updateOffer = { checkedAtMs: Fixtures.NOW }; appState.updateChecking = true }
+        if (window.mode === "settings-updates-stale") {
+          appState.runningVersion = "0.21.6"
+          appState.installedVersion = "0.21.6"
+          appState.updateOffer = { checkedAtMs: Fixtures.NOW, target: { commit: "old", version: "0.21.1" } }
+          appState.updateTransaction = { state: "rolled-back", targetCommit: "old", targetVersion: "0.21.1",
+            message: "The update did not finish. Your previous version is still running. The verified release is not a fast-forward update." }
+        }
       }
       // A voice above the threshold, which the room's noise put at -52 dB.
       if (window.mode.indexOf("settings-audio") === 0) appState.applyLevel("0.550 -40.0 1" + " 0.400".repeat(13) + " -52")

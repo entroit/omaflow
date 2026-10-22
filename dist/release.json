@@ -1,12 +1,12 @@
 {
   "schemaVersion": 1,
   "pluginId": "entroit.omaflow",
-  "version": "0.21.6",
-  "summary": "Restore setup and verified local speech connections in sandboxed services.",
+  "version": "0.21.7",
+  "summary": "Discard outdated update offers after installing a newer release.",
   "changes": [
-    "Verify storage ownership before entering the service sandbox",
-    "Authenticate local speech connections outside the service namespace before sending audio",
-    "Require real systemd startup and speech identity tests before publishing releases"
+    "Stop offering older or already installed releases",
+    "Clear obsolete update warnings after installation",
+    "Keep recovery available when an update check fails"
   ],
   "binary": {
     "target": "x86_64-unknown-linux-gnu",

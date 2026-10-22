@@ -229,8 +229,17 @@ Panel {
     path: root.stateHome + "/omaflow/update/installed.json"
     watchChanges: true
     printErrors: false
-    onLoaded: { try { flow.installedVersion = String(JSON.parse(text()).version || "") } catch (error) { flow.installedVersion = "" } }
-    onLoadFailed: flow.installedVersion = ""
+    onLoaded: {
+      try {
+        var receipt = JSON.parse(text())
+        flow.installedVersion = String(receipt.version || "")
+        flow.installedCommit = String(receipt.commit || "")
+      } catch (error) {
+        flow.installedVersion = ""
+        flow.installedCommit = ""
+      }
+    }
+    onLoadFailed: { flow.installedVersion = ""; flow.installedCommit = "" }
     onFileChanged: reload()
   }
   FileView {

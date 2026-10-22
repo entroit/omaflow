@@ -17,6 +17,7 @@ Item {
   property var sent: []
   property var pending: []
   property var shown: []
+  property var updateSent: []
 
   App {
     id: app
@@ -318,7 +319,18 @@ Item {
   }
 
   // The Updates page on its own, fed the states the updater writes.
-  App { id: updatesApp; clockOverride: Fixtures.NOW; nowMs: Fixtures.NOW }
+  App {
+    id: updatesApp
+    clockOverride: Fixtures.NOW
+    nowMs: Fixtures.NOW
+    host: QtObject {
+      property string trustedRunner: "/fixture/trusted-runner"
+      function spawn(argv, callback, input) {
+        root.updateSent.push(argv)
+        if (callback) callback("", "", 0)
+      }
+    }
+  }
   SettingsUpdates { id: updates; y: 720; width: 640; app: updatesApp }
 
   TestCase {
@@ -329,6 +341,9 @@ Item {
       updatesApp.applyState(JSON.stringify(Fixtures.state("settings-updates", Fixtures.NOW)))
       updatesApp.updateOffer = ({})
       updatesApp.updateTransaction = ({})
+      updatesApp.installedVersion = ""
+      updatesApp.installedCommit = ""
+      root.updateSent = []
     }
     function text(content) {
       return root.find(updates, function(item) { return item.hasOwnProperty("text") && String(item.text) === content && !item.hasOwnProperty("kind") })
@@ -342,6 +357,86 @@ Item {
       verify(text("OmaFlow is up to date") !== null)
       var at = new Date(Fixtures.NOW - 60000)
       verify(text("Checked today at " + String(at.getHours()).padStart(2, "0") + ":" + String(at.getMinutes()).padStart(2, "0") + ".") !== null)
+    }
+
+    function test_an_older_cached_offer_and_failure_do_not_offer_a_downgrade() {
+      updatesApp.runningVersion = "0.21.6"
+      updatesApp.installedVersion = "0.21.6"
+      updatesApp.updateOffer = { checkedAtMs: Fixtures.NOW, target: { commit: "old", version: "0.21.1" } }
+      updatesApp.updateTransaction = { state: "rolled-back", targetCommit: "old", targetVersion: "0.21.1",
+        message: "The update did not finish. Your previous version is still running. The verified release is not a fast-forward update." }
+      verify(text("OmaFlow is up to date") !== null)
+      verify(pill("Try again") === null)
+      verify(pill("Update and restart") === null)
+      verify(pill("Later") === null)
+      verify(pill("Check now") !== null)
+      verify(!updatesApp.updateAttention)
+    }
+
+    function test_a_new_install_rechecks_the_cached_offer_immediately() {
+      updatesApp.updateOffer = { checkedAtMs: Fixtures.NOW, target: { commit: "older", version: "0.21.9" } }
+      verify(updatesApp.updateAvailable)
+      updatesApp.installedVersion = "0.21.10"
+      verify(!updatesApp.updateAvailable)
+      verify(!updatesApp.updateAttention)
+      updatesApp.installedVersion = "0.21.9"
+      verify(updatesApp.updateAvailable, "a same-version correction at another commit can still be offered")
+      updatesApp.installedCommit = "older"
+      verify(!updatesApp.updateAvailable, "the installed commit cannot be offered again")
+    }
+
+    function test_a_newer_offer_keeps_its_actions_data() {
+      return [{ tag: "update", button: "Update and restart", command: "request" },
+              { tag: "later", button: "Later", command: "later" }]
+    }
+
+    function test_a_newer_offer_keeps_its_actions(data) {
+      updatesApp.installedVersion = "0.21.6"
+      updatesApp.updateOffer = { checkedAtMs: Fixtures.NOW, target: { commit: "new", version: "0.21.7" } }
+      var button = pill(data.button)
+      verify(button !== null)
+      button.clicked()
+      compare(JSON.stringify(root.updateSent), JSON.stringify([["/fixture/trusted-runner", "update", data.command]]))
+    }
+
+    function test_incomplete_versions_do_not_hide_a_failed_update() {
+      updatesApp.installedVersion = "development"
+      updatesApp.updateOffer = { checkedAtMs: Fixtures.NOW, target: { commit: "new", version: "0.21.7" } }
+      updatesApp.updateTransaction = { state: "rolled-back", targetCommit: "new", targetVersion: "0.21.7" }
+      verify(updatesApp.updateAvailable)
+      verify(updatesApp.updateFailed)
+      updatesApp.installedVersion = "0.21.7"
+      updatesApp.updateTransaction = { state: "rolled-back", targetCommit: "old" }
+      verify(updatesApp.updateFailed)
+    }
+
+    function test_an_active_update_stays_visible_after_installation() {
+      updatesApp.installedVersion = "0.21.7"
+      updatesApp.installedCommit = "new"
+      updatesApp.updateOffer = { checkedAtMs: Fixtures.NOW, target: { commit: "new", version: "0.21.7" } }
+      updatesApp.updateTransaction = { state: "verifying", targetCommit: "new", targetVersion: "0.21.7" }
+      verify(!updatesApp.updateAvailable)
+      verify(updatesApp.updateRunning)
+      verify(updatesApp.updateAttention)
+    }
+
+    function test_recovery_does_not_depend_on_an_update_offer_data() {
+      return [{ tag: "needs-recovery", state: "needs-recovery" },
+              { tag: "interrupted", state: "interrupted" }]
+    }
+
+    function test_recovery_does_not_depend_on_an_update_offer(data) {
+      updatesApp.installedVersion = "0.21.6"
+      updatesApp.updateOffer = { checkedAtMs: Fixtures.NOW, error: "The update check failed." }
+      updatesApp.updateTransaction = { state: data.state, blocksDictation: true, targetCommit: "old", targetVersion: "0.21.1",
+        originalRelease: { version: "0.21.6" }, message: "The update stopped partway through." }
+      verify(updatesApp.updatePausesDictation)
+      verify(updatesApp.updateAttention)
+      var restore = pill("Put back 0.21.6")
+      verify(restore !== null)
+      restore.clicked()
+      compare(root.updateSent.length, 1)
+      compare(JSON.stringify(root.updateSent[0]), JSON.stringify(["/fixture/trusted-runner", "update", "request"]))
     }
 
     function test_a_failed_update_keeps_its_reason_readable() {

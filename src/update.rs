@@ -80,9 +80,7 @@ pub fn status() -> UpdateStatus {
     let checkout_version = repo_root()
         .and_then(|root| checkout_version(&root))
         .unwrap_or_default();
-    let offer: Option<UpdateOffer> = store::read(&store::offer_path(), STATE_LIMIT)
-        .ok()
-        .flatten();
+    let offer = read_offer().ok().flatten();
     let transaction: Option<UpdateTransaction> =
         store::read(&store::transaction_path(), STATE_LIMIT)
             .ok()
@@ -146,18 +144,7 @@ pub fn check() -> Result<UpdateOffer, String> {
         _ => None,
     };
     let (target, error) = match result {
-        Ok(Some(snapshot)) => {
-            let target = match installed.as_ref() {
-                Ok(installed) if installed.commit == snapshot.commit => None,
-                Ok(installed)
-                    if compare_versions(&snapshot.version, &installed.version).is_lt() =>
-                {
-                    None
-                }
-                _ => Some(snapshot),
-            };
-            (target, None)
-        }
+        Ok(Some(snapshot)) => (Some(snapshot), None),
         Ok(None) => (None, None),
         Err(error) => {
             let target = if error == "the marketplace has no verified OmaFlow release" {
@@ -171,13 +158,35 @@ pub fn check() -> Result<UpdateOffer, String> {
     let offer = UpdateOffer {
         schema_version: 1,
         checked_at_ms,
-        target,
+        target: target.filter(|target| {
+            is_update_target(&target.commit, &target.version, installed.as_ref().ok())
+        }),
         error,
         external_checkout_warning,
     };
     store::replace(&store::offer_path(), &offer)?;
     if let Some(target) = &offer.target {
         notify_once(target)?;
+    }
+    Ok(offer)
+}
+
+fn is_update_target(commit: &str, version: &str, installed: Option<&InstalledRelease>) -> bool {
+    installed.is_none_or(|installed| {
+        commit != installed.commit
+            && (release_manifest::validate_version(version).is_err()
+                || !compare_versions(version, &installed.version).is_lt())
+    })
+}
+
+fn read_offer() -> Result<Option<UpdateOffer>, String> {
+    let installed = read_installed().ok();
+    let mut offer: Option<UpdateOffer> = store::read(&store::offer_path(), STATE_LIMIT)?;
+    if let Some(offer) = &mut offer {
+        offer.target = offer
+            .target
+            .take()
+            .filter(|target| is_update_target(&target.commit, &target.version, installed.as_ref()));
     }
     Ok(offer)
 }
@@ -359,8 +368,7 @@ pub fn refusal(error: &str) -> String {
 
 /// Puts the offered update off until tomorrow; returns its version.
 pub fn later() -> Result<String, String> {
-    let offer: UpdateOffer =
-        store::read(&store::offer_path(), STATE_LIMIT)?.ok_or("no update is available")?;
+    let offer = read_offer()?.ok_or("no update is available")?;
     let target = offer.target.ok_or("no update is available")?;
     let version = target.version;
     store::replace(
@@ -377,12 +385,6 @@ pub fn later() -> Result<String, String> {
 /// Starts the update, or goes on with one already on its way. Returns what
 /// is happening now, as a sentence for a person.
 pub fn request() -> Result<String, String> {
-    let offer: UpdateOffer =
-        store::read(&store::offer_path(), STATE_LIMIT)?.ok_or("check for updates first")?;
-    if offer.error.is_some() {
-        return Err("the last marketplace check failed; check again before updating".into());
-    }
-    let target = offer.target.ok_or("no verified update is available")?;
     set_aside_unreadable_transaction()?;
     // An update already on its way goes on from where it stopped, whatever
     // its install left in the checkout: the runner checks or recovers it. If
@@ -391,28 +393,44 @@ pub fn request() -> Result<String, String> {
     // runner, which brings the previous version back.
     let existing: Option<UpdateTransaction> = store::read(&store::transaction_path(), STATE_LIMIT)?;
     if let Some(existing) = existing.filter(UpdateTransaction::needs_reconciliation) {
-        if existing.is_active()
-            && existing.identity().target_commit != target.commit
-            && current_interruption(&existing).is_none()
-        {
-            return Err("another OmaFlow update is already queued".into());
+        let obsolete = read_installed()
+            .ok()
+            .is_some_and(|installed| pending_update_is_obsolete(&existing, &installed));
+        if !obsolete {
+            start_update_service()?;
+            let identity = existing.identity();
+            let puts_back = matches!(existing, UpdateTransaction::NeedsRecovery(_))
+                || current_interruption(&existing) == Some(Interruption::Partway);
+            return Ok(if puts_back {
+                format!(
+                    "Putting back OmaFlow {}. A notification says when it is done.",
+                    identity.original_release.version
+                )
+            } else {
+                format!(
+                    "Updating to OmaFlow {}. A notification says when it is done.",
+                    identity.target_version
+                )
+            });
         }
-        start_update_service()?;
-        let identity = existing.identity();
-        let puts_back = matches!(existing, UpdateTransaction::NeedsRecovery(_))
-            || current_interruption(&existing) == Some(Interruption::Partway);
-        return Ok(if puts_back {
-            format!(
-                "Putting back OmaFlow {}. A notification says when it is done.",
-                identity.original_release.version
-            )
-        } else {
-            format!(
-                "Updating to OmaFlow {}. A notification says when it is done.",
-                identity.target_version
-            )
-        });
+        if current_interruption(&existing) != Some(Interruption::BeforeInstall) {
+            return Err("no verified update is available".into());
+        }
     }
+    let lock = UpdateLock::acquire()?;
+    let existing: Option<UpdateTransaction> = store::read(&store::transaction_path(), STATE_LIMIT)?;
+    if let Some(existing) = existing.filter(UpdateTransaction::needs_reconciliation)
+        && (interruption(&existing, false, transaction_quiet_time())
+            != Some(Interruption::BeforeInstall)
+            || !retire_obsolete_pending_update(&existing, &lock)?)
+    {
+        return Err("another OmaFlow update is already queued".into());
+    }
+    let offer = read_offer()?.ok_or("check for updates first")?;
+    if offer.error.is_some() {
+        return Err("the last marketplace check failed; check again before updating".into());
+    }
+    let target = offer.target.ok_or("no verified update is available")?;
     if offer.external_checkout_warning.is_some() {
         return Err("the OmaFlow folder changed outside OmaFlow; review it before updating".into());
     }
@@ -421,10 +439,14 @@ pub fn request() -> Result<String, String> {
     require_clean(&root)?;
     let original_commit = head(&root)?;
     let original_release = read_installed()?;
+    if !is_update_target(&target.commit, &target.version, Some(&original_release)) {
+        return Err("no verified update is available".into());
+    }
     validate_retained_release(&original_release)?;
     if original_commit != original_release.commit {
         return Err("the OmaFlow folder does not match the installed verified release".into());
     }
+    require_fast_forward(&root, &original_commit, &target.commit)?;
     let identity = TransactionIdentity {
         schema_version: 1,
         id: format!("{}-{}", now_ms(), &target.commit[..12]),
@@ -439,6 +461,7 @@ pub fn request() -> Result<String, String> {
         &UpdateTransaction::Queued(identity.clone()),
     )?;
     let _ = fs::remove_file(store::deferral_path());
+    drop(lock);
     if let Err(error) = start_update_service() {
         mark_retryable_start_failure(&identity)?;
         return Err(error);
@@ -463,6 +486,14 @@ fn start_update_service() -> Result<(), String> {
 }
 
 fn mark_retryable_start_failure(identity: &TransactionIdentity) -> Result<(), String> {
+    // Another request may have started the runner while this service call failed.
+    let Ok(_lock) = UpdateLock::acquire() else {
+        return Ok(());
+    };
+    let current: Option<UpdateTransaction> = store::read(&store::transaction_path(), STATE_LIMIT)?;
+    if current != Some(UpdateTransaction::Queued(identity.clone())) {
+        return Ok(());
+    }
     store::replace(
         &store::transaction_path(),
         &UpdateTransaction::RolledBack(UpdateFailure {
@@ -475,9 +506,12 @@ fn mark_retryable_start_failure(identity: &TransactionIdentity) -> Result<(), St
 }
 
 pub fn run() -> Result<(), String> {
-    let _lock = UpdateLock::acquire()?;
+    let lock = UpdateLock::acquire()?;
     let transaction: UpdateTransaction =
         store::read(&store::transaction_path(), STATE_LIMIT)?.ok_or("no update is queued")?;
+    if retire_obsolete_pending_update(&transaction, &lock)? {
+        return Ok(());
+    }
     match run_disposition(&transaction) {
         RunDisposition::Terminal => return Ok(()),
         RunDisposition::Recover => {
@@ -523,6 +557,50 @@ fn run_disposition(transaction: &UpdateTransaction) -> RunDisposition {
             RunDisposition::Terminal
         }
     }
+}
+
+fn pending_update_is_obsolete(
+    transaction: &UpdateTransaction,
+    installed: &InstalledRelease,
+) -> bool {
+    let identity = transaction.identity();
+    run_disposition(transaction) == RunDisposition::Update
+        && (identity.original_commit != installed.commit
+            || !is_update_target(
+                &identity.target_commit,
+                &identity.target_version,
+                Some(installed),
+            ))
+}
+
+fn retire_obsolete_pending_update(
+    transaction: &UpdateTransaction,
+    _lock: &UpdateLock,
+) -> Result<bool, String> {
+    if run_disposition(transaction) != RunDisposition::Update {
+        return Ok(false);
+    }
+    let Ok(installed) = read_installed() else {
+        return Ok(false);
+    };
+    if !pending_update_is_obsolete(transaction, &installed) {
+        return Ok(false);
+    }
+    validate_transaction_identity(transaction.identity())?;
+    let root = repo_root().ok_or("could not find the OmaFlow folder")?;
+    require_canonical_checkout(&root)?;
+    require_clean_at(&root, &installed.commit)?;
+    validate_retained_release(&installed)?;
+    let current = fs::canonicalize(install_root().join("current"))
+        .map_err(|error| format!("could not verify the active release link: {error}"))?;
+    let retained = fs::canonicalize(release_root().join(&installed.commit))
+        .map_err(|error| format!("could not verify the installed release directory: {error}"))?;
+    if current != retained {
+        return Err("the active release link does not match the installed receipt".into());
+    }
+    fs::remove_file(store::transaction_path())
+        .map_err(|error| format!("could not retire the obsolete update: {error}"))?;
+    Ok(true)
 }
 
 fn recovery_may_restart_daemon(transaction: &UpdateTransaction) -> bool {
@@ -654,13 +732,16 @@ fn interruption(
     }
 }
 
-fn current_interruption(transaction: &UpdateTransaction) -> Option<Interruption> {
-    let quiet = fs::metadata(store::transaction_path())
+fn transaction_quiet_time() -> Duration {
+    fs::metadata(store::transaction_path())
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| modified.elapsed().ok())
-        .unwrap_or_default();
-    interruption(transaction, store::runner_alive(), quiet)
+        .unwrap_or_default()
+}
+
+fn current_interruption(transaction: &UpdateTransaction) -> Option<Interruption> {
+    interruption(transaction, store::runner_alive(), transaction_quiet_time())
 }
 
 /// The update as the window shows it: the saved transaction, except that a
@@ -671,6 +752,15 @@ pub fn transaction_json() -> Result<serde_json::Value, String> {
     else {
         return Ok(serde_json::json!({}));
     };
+    if matches!(transaction, UpdateTransaction::RolledBack(_))
+        && !is_update_target(
+            &transaction.identity().target_commit,
+            &transaction.identity().target_version,
+            read_installed().ok().as_ref(),
+        )
+    {
+        return Ok(serde_json::json!({}));
+    }
     let mut value = serde_json::to_value(&transaction).map_err(|error| error.to_string())?;
     if let Some(interruption) = current_interruption(&transaction) {
         value["state"] = "interrupted".into();
@@ -957,7 +1047,7 @@ fn notify_failure(paused: bool) {
 }
 
 pub fn reconcile() -> Result<(), String> {
-    let _lock = match UpdateLock::acquire() {
+    let lock = match UpdateLock::acquire() {
         Ok(lock) => lock,
         Err(error) if error == "another OmaFlow update is already running" => return Ok(()),
         Err(error) => return Err(error),
@@ -967,6 +1057,9 @@ pub fn reconcile() -> Result<(), String> {
     let Some(transaction) = transaction.filter(UpdateTransaction::needs_reconciliation) else {
         return Ok(());
     };
+    if retire_obsolete_pending_update(&transaction, &lock)? {
+        return Ok(());
+    }
     let identity = transaction.identity().clone();
     validate_transaction_identity(&identity)?;
     finish_recovery(&identity, "It was interrupted.", false).map(|_| ())
@@ -1672,15 +1765,9 @@ fn command_ok(command: &mut Command, context: &str, timeout: Duration) -> Result
 }
 
 fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
-    fn parts(value: &str) -> [u64; 3] {
-        let mut values = value.split('.').map(|part| part.parse().unwrap_or(0));
-        [
-            values.next().unwrap_or(0),
-            values.next().unwrap_or(0),
-            values.next().unwrap_or(0),
-        ]
-    }
-    parts(left).cmp(&parts(right))
+    left.split('.')
+        .map(|part| (part.len(), part))
+        .cmp(right.split('.').map(|part| (part.len(), part)))
 }
 
 fn now_ms() -> u64 {
@@ -1733,6 +1820,30 @@ mod tests {
         assert!(compare_versions("0.18.0", "0.17.9").is_gt());
         assert!(compare_versions("0.17.0", "0.17.0").is_eq());
         assert!(compare_versions("0.16.0", "0.17.0").is_lt());
+        assert!(compare_versions("0.21.18446744073709551616", "0.21.6").is_gt());
+        assert!(compare_versions("0.21.6", "0.21.18446744073709551616").is_lt());
+        assert!(compare_versions("18446744073709551616.0.0", "1.99.99").is_gt());
+    }
+
+    #[test]
+    fn update_targets_must_differ_from_the_installed_commit_and_not_be_older() {
+        let installed = InstalledRelease {
+            schema_version: 1,
+            commit: "a".repeat(40),
+            version: "0.21.6".into(),
+            binary_sha256: "c".repeat(64),
+            installed_at_ms: 1,
+        };
+        let other = "b".repeat(40);
+        assert!(!is_update_target(&other, "0.21.1", Some(&installed)));
+        assert!(!is_update_target(
+            &installed.commit,
+            "0.21.6",
+            Some(&installed)
+        ));
+        assert!(is_update_target(&other, "0.21.6", Some(&installed)));
+        assert!(is_update_target(&other, "0.22.0", Some(&installed)));
+        assert!(is_update_target(&other, "0.21.1", None));
     }
 
     #[test]

@@ -110,19 +110,23 @@ Item {
   // Set by previews and tests to pin "today"; 0 follows the real clock.
   property double clockOverride: 0
   readonly property var verifiedUpdate: updateOffer.target
+    && !isObsoleteUpdate(updateOffer.target.commit, updateOffer.target.version)
     && !(updateTransaction.state === "succeeded"
       && updateTransaction.targetCommit === updateOffer.target.commit)
     ? updateOffer.target : null
   readonly property bool updateAvailable: verifiedUpdate !== null
   readonly property string updateState: String(updateTransaction.state || "")
   readonly property bool updateRunning: ["queued", "preparing", "waiting-for-idle", "activating", "verifying"].indexOf(updateState) >= 0
-  readonly property bool updateFailed: ["rolled-back", "needs-recovery", "interrupted"].indexOf(updateState) >= 0
+  readonly property bool updateFailed: updatePausesDictation
+    || (["rolled-back", "interrupted"].indexOf(updateState) >= 0
+      && !isObsoleteUpdate(updateTransaction.targetCommit, updateTransaction.targetVersion))
   // A failed update that left OmaFlow half replaced: the daemon refuses new
   // dictation until Try again puts it right.
   readonly property bool updatePausesDictation: updateState === "needs-recovery"
     || (updateState === "interrupted" && updateTransaction.blocksDictation === true)
-  readonly property bool updateActionsAvailable: supportedState && updateAvailable && !updateRunning
-    && !updateOffer.externalCheckoutWarning && !updateOffer.error
+  readonly property bool updateActionsAvailable: supportedState && !updateRunning
+    && ((updatePausesDictation && Boolean(updateTransaction.targetCommit))
+      || (updateAvailable && !updateOffer.externalCheckoutWarning && !updateOffer.error))
   readonly property bool updateDeferred: updateAvailable
     && updateDeferral.commit === verifiedUpdate.commit
     && Number(updateDeferral.untilMs || 0) > nowMs
@@ -141,6 +145,7 @@ Item {
   // The installed release, from its receipt; the running version stands in
   // for a development build, which has none.
   property string installedVersion: ""
+  property string installedCommit: ""
   // The status file the setup writes: state, step, message, command, from.
   property var setupStatus: ({})
   // False once the host sees the setup gone while its file still says running.
@@ -586,6 +591,20 @@ Item {
   function selectModel(kind, id) { command(["model-select", kind, id]) }
   function installModel(kind, id) { command(["model-install", kind, id]) }
   function cancelModel(kind, id) { commandOrSay(["model-cancel", kind, id], "The download could not be stopped. Run omaflow model-cancel " + kind + " " + id + " in a terminal to see why.") }
+  function isObsoleteUpdate(commit, version) {
+    if (installedCommit && commit === installedCommit) return true
+    var current = installedVersion || runningVersion
+    var numericVersion = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
+    if (!numericVersion.test(version || "") || !numericVersion.test(current)) return false
+    var offered = version.split(".")
+    var installed = current.split(".")
+    for (var i = 0; i < offered.length; i++) {
+      if (offered[i].length !== installed[i].length) return offered[i].length < installed[i].length
+      if (offered[i] !== installed[i]) return offered[i] < installed[i]
+    }
+    return false
+  }
+
   function checkForUpdate() {
     if (updateChecking) return
     updateChecking = true
