@@ -37,8 +37,10 @@ jobs:
           persist-credentials: false
       - name: Rebuild and compare the bundled executable
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          {
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- bash -e -o pipefail <<'BUILD' 2>&1 | tee release-build.txt
+            id
             printf 'Source commit: %s\n' "$(git rev-parse HEAD)"
             rustc -Vv
             pacman -Q rust gcc binutils glibc
@@ -46,9 +48,9 @@ jobs:
             scripts/package-release --verify
             sha256sum target/release/omaflow dist/bin/x86_64-unknown-linux-gnu/omaflow
             printf 'PASS: clean source build matches the committed executable and release metadata.\n'
-          } 2>&1 | tee release-build.txt
+          BUILD
       - name: Test the workspace
-        run: cargo test --locked --workspace
+        run: runuser -u builder -- cargo test --locked --workspace
       - name: Attest the rebuilt executable
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:

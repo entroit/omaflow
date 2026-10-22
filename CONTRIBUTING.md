@@ -70,10 +70,11 @@ on `main`. You can also start it manually:
 gh workflow run release-binary.yml --ref main --repo entroit/omaflow
 ```
 
-The workflow builds from a fresh checkout in a pinned Arch Linux image using
-the October 20, 2026 package archive. It runs `scripts/package-release --verify`
-to require a byte-for-byte match with the committed executable and its release
-metadata, then runs all Rust workspace tests. It restores no compiled cache.
+The workflow builds as an unprivileged user from a fresh checkout in a pinned
+Arch Linux image using the October 20, 2026 package archive. It runs
+`scripts/package-release --verify` to require a byte-for-byte match with the
+committed executable and its release metadata, then runs all Rust workspace
+tests. It restores no compiled cache.
 The public run logs record the source commit, tool versions, and binary hashes.
 Each successful run retains the rebuilt executable and comparison log for 90
 days and publishes a signed build attestation.
