@@ -1,0 +1,65 @@
+name: Release binary
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-binary.yml
+      - scripts/package-release
+      - dist/release.json
+      - dist/bin/**
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    container:
+      image: archlinux@sha256:dfb01267da058e5d08ffdc543bf484c9b404655b0bac1d0201d972bf950cdfd0
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install the pinned build environment
+        run: |
+          # shellcheck disable=SC2016
+          printf 'Server = https://archive.archlinux.org/repos/2026/10/20/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist
+          pacman -Syyuu --noconfirm --needed git rust gcc jq diffutils
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Rebuild and compare the bundled executable
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          {
+            printf 'Source commit: %s\n' "$(git rev-parse HEAD)"
+            rustc -Vv
+            pacman -Q rust gcc binutils glibc
+            test ! -e target
+            scripts/package-release --verify
+            sha256sum target/release/omaflow dist/bin/x86_64-unknown-linux-gnu/omaflow
+            printf 'PASS: clean source build matches the committed executable and release metadata.\n'
+          } 2>&1 | tee release-build.txt
+      - name: Test the workspace
+        run: cargo test --locked --workspace
+      - name: Attest the rebuilt executable
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: target/release/omaflow
+      - name: Retain the executable and comparison evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: omaflow-${{ github.sha }}
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            target/release/omaflow
+            dist/release.json
+            release-build.txt

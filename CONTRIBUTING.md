@@ -58,9 +58,38 @@ That runs `cargo fmt --check`, clippy with warnings denied, the Rust tests,
 a release build, the Python and Lua regression suites, shellcheck, `bash -n`
 and `git diff --check`. `scripts/check-local.sh --full` adds the model
 evaluation gates, the QML smoke test and `omarchy plugin validate .`; those
-need the cleanup model downloaded and an installed Omarchy shell. Release
-verification runs on the maintainer machine; this repository does not use
-GitHub Actions.
+need the cleanup model downloaded and an installed Omarchy shell.
+
+## Verify a release build
+
+The [Release binary workflow](.github/workflows/release-binary.yml) runs when
+the bundled executable, release metadata, packaging script, or workflow changes
+on `main`. You can also start it manually:
+
+```bash
+gh workflow run release-binary.yml --ref main --repo entroit/omaflow
+```
+
+The workflow builds from a fresh checkout in a pinned Arch Linux image using
+the October 20, 2026 package archive. It runs `scripts/package-release --verify`
+to require a byte-for-byte match with the committed executable and its release
+metadata, then runs all Rust workspace tests. It restores no compiled cache.
+The public run logs record the source commit, tool versions, and binary hashes.
+Each successful run retains the rebuilt executable and comparison log for 90
+days and publishes a signed build attestation.
+
+To verify the committed executable's attestation for your checked-out commit:
+
+```bash
+gh attestation verify dist/bin/x86_64-unknown-linux-gnu/omaflow \
+  --repo entroit/omaflow \
+  --signer-workflow entroit/omaflow/.github/workflows/release-binary.yml \
+  --source-digest "$(git rev-parse HEAD)" \
+  --deny-self-hosted-runners
+```
+
+For marketplace review, link the successful run for the exact submitted commit.
+A workflow file or an unsuccessful run does not establish build provenance.
 
 ## Changes that need extra care
 
