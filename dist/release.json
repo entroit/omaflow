@@ -6,8 +6,7 @@
   "changes": [
     "Verify the managed speech service before sending recorded audio",
     "Protect model credentials, clipboard text, and shared-folder writes",
-    "Verify installed speech runtimes and prevent concurrent update races",
-    "Add runtime regressions for local service impersonation and private data handling"
+    "Verify installed speech runtimes and prevent concurrent update races"
   ],
   "binary": {
     "target": "x86_64-unknown-linux-gnu",
