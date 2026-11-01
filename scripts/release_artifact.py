@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Acquire a release executable and verify its source-bound attestation."""
+"""Acquire a release executable and verify OmaFlow's signature over it.
+
+CI signs a statement naming the plugin, source commit, version, size and
+SHA-256 of each published executable with OmaFlow's release key. The key's
+private half exists only as a secret of the repository's `release`
+environment; its public half is below. Checking needs only OpenSSL, which
+every Arch system has, so installing and updating need no extra package.
+"""
 
 import argparse
 import hashlib
@@ -13,9 +20,12 @@ import tempfile
 
 
 REPOSITORY = "entroit/omaflow"
-WORKFLOW = f"{REPOSITORY}/.github/workflows/release-binary.yml"
 ASSET = "omaflow-x86_64-unknown-linux-gnu"
-BUNDLE_LIMIT = 4 * 1024 * 1024
+SIGNATURE_BYTES = 64
+PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA3BJ9z5wHojDr5+tEMNI8QRaGblrm2kf/b+8ejCic4sk=
+-----END PUBLIC KEY-----
+"""
 
 
 class ArtifactError(Exception):
@@ -47,7 +57,7 @@ def check_destination(directory):
     info = directory.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ArtifactError("The release directory must be a private directory owned by you.")
-    for name in ("omaflow", "omaflow.sigstore.json"):
+    for name in ("omaflow", "omaflow.sig"):
         try:
             info = (directory / name).lstat()
         except FileNotFoundError:
@@ -86,28 +96,31 @@ def download(url, destination, limit, label):
         raise ArtifactError(f"The release {label} size is invalid.")
 
 
-def verify(binary, bundle, release, scratch):
+def statement(commit, version, size, sha256):
+    """The exact bytes CI signs and every installation checks."""
+    return (f"omaflow-release-v1\nplugin entroit.omaflow\ncommit {commit}\n"
+            f"version {version}\nbytes {size}\nsha256 {sha256}\n").encode()
+
+
+def verify(binary, signature, release, scratch):
     check_bytes(binary, release)
-    if not 0 < bundle.stat().st_size <= BUNDLE_LIMIT:
-        raise ArtifactError("The release attestation size is invalid.")
-    environment = {"PATH": "/usr/bin", "LC_ALL": "C", "GH_PROMPT_DISABLED": "1",
-                   "GH_NO_UPDATE_NOTIFIER": "1", "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
-                   "GH_CONFIG_DIR": str(scratch / "gh"),
-                   "XDG_CACHE_HOME": str(scratch / "cache"), "TMPDIR": str(scratch)}
+    if signature.stat().st_size != SIGNATURE_BYTES:
+        raise ArtifactError("The release signature size is invalid.")
+    key = scratch / "release-key.pem"
+    signed = scratch / "release-statement"
+    key.write_text(PUBLIC_KEY)
+    signed.write_bytes(statement(release.commit, release.version, release.bytes, release.sha256))
     try:
         result = subprocess.run(
-            ["/usr/bin/gh", "attestation", "verify", str(binary), "--bundle", str(bundle),
-             "--repo", REPOSITORY, "--signer-workflow", WORKFLOW,
-             "--signer-digest", release.commit, "--source-digest", release.commit,
-             "--source-ref", f"refs/tags/commit-{release.commit}",
-             "--cert-oidc-issuer", "https://token.actions.githubusercontent.com",
-             "--deny-self-hosted-runners"],
-            env=environment, capture_output=True, timeout=90, check=False,
+            ["/usr/bin/openssl", "pkeyutl", "-verify", "-pubin", "-inkey", str(key),
+             "-rawin", "-in", str(signed), "-sigfile", str(signature)],
+            env={"PATH": "/usr/bin", "LC_ALL": "C"},
+            capture_output=True, timeout=30, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise ArtifactError("Could not verify the release provenance. Install github-cli if it is missing.") from error
+        raise ArtifactError("Could not check the release signature with OpenSSL.") from error
     if result.returncode != 0:
-        raise ArtifactError("The release provenance could not be verified.")
+        raise ArtifactError("The release signature could not be verified.")
     check_bytes(binary, release)
 
 
@@ -115,12 +128,12 @@ def acquire(release):
     directory = release.destination
     check_destination(directory)
     binary = directory / "omaflow"
-    bundle = directory / "omaflow.sigstore.json"
+    signature = directory / "omaflow.sig"
     with tempfile.TemporaryDirectory(prefix=".artifact-", dir=directory) as temporary:
         scratch = Path(temporary)
-        if binary.exists() and bundle.exists():
+        if binary.exists() and signature.exists():
             try:
-                verify(binary, bundle, release, scratch)
+                verify(binary, signature, release, scratch)
             except (ArtifactError, OSError):
                 pass
             else:
@@ -128,13 +141,13 @@ def acquire(release):
                 return
         base = f"https://github.com/{REPOSITORY}/releases/download/commit-{release.commit}"
         downloaded = scratch / "omaflow"
-        downloaded_bundle = scratch / "omaflow.sigstore.json"
+        downloaded_signature = scratch / "omaflow.sig"
         download(f"{base}/{ASSET}", downloaded, release.bytes, "executable")
         check_bytes(downloaded, release)
-        download(f"{base}/{ASSET}.sigstore.json", downloaded_bundle, BUNDLE_LIMIT, "attestation")
-        verify(downloaded, downloaded_bundle, release, scratch)
+        download(f"{base}/{ASSET}.sig", downloaded_signature, SIGNATURE_BYTES, "signature")
+        verify(downloaded, downloaded_signature, release, scratch)
         downloaded.chmod(0o700)
-        for source, destination in ((downloaded, binary), (downloaded_bundle, bundle)):
+        for source, destination in ((downloaded, binary), (downloaded_signature, signature)):
             with source.open("rb") as file:
                 os.fsync(file.fileno())
             os.replace(source, destination)

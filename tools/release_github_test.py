@@ -5,8 +5,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 
@@ -14,6 +16,17 @@ ROOT = Path(__file__).resolve().parents[1]
 BINARY = "dist/bin/x86_64-unknown-linux-gnu/omaflow"
 GENERATED = {BINARY, "dist/release.json"}
 DATE = "2026-10-01T12:34:56+00:00"
+SIGNATURE = "omaflow-x86_64-unknown-linux-gnu.sig"
+sys.path.insert(0, str(ROOT / "scripts"))
+import release_artifact  # noqa: E402
+
+# A throwaway release key stands in for the one in the `release` environment.
+KEYS = Path(tempfile.mkdtemp(prefix="omaflow-release-keys-"))
+for name in ("key", "other"):
+    subprocess.run(["/usr/bin/openssl", "genpkey", "-algorithm", "ed25519", "-out", str(KEYS / f"{name}.pem")],
+                   check=True, capture_output=True)
+subprocess.run(["/usr/bin/openssl", "pkey", "-in", str(KEYS / "key.pem"), "-pubout", "-out", str(KEYS / "public.pem")],
+               check=True, capture_output=True)
 
 
 def git(directory, *args, **kwargs):
@@ -41,11 +54,15 @@ class Fixture:
         self.storage.mkdir()
         self.cli = self.base / "release-github.py"
         script = (ROOT / "scripts/release-github.py").read_text()
-        isolated_path = 'env={"PATH": "/usr/bin",'
+        isolated_path = 'env={"PATH": "/usr/bin", "GH_CONFIG_DIR"'
         assert script.count(isolated_path) == 1
         script = script.replace(isolated_path,
-                                f'env={{"PATH": {str(self.commands) + ":/usr/bin"!r},')
+                                f'env={{"PATH": {str(self.commands) + ":/usr/bin"!r}, "GH_CONFIG_DIR"')
         self.cli.write_text(script)
+        verifier = (ROOT / "scripts/release_artifact.py").read_text()
+        shipped_key = re.search(r'PUBLIC_KEY = """(.*?)"""', verifier, re.S).group(1)
+        (self.base / "release_artifact.py").write_text(
+            verifier.replace(shipped_key, (KEYS / "public.pem").read_text()))
         gh = self.commands / "gh"
         gh.write_text(f'''#!/usr/bin/python3
 import hashlib
@@ -172,7 +189,8 @@ sys.exit(1)
     def execute(self, mode="prepare", success=True, **environment):
         args = ["/usr/bin/python3", "-I", str(self.cli), mode]
         if mode == "publish":
-            args.extend(["--bundle", str(self.base / "bundle.json")])
+            args.extend(["--bundle", str(self.base / "bundle.json"),
+                         "--signature", str(self.base / "omaflow.sig")])
         result = subprocess.run(args, cwd=self.repo,
                                 env=dict(self.environment, **environment),
                                 capture_output=True, text=True, timeout=15)
@@ -195,8 +213,10 @@ sys.exit(1)
         bundle.write_text(json.dumps({"fixtureOnly": True, "sourceCommit": self.source,
                                       "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
                                       "revision": "original"}))
+        self.sign()
         self.files = {"omaflow-x86_64-unknown-linux-gnu": target,
                       "omaflow-x86_64-unknown-linux-gnu.sigstore.json": bundle,
+                      SIGNATURE: self.base / "omaflow.sig",
                       "release.json": self.repo / "dist/release.json",
                       "release-build.txt": self.repo / "release-build.txt"}
         configuration = json.loads(self.configuration.read_text())
@@ -205,6 +225,17 @@ sys.exit(1)
         self.environment.update(GITHUB_REF=f"refs/tags/commit-{self.source}",
                                 GH_TOKEN="synthetic-api-token")
         self.releases.write_text(json.dumps([{"tag_name": "unrelated", "draft": False, "assets": []}]))
+
+    def sign(self, key="key"):
+        target = self.repo / "target/release/omaflow"
+        metadata = json.loads((self.repo / "dist/release.json").read_text())
+        statement = self.base / "statement"
+        statement.write_bytes(release_artifact.statement(
+            self.source, metadata["version"], target.stat().st_size,
+            hashlib.sha256(target.read_bytes()).hexdigest()))
+        subprocess.run(["/usr/bin/openssl", "pkeyutl", "-sign", "-rawin", "-inkey", str(KEYS / f"{key}.pem"),
+                        "-in", str(statement), "-out", str(self.base / "omaflow.sig")],
+                       check=True, capture_output=True)
 
     def seed_release(self, names, draft):
         release = {"tag_name": f"commit-{self.source}", "draft": draft, "assets": []}
@@ -344,7 +375,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-release-github-") as directory:
         assert (fixture.storage / name).read_bytes() == source.read_bytes()
     operations = [call[:2] for call in fixture.calls() if call[0] == "release"]
     assert operations.count(["release", "create"]) == 0
-    assert operations.count(["release", "upload"]) == 4
+    assert operations.count(["release", "upload"]) == 5
     assert operations[-1] == ["release", "edit"]
     listings = [call for call in fixture.calls()
                 if call[0] == "api" and "releases?per_page=100" in call[-1]]
@@ -365,7 +396,7 @@ with tempfile.TemporaryDirectory(prefix="omaflow-release-github-") as directory:
     assert not any(call[:2] == ["release", "create"] for call in calls)
     assert not any(call[0] == "api" and "POST" in call for call in calls)
     uploads = [Path(call[3]).name for call in calls if call[:2] == ["release", "upload"]]
-    assert set(uploads) == {"release.json", "release-build.txt"}
+    assert set(uploads) == {"release.json", "release-build.txt", SIGNATURE}
     assert sum(call[:2] == ["attestation", "verify"] for call in calls) == 2
     for name, data in retained.items():
         assert (fixture.storage / name).read_bytes() == data
@@ -398,3 +429,47 @@ with tempfile.TemporaryDirectory(prefix="omaflow-release-github-") as directory:
     assert not any(call[:2] in (["release", "create"], ["release", "upload"], ["release", "edit"])
                    for call in fixture.calls())
     print("PASS an invalid retained bundle rejects a published retry even when the new synthetic evidence passes")
+
+    # The release key signs only the exact final build, and only in the job
+    # that holds it; a signature from another key never reaches a release.
+    fixture = Fixture(base, "signing")
+    fixture.publication()
+    expected = (fixture.base / "omaflow.sig").read_bytes()
+    output = fixture.base / "signed-in-ci.sig"
+    key = (KEYS / "key.pem").read_text()
+    signing = ["/usr/bin/python3", "-I", str(fixture.cli), "sign", "--output", str(output)]
+    result = subprocess.run(signing, cwd=fixture.repo, capture_output=True, text=True, timeout=15,
+                            env=dict(fixture.environment, OMAFLOW_RELEASE_SIGNING_KEY=key))
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes() == expected and key not in result.stdout + result.stderr
+    for reason, environment in (("main", {"GITHUB_REF": "refs/heads/main", "OMAFLOW_RELEASE_SIGNING_KEY": key}),
+                                ("no key", {}),
+                                ("wrong key", {"OMAFLOW_RELEASE_SIGNING_KEY": (KEYS / "other.pem").read_text()})):
+        output.unlink(missing_ok=True)
+        result = subprocess.run(signing, cwd=fixture.repo, capture_output=True, text=True, timeout=15,
+                                env=dict(fixture.environment, **environment))
+        assert result.returncode != 0, reason
+        assert key not in result.stdout + result.stderr
+    assert not fixture.calls()
+    print("PASS the release key signs only the exact commit-addressed build, and is never printed")
+
+    fixture.sign("other")
+    result = fixture.execute("publish", success=False)
+    assert "signature could not be verified" in result.stderr
+    fixture.assert_no_publication()
+    print("PASS a signature from another key prevents publication")
+
+    fixture = Fixture(base, "replaced-signature")
+    fixture.publication()
+    fixture.seed_release(fixture.files, draft=False)
+    (fixture.storage / SIGNATURE).write_bytes(b"x" * 64)
+    release = json.loads(fixture.releases.read_text())
+    for asset in release[-1]["assets"]:
+        if asset["name"] == SIGNATURE:
+            asset["digest"] = "sha256:" + hashlib.sha256(b"x" * 64).hexdigest()
+    fixture.releases.write_text(json.dumps(release))
+    result = fixture.execute("publish", success=False)
+    assert "different bytes" in result.stderr
+    print("PASS a published release keeps its signature; a different one is never replaced")
+
+shutil.rmtree(KEYS)

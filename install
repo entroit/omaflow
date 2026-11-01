@@ -187,7 +187,7 @@ want_package pipewire-audio
 want_package wl-clipboard
 want_package git
 want_package curl
-want_package github-cli
+want_package openssl
 
 hotkey_file="$config_home/hypr/omaflow-hotkey.lua"
 need_hotkey=0

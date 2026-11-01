@@ -54,8 +54,8 @@ password, neither downloads a speech model, and you do not need Rust
 or Cargo.
 
 The app is built and signed in [public GitHub Actions](https://github.com/entroit/omaflow/actions/workflows/release-binary.yml).
-Setup verifies the exact release's checksum and signed source identity before
-running it. This needs the `github-cli` package, but no GitHub account or login.
+Setup checks the exact release's checksum and OmaFlow's signature over it
+before running it, with nothing more than the `openssl` every Arch system has.
 
 ## Updates stay inside OmaFlow
 

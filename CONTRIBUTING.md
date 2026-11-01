@@ -88,18 +88,46 @@ gh workflow run release-binary.yml --ref commit-FULL_SHA \
   --field publish=true --repo entroit/omaflow
 ```
 
+The final run also signs the build with OmaFlow's release key. The key's
+private half is a secret of the repository's `release` environment, which only
+`main` and `commit-*` tags can use, so only the publication job sees it. The
+signature covers a statement of the plugin, source commit, version, size and
+SHA-256, built by `statement()` in `scripts/release_artifact.py`, where the
+public half lives. The job checks the signature with that same code before it
+uploads anything.
+
 Existing published assets are verified and reused. Publication never replaces
-an asset with different bytes. A draft becomes public only after all required
-assets are present. The executable, committed release metadata, attestation
+an asset with different bytes; signatures are deterministic, so a retry signs
+the same bytes again. A draft becomes public only after all required assets are
+present. The executable, its signature, committed release metadata, attestation
 bundle, and build log remain attached to the release.
 
 Installation downloads only the artifact at the checkout's exact commit.
 The installed updater uses the marketplace-approved commit and its own embedded
-verifier. Both verify size, digest, source commit, signer workflow and signature
-before running the executable. Signature verification needs `github-cli`, but
-no GitHub login. Repeat setup rechecks cached bytes and their signature.
+copy of the same verifier. Both check the size and digest against the committed
+release metadata and OmaFlow's signature over them with `openssl`, which every
+Arch system has, before running the executable. No GitHub tool or login is
+needed. Repeat setup rechecks cached bytes and their signature. The attestation
+stays for public provenance and for installations from 0.22.0 and earlier,
+whose updaters still check it.
 
-To verify a downloaded executable and bundle yourself:
+An installed updater checks a new release with the public key built into it,
+so the key cannot simply be replaced: installations would reject releases
+signed with a new one. Rotating it first needs the verifier to accept more than
+one key, which it does not yet.
+
+To verify a downloaded executable yourself, write the statement and check it
+with the public key from `scripts/release_artifact.py`:
+
+```bash
+python3 -c 'import sys; sys.path.insert(0, "scripts"); import release_artifact as r
+print(r.PUBLIC_KEY, end="", file=open("key.pem", "w"))
+sys.stdout.buffer.write(r.statement("FULL_SHA", "VERSION", BYTES, "SHA256"))' > statement
+openssl pkeyutl -verify -pubin -inkey key.pem -rawin -in statement \
+  -sigfile omaflow-x86_64-unknown-linux-gnu.sig
+```
+
+Its GitHub attestation can be checked too:
 
 ```bash
 gh attestation verify omaflow-x86_64-unknown-linux-gnu \
@@ -112,6 +140,7 @@ gh attestation verify omaflow-x86_64-unknown-linux-gnu \
 
 Submit the final CI-generated commit and public release/run links for
 marketplace review. GitHub publication does not grant marketplace approval.
+
 ## Changes that need extra care
 
 - **The cleanup prompt** in `config/config.toml`. Run the model gates below

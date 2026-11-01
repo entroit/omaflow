@@ -115,6 +115,9 @@ jobs:
     needs: [build, service-sandbox]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # The release signing key is a secret of this environment, which only
+    # main and commit-* tags may use.
+    environment: release
     permissions:
       contents: write
       actions: write
@@ -147,9 +150,14 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: target/release/omaflow
+      - name: Sign the final source build for installations
+        if: ${{ inputs.publish }}
+        env:
+          OMAFLOW_RELEASE_SIGNING_KEY: ${{ secrets.OMAFLOW_RELEASE_SIGNING_KEY }}
+        run: python3 scripts/release-github.py sign --output "$RUNNER_TEMP/omaflow.sig"
       - name: Publish the verified executable and evidence
         if: ${{ inputs.publish }}
         env:
           GH_TOKEN: ${{ github.token }}
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
-        run: python3 scripts/release-github.py publish --bundle "$BUNDLE_PATH"
+        run: python3 scripts/release-github.py publish --bundle "$BUNDLE_PATH" --signature "$RUNNER_TEMP/omaflow.sig"
