@@ -54,6 +54,7 @@ if ((full)); then
   tools/cleanup_itn_gate.py
   tools/dictation_modes_gate.py
   python3 tools/ui_smoke.py
+  python3 tools/dictation_e2e.py
   # Validate what git publishes, not local agent and editor folders, which
   # hold symlinks the marketplace never sees.
   published="$(mktemp -d)"

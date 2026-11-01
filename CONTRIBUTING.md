@@ -57,8 +57,9 @@ scripts/check-local.sh
 That runs `cargo fmt --check`, clippy with warnings denied, the Rust tests,
 a release build, the Python and Lua regression suites, shellcheck, `bash -n`
 and `git diff --check`. `scripts/check-local.sh --full` adds the model
-evaluation gates, the QML smoke test and `omarchy plugin validate .`; those
-need the cleanup model downloaded and an installed Omarchy shell.
+evaluation gates, the QML smoke test, the dictation check and `omarchy plugin
+validate .`; those need the cleanup model downloaded, an installed Omarchy
+shell and its speech server running.
 
 ## Publish a release
 
@@ -111,6 +112,11 @@ gh attestation verify omaflow-x86_64-unknown-linux-gnu \
 
 Submit the final CI-generated commit and public release/run links for
 marketplace review. GitHub publication does not grant marketplace approval.
+||||||| parent of bd95c3f (WIP: Vulkan runtime, clipboard restore, dictation e2e test)
+evaluation gates, the QML smoke test and `omarchy plugin validate .`; those
+need the cleanup model downloaded and an installed Omarchy shell. Release
+verification runs on the maintainer machine; this repository does not use
+GitHub Actions.
 
 ## Changes that need extra care
 
@@ -159,15 +165,22 @@ repository.
 
 ```bash
 python3 tools/ui_smoke.py --output /tmp/omaflow-ui-review   # 26 rendered views
+python3 tools/dictation_e2e.py                              # speak, transcribe, paste into a terminal
 omarchy plugin validate .
 hyprctl configerrors
 systemctl --user is-active omaflow.service omaflow-asr.service
 scripts/preflight.sh
 ```
 
-The render check catches load errors and layout regressions. It does not prove
-physical key behavior, paste acceptance in a given application or microphone
-quality; those need the real desktop.
+The render check catches load errors and layout regressions. The dictation
+check runs a second daemon from `target/release/omaflow`, with its own config
+and a virtual microphone, plays a recorded sentence into it and waits for the
+text in a foot window it opens, then checks the clipboard came back. It uses
+the speech server already running here (`--endpoint` picks another), prints
+how long the text took after release, and needs the keyboard left alone for
+about fifteen seconds. Neither proves physical key behavior, other
+applications' paste handling or microphone quality; those need the real
+desktop.
 
 ## Commits
 
