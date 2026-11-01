@@ -1,12 +1,12 @@
 {
   "schemaVersion": 1,
   "pluginId": "entroit.omaflow",
-  "version": "0.21.7",
-  "summary": "Discard outdated update offers after installing a newer release.",
+  "version": "0.22.0",
+  "summary": "Run speech on AMD and Intel GPUs, and optionally keep your clipboard after a paste.",
   "changes": [
-    "Stop offering older or already installed releases",
-    "Clear obsolete update warnings after installation",
-    "Keep recovery available when an update check fails"
+    "Use the GPU through Vulkan on computers without an NVIDIA driver",
+    "Update the CPU speech runtime, which transcribes about 1.5 times faster",
+    "Put back what you had copied after a dictation is pasted, if you turn it on"
   ],
   "binary": {
     "target": "x86_64-unknown-linux-gnu",
