@@ -128,6 +128,39 @@ elif args[:2] == ["todos", "list"]:
         raise SystemExit("A secret did not reach the command on stdin: " + repr(received))
     print("PASS Omarchy host loads, shows each place, no QML warnings, and sends secrets on stdin", flush=True)
 
+    # Right after `omarchy plugin add` the app is not installed: the host
+    # starts the setup by itself, once, and not again on the next start.
+    (stage / "shell.qml").write_text('''import QtQuick
+import Quickshell
+import "hosts/omarchy" as Host
+ShellRoot {
+  Host.OmaFlow { id: plugin }
+  Timer { interval: 4500; running: true; onTriggered: Qt.quit() }
+}
+''')
+    fresh = stage / "fresh"
+    (fresh / "runtime").mkdir(parents=True)
+    fresh_bin = fresh / "bin"
+    fresh_bin.mkdir()
+    started = fresh / "systemd-run.log"
+    (fresh_bin / "systemd-run").write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {started}\n")
+    (fresh_bin / "systemctl").write_text("#!/bin/sh\nexit 3\n")
+    for command in fresh_bin.iterdir():
+        command.chmod(0o755)
+    for attempt in range(2):
+        subprocess.run(
+            ["quickshell", "-p", str(stage)],
+            env=dict(headless, QT_QPA_PLATFORM="offscreen", QT_QPA_PLATFORMTHEME="",
+                     XDG_RUNTIME_DIR=str(fresh / "runtime"), XDG_STATE_HOME=str(fresh / "state"),
+                     PATH=f"{fresh_bin}:/usr/bin"),
+            capture_output=True, text=True, timeout=20,
+        )
+        calls = started.read_text().splitlines() if started.exists() else []
+        if len(calls) != 1 or not calls[0].endswith("/install --from-window") \
+                or "--unit=omaflow-setup.service" not in calls[0]:
+            raise SystemExit(f"Start {attempt + 1} of a fresh install ran setup {len(calls)} times: {calls}")
+    print("PASS a fresh install starts its setup by itself, once", flush=True)
+
 # 3. The shortcut recorder, driven by synthetic key presses.
 recorder = subprocess.run(["/usr/lib/qt6/bin/qmltestrunner", "-input", str(ROOT / "tools/key_recorder_test.qml")],
                           env=dict(os.environ, QT_QPA_PLATFORM="offscreen"), capture_output=True, text=True, timeout=30)
