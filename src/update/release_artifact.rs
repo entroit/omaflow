@@ -44,7 +44,7 @@ pub(super) fn acquire(destination: &Path, snapshot: &VerifiedSnapshot) -> Result
 
 fn validate_download(destination: &Path, snapshot: &VerifiedSnapshot) -> Result<(), String> {
     require_regular_file(destination, Path::new("omaflow"))?;
-    require_regular_file(destination, Path::new("omaflow.sigstore.json"))?;
+    require_regular_file(destination, Path::new("omaflow.sig"))?;
     let binary = destination.join("omaflow");
     let metadata = fs::metadata(&binary)
         .map_err(|error| format!("could not inspect the release binary: {error}"))?;
@@ -94,7 +94,7 @@ printf '%s\n' '{"pluginId":"entroit.omaflow","version":"0.21.3","target":"x86_64
         )
         .unwrap();
         fs::set_permissions(directory.join("omaflow"), fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(directory.join("omaflow.sigstore.json"), "{}").unwrap();
+        fs::write(directory.join("omaflow.sig"), [0_u8; 64]).unwrap();
         let snapshot = VerifiedSnapshot {
             commit: "a".repeat(40),
             version: "0.21.3".into(),

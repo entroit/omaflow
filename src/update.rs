@@ -1261,7 +1261,7 @@ fn prepare_release(stage: &Path, snapshot: &VerifiedSnapshot) -> Result<PathBuf,
     fs::write(destination.join("commit"), format!("{}\n", snapshot.commit))
         .map_err(|error| error.to_string())?;
     sync_file(&destination.join("omaflow"))?;
-    sync_file(&destination.join("omaflow.sigstore.json"))?;
+    sync_file(&destination.join("omaflow.sig"))?;
     sync_file(&destination.join("release.json"))?;
     sync_file(&destination.join("commit"))?;
     sync_dir(&destination)?;

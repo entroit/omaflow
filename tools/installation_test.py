@@ -4,15 +4,25 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSET = 'omaflow-x86_64-unknown-linux-gnu'
+sys.path.insert(0, str(ROOT/'scripts'))
+import release_artifact  # noqa: E402
+
+# A throwaway release key stands in for OmaFlow's; fixture releases are
+# signed with it and checked by the real OpenSSL.
+KEYS = Path(tempfile.mkdtemp(prefix='omaflow-install-keys-'))
+subprocess.run(['/usr/bin/openssl', 'genpkey', '-algorithm', 'ed25519', '-out', str(KEYS/'key.pem')], check=True, capture_output=True)
+subprocess.run(['/usr/bin/openssl', 'pkey', '-in', str(KEYS/'key.pem'), '-pubout', '-out', str(KEYS/'public.pem')], check=True, capture_output=True)
 
 
 def commit(repo, message):
@@ -41,6 +51,7 @@ def checkout(repo):
     transport = '''#!/usr/bin/python3
 import json
 from pathlib import Path
+import os
 import re
 import shutil
 import sys
@@ -51,7 +62,7 @@ args = sys.argv[1:]
 with (fixture/'calls.jsonl').open('a') as log:
     log.write(json.dumps({'program': program, 'args': args}) + '\\n')
 if program == 'curl':
-    match = re.fullmatch(r'https://github.com/entroit/omaflow/releases/download/commit-([0-9a-f]{40})/(omaflow-x86_64-unknown-linux-gnu(?:\\.sigstore\\.json)?)', args[-1])
+    match = re.fullmatch(r'https://github.com/entroit/omaflow/releases/download/commit-([0-9a-f]{40})/(omaflow-x86_64-unknown-linux-gnu(?:\\.sig)?)', args[-1])
     assert match, args
     source = fixture/match[1]/match[2]
     destination = Path(args[args.index('--output') + 1])
@@ -59,20 +70,16 @@ if program == 'curl':
     if match[2] == 'omaflow-x86_64-unknown-linux-gnu' and (fixture/'wrong-binary').exists():
         destination.write_bytes(destination.read_bytes()[:-1] + b' ')
 else:
-    assert args[:2] == ['attestation', 'verify'], args
-    bundle = json.loads(Path(args[args.index('--bundle') + 1]).read_text())
-    for flag, expected in [('--repo', 'entroit/omaflow'),
-                           ('--signer-workflow', 'entroit/omaflow/.github/workflows/release-binary.yml'),
-                           ('--source-digest', bundle['commit']), ('--signer-digest', bundle['commit']),
-                           ('--source-ref', 'refs/tags/commit-' + bundle['commit'])]:
-        assert args[args.index(flag) + 1] == expected, args
-    assert '--deny-self-hosted-runners' in args
+    assert args[:3] == ['pkeyutl', '-verify', '-pubin'], args
     if (fixture/'fail-verification').exists():
         sys.exit(1)
+    os.execv('/usr/bin/openssl', ['/usr/bin/openssl', *args])
 '''.replace('FIXTURE_DIRECTORY', repr(str(fixture)))
     helper = repo/'scripts/release_artifact.py'
     contents = helper.read_text()
-    for command in ['curl', 'gh']:
+    shipped_key = re.search(r'PUBLIC_KEY = """(.*?)"""', contents, re.S).group(1)
+    contents = contents.replace(shipped_key, (KEYS/'public.pem').read_text())
+    for command in ['curl', 'openssl']:
         executable = fixture/command
         executable.write_text(transport)
         executable.chmod(0o755)
@@ -95,7 +102,11 @@ def publish_artifact(repo, fixture):
     destination.mkdir()
     release = json.loads((repo/'dist/release.json').read_text())
     shutil.copy2(repo/release['binary']['path'], destination/ASSET)
-    (destination/(ASSET + '.sigstore.json')).write_text(json.dumps({'commit': source}))
+    statement = destination/'statement'
+    statement.write_bytes(release_artifact.statement(source, release['version'], release['binary']['bytes'],
+                                                     release['binary']['sha256']))
+    subprocess.run(['/usr/bin/openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', str(KEYS/'key.pem'),
+                    '-in', str(statement), '-out', str(destination/(ASSET + '.sig'))], check=True, capture_output=True)
 
 
 def artifact_calls(fixture, command):
@@ -107,7 +118,7 @@ def stub_commands(commands):
     """Desktop and system commands that only log what they were asked. TEST_MISSING
     names packages pacman says are not installed; sudo always fails."""
     commands.mkdir()
-    for name in ['cargo','pacman','systemctl','hyprctl','omarchy','omarchy-shell','pw-cat','wl-copy','wl-paste','git','update-desktop-database','ollama','curl','gh','sudo']:
+    for name in ['cargo','pacman','systemctl','hyprctl','omarchy','omarchy-shell','pw-cat','wl-copy','wl-paste','git','update-desktop-database','ollama','curl','sudo']:
         body = f'printf "%s\\n" "{name} $*" >> "$TEST_LOG"\n'
         if name == 'hyprctl': body += '''if [[ $* == '-j binds' ]]; then echo '[]'; fi\n'''
         if name == 'omarchy': body += '''if [[ $* == 'plugin list --json' ]]; then echo '[{"id":"entroit.omaflow","enabled":true}]'; fi\n'''
@@ -146,7 +157,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     helper.write_bytes(helper_bytes + b'\n')
     rejected = subprocess.run([str(release_installer)], env=dict(os.environ, HOME=str(home)), capture_output=True, text=True)
     assert rejected.returncode != 0 and 'differs from HEAD' in rejected.stderr
-    assert not artifact_calls(fixture, 'curl') and not artifact_calls(fixture, 'gh')
+    assert not artifact_calls(fixture, 'curl') and not artifact_calls(fixture, 'openssl')
     helper.write_bytes(helper_bytes)
     subprocess.run(['/usr/bin/git', '-C', str(repo), 'update-index', '--no-skip-worktree', 'scripts/release_artifact.py'], check=True)
     print('PASS production release install rejects linked worktrees, symlinks, and hidden input/verifier drift')
@@ -188,7 +199,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     result = subprocess.run([str(home/'.local/bin/omaflow'), 'serve-asr'], env=env, capture_output=True, timeout=3)
     assert result.returncode == 0 and not result.stdout
     assert len(artifact_calls(fixture, 'curl')) == 2
-    assert len(artifact_calls(fixture, 'gh')) == 2
+    assert len(artifact_calls(fixture, 'openssl')) == 2
     print('PASS app-only install through a checkout symlink fetches one verified release and no speech models')
     with (base/'daemon.log').open('w') as daemon_log:
         daemon = subprocess.Popen([str(repo/'target/release/omaflow'), 'daemon'], env=env, stdout=daemon_log, stderr=daemon_log)
@@ -243,7 +254,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     nemo.write_text('#!/usr/bin/bash\nprintf "%s\\n" "nemo-speech $*" >> "$TEST_LOG"\n'); nemo.chmod(0o755)
     log.write_text('')
     downloads_before = len(artifact_calls(fixture, 'curl'))
-    verifications_before = len(artifact_calls(fixture, 'gh'))
+    verifications_before = len(artifact_calls(fixture, 'openssl'))
     reinstall_output = run('install', '--skip-preflight', '--yes')
     settings = tomllib.loads(personal.read_text())
     # A re-install must not claim the models are ready; only a model the user
@@ -255,7 +266,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-install-') as directory:
     assert 'no model configured yet' not in reinstall_output
     assert not any(word in log.read_text() for word in ['ollama ', 'nemo-speech', 'curl ']), log.read_text()
     assert len(artifact_calls(fixture, 'curl')) == downloads_before
-    assert len(artifact_calls(fixture, 'gh')) == verifications_before + 2
+    assert len(artifact_calls(fixture, 'openssl')) == verifications_before + 2
     print('PASS a re-install re-verifies cached release bytes, downloads nothing twice and preserves settings')
 
     state = home/'.local/state/omaflow'; state.mkdir(parents=True, exist_ok=True)
@@ -342,12 +353,12 @@ with tempfile.TemporaryDirectory(prefix='omaflow-setup-') as directory:
 
     # A missing package stops it before anything changes, with the command.
     untouched = snapshot()
-    missing = setup(TEST_MISSING='jq wl-clipboard github-cli')
+    missing = setup(TEST_MISSING='jq wl-clipboard openssl')
     assert missing.returncode != 0
     assert status()['state'] == 'needs-packages', status()
-    assert status()['command'] == 'sudo pacman -S --needed jq wl-clipboard github-cli', status()
-    assert status()['missing'] == 'jq wl-clipboard github-cli'
-    assert 'sudo pacman -S --needed jq wl-clipboard github-cli' in (runtime/'omaflow-setup.log').read_text()
+    assert status()['command'] == 'sudo pacman -S --needed jq wl-clipboard openssl', status()
+    assert status()['missing'] == 'jq wl-clipboard openssl'
+    assert 'sudo pacman -S --needed jq wl-clipboard openssl' in (runtime/'omaflow-setup.log').read_text()
     assert snapshot() == untouched and not (home/'.local').exists()
     assert not any(line.split()[0] in ('sudo', 'systemctl', 'hyprctl', 'omarchy') for line in log.read_text().splitlines()), log.read_text()
     print('PASS a missing package stops the window setup before any change and names the command')
@@ -389,7 +400,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-setup-') as directory:
     # Run twice, same result: nothing is added, moved or backed up again.
     settled = snapshot()
     downloads_before = len(artifact_calls(fixture, 'curl'))
-    verifications_before = len(artifact_calls(fixture, 'gh'))
+    verifications_before = len(artifact_calls(fixture, 'openssl'))
     again = setup()
     assert again.returncode == 0 and status()['state'] == 'ok', (runtime/'omaflow-setup.log').read_text()
     changed = [path for path in set(settled) | set(snapshot()) if settled.get(path) != snapshot().get(path)]
@@ -397,7 +408,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-setup-') as directory:
     assert changed == [str(home/'.local/state/omaflow/update/installed.json')], changed
     assert not (config/'omarchy/backups').exists()
     assert len(artifact_calls(fixture, 'curl')) == downloads_before
-    assert len(artifact_calls(fixture, 'gh')) == verifications_before + 2
+    assert len(artifact_calls(fixture, 'openssl')) == verifications_before + 2
     print('PASS a second window setup re-verifies provenance without downloading or changing settings')
 
     # A failing step leaves its own words as the reason, not "running".
@@ -438,7 +449,7 @@ with tempfile.TemporaryDirectory(prefix='omaflow-setup-') as directory:
         (fixture/failure).touch()
         rejected = setup()
         assert rejected.returncode != 0 and status()['state'] == 'failed', status()
-        assert ('checksum' if failure == 'wrong-binary' else 'provenance') in status()['message'], status()
+        assert ('checksum' if failure == 'wrong-binary' else 'signature') in status()['message'], status()
         assert not executed.exists(), failure
         assert os.readlink(active) == previous_target
         assert (active/'omaflow').read_bytes() == previous_binary
@@ -453,3 +464,5 @@ with tempfile.TemporaryDirectory(prefix='omaflow-setup-') as directory:
     assert (home/'.local/lib/omaflow/current/omaflow').read_bytes() == compatibility_binary.read_bytes()
     assert json.loads((home/'.local/state/omaflow/update/installed.json').read_text())['version'] == newer
     print('PASS after a plugin update the window setup installs the exact verified release asset')
+
+shutil.rmtree(KEYS, ignore_errors=True)

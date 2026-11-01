@@ -7,7 +7,12 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import release_artifact  # noqa: E402  The installed verifier, so CI checks what users check.
 
 REPOSITORY = "entroit/omaflow"
 WORKFLOW = "release-binary.yml"
@@ -78,6 +83,48 @@ def digest(path):
         return "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def built_release(commit):
+    """The executable CI built, checked against the committed release metadata."""
+    manifest = json.loads(Path("dist/release.json").read_text())
+    binary = Path("target/release/omaflow")
+    if (binary.stat().st_size != manifest["binary"]["bytes"]
+            or digest(binary) != "sha256:" + manifest["binary"]["sha256"]):
+        raise ValueError("The built executable does not match committed release metadata.")
+    release = SimpleNamespace(commit=commit, version=manifest["version"],
+                              bytes=manifest["binary"]["bytes"], sha256=manifest["binary"]["sha256"])
+    return manifest, binary, release
+
+
+def verify_signature(binary, signature, release):
+    with tempfile.TemporaryDirectory(prefix="omaflow-publish-signature-") as scratch:
+        try:
+            release_artifact.verify(binary, signature, release, Path(scratch))
+        except release_artifact.ArtifactError as error:
+            raise ValueError(str(error)) from error
+
+
+def sign(output):
+    """Signs the final build with the release key, which only this step sees."""
+    commit = identity()
+    if os.environ["GITHUB_REF"] != f"refs/tags/commit-{commit}":
+        raise ValueError("Signing requires the exact commit-addressed tag.")
+    key = os.environ.get("OMAFLOW_RELEASE_SIGNING_KEY", "")
+    if "PRIVATE KEY" not in key:
+        raise ValueError("The release signing key is not available to this job.")
+    _, binary, release = built_release(commit)
+    with tempfile.TemporaryDirectory(prefix="omaflow-sign-") as scratch:
+        key_path = Path(scratch) / "key.pem"
+        signed = Path(scratch) / "statement"
+        key_path.touch(mode=0o600)
+        key_path.write_text(key if key.endswith("\n") else key + "\n")
+        signed.write_bytes(release_artifact.statement(
+            release.commit, release.version, release.bytes, release.sha256))
+        run("/usr/bin/openssl", "pkeyutl", "-sign", "-rawin", "-inkey", str(key_path),
+            "-in", str(signed), "-out", str(output), env={"PATH": "/usr/bin", "LC_ALL": "C"})
+    verify_signature(binary, output, release)
+    print(f"Signed {release.version} at {commit}.")
+
+
 def find_release(tag):
     # The tag endpoint omits drafts; authenticated release listings include them.
     pages = json.loads(run("gh", "api", "--paginate", "--slurp",
@@ -88,7 +135,7 @@ def find_release(tag):
     return matches[0] if matches else None
 
 
-def publish(bundle_path):
+def publish(bundle_path, signature_path):
     commit = identity()
     tag = f"commit-{commit}"
     if os.environ["GITHUB_REF"] != f"refs/tags/{tag}":
@@ -96,15 +143,13 @@ def publish(bundle_path):
     reference = api(f"git/ref/tags/{tag}")["object"]
     if reference["type"] != "commit" or reference["sha"] != commit:
         raise ValueError("The release tag does not identify this source commit.")
-    manifest = json.loads(Path("dist/release.json").read_text())
-    binary = Path("target/release/omaflow")
-    if (binary.stat().st_size != manifest["binary"]["bytes"]
-            or digest(binary) != "sha256:" + manifest["binary"]["sha256"]):
-        raise ValueError("The built executable does not match committed release metadata.")
+    manifest, binary, release_identity = built_release(commit)
     verify_bundle(binary, bundle_path, commit)
+    verify_signature(binary, signature_path, release_identity)
     with tempfile.TemporaryDirectory(prefix="omaflow-release-assets-") as directory:
         assets = Path(directory)
         for source, name in [(binary, ASSET), (bundle_path, ASSET + ".sigstore.json"),
+                             (signature_path, ASSET + ".sig"),
                              (Path("dist/release.json"), "release.json"),
                              (Path("release-build.txt"), "release-build.txt")]:
             shutil.copyfile(source, assets / name)
@@ -124,7 +169,7 @@ def publish(bundle_path):
                 if not release["draft"]:
                     raise ValueError("The published release is missing required evidence.")
                 run("gh", "release", "upload", tag, str(path), "--repo", REPOSITORY)
-            elif path.name == ASSET or path.name == "release.json":
+            elif path.name in (ASSET, ASSET + ".sig", "release.json"):
                 if existing[path.name].get("digest") != digest(path):
                     raise ValueError("An existing release asset has different bytes; refusing replacement.")
             elif path.name.endswith(".sigstore.json"):
@@ -141,15 +186,21 @@ def publish(bundle_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["prepare", "publish"])
+    parser.add_argument("mode", choices=["prepare", "sign", "publish"])
     parser.add_argument("--bundle", type=Path)
+    parser.add_argument("--signature", type=Path)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
         if args.mode == "prepare":
             prepare()
-        elif args.bundle is None:
-            parser.error("publish requires --bundle")
+        elif args.mode == "sign":
+            if args.output is None:
+                parser.error("sign requires --output")
+            sign(args.output)
+        elif args.bundle is None or args.signature is None:
+            parser.error("publish requires --bundle and --signature")
         else:
-            publish(args.bundle)
+            publish(args.bundle, args.signature)
     except (ValueError, OSError, KeyError) as error:
         parser.exit(1, f"Release failed: {error}\n")
