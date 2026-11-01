@@ -38,12 +38,12 @@ dictation transcribes in **48.8 ms**, two minutes in **373.6 ms**: 281× and
 omarchy plugin add https://github.com/entroit/omaflow.git
 ```
 
-Enable it when asked. The OmaFlow window opens by itself on **Finish setup**;
-choose it. It downloads and verifies the OmaFlow app, installs two user
-services, and sets your dictation key to AltGr+Menu. The top bar restarts
+Enable it when asked. OmaFlow then finishes setting itself up: the window
+opens and shows it download and verify the OmaFlow app, install two user
+services, and set your dictation key to AltGr+Menu. The top bar restarts
 once, and the window opens again to choose a speech model; it downloads there.
 If a system package is missing, the window names it and changes nothing until
-it is there.
+it is there, and **Finish setup** tries again.
 
 To use another key, choose Change in Settings → Advanced → Hotkeys and press
 it.
