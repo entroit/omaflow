@@ -112,12 +112,6 @@ gh attestation verify omaflow-x86_64-unknown-linux-gnu \
 
 Submit the final CI-generated commit and public release/run links for
 marketplace review. GitHub publication does not grant marketplace approval.
-||||||| parent of bd95c3f (WIP: Vulkan runtime, clipboard restore, dictation e2e test)
-evaluation gates, the QML smoke test and `omarchy plugin validate .`; those
-need the cleanup model downloaded and an installed Omarchy shell. Release
-verification runs on the maintainer machine; this repository does not use
-GitHub Actions.
-
 ## Changes that need extra care
 
 - **The cleanup prompt** in `config/config.toml`. Run the model gates below
