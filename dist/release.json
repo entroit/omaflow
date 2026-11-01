@@ -1,12 +1,11 @@
 {
   "schemaVersion": 1,
   "pluginId": "entroit.omaflow",
-  "version": "0.22.0",
-  "summary": "Run speech on AMD and Intel GPUs, and optionally keep your clipboard after a paste.",
+  "version": "0.22.1",
+  "summary": "Set up by itself after the plugin is added, with no extra package to install.",
   "changes": [
-    "Use the GPU through Vulkan on computers without an NVIDIA driver",
-    "Update the CPU speech runtime, which transcribes about 1.5 times faster",
-    "Put back what you had copied after a dictation is pasted, if you turn it on"
+    "Start setup automatically after omarchy plugin add",
+    "Check releases with OmaFlow's own signature and openssl instead of github-cli"
   ],
   "binary": {
     "target": "x86_64-unknown-linux-gnu",
