@@ -20,7 +20,7 @@ if ((${#modes[@]} == 0)); then
     settings-models settings-ownmodel settings-cleanup settings-hotkeys settings-audio settings-audio-manual settings-updates settings-updates-later settings-updates-failed settings-updates-interrupted settings-updates-finish settings-updates-finish-running
     settings-privacy-audio settings-basics-recording settings-basics-custom settings-basics-light
     settings-models-missing settings-ownmodel-server settings-cleanup-server
-    history-partly history-kept history-tabhint settings-updates-partly settings-models-downloading settings-models-cpu settings-cleanup-light settings-privacy-trim
+    history-partly history-kept history-tabhint settings-updates-partly settings-models-downloading settings-models-cpu settings-models-vulkan settings-cleanup-light settings-privacy-trim
     overlay-holding overlay-locked overlay-processing overlay-success overlay-result overlay-notice
     overlay-error overlay-error-kept overlay-journal overlay-journal-saved overlay-journal-note overlay-todo overlay-todo-menu overlay-todos-saved overlay-todos-saved-editing overlay-todos-saved-menu
     overlay-todo-inbox overlay-todos-saved-inbox overlay-copy-failed overlay-clipboard overlay-warning

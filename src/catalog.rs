@@ -13,7 +13,7 @@ use std::{
     io::{BufReader, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{Mutex, mpsc},
     thread,
     time::Duration,
 };
@@ -327,6 +327,7 @@ pub fn ollama_on_path() -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpeechRuntime {
     Cuda,
+    Vulkan,
     Cpu,
 }
 
@@ -350,6 +351,7 @@ impl SpeechRuntime {
     fn from_marker(text: &str) -> Option<Self> {
         match text.split_whitespace().last()? {
             "cuda" => Some(Self::Cuda),
+            "vulkan" => Some(Self::Vulkan),
             "cpu" => Some(Self::Cpu),
             _ => None,
         }
@@ -358,8 +360,64 @@ impl SpeechRuntime {
     fn as_str(self) -> &'static str {
         match self {
             Self::Cuda => "cuda",
+            Self::Vulkan => "vulkan",
             Self::Cpu => "cpu",
         }
+    }
+}
+
+/// The GPU the installed Vulkan build runs speech on, asked of the build once
+/// per install. None when no GPU answers, so speech has to run on the CPU.
+fn vulkan_gpu() -> Option<String> {
+    static PROBED: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
+    let prefix = speech_runtime_prefix()?;
+    let marker = fs::read_to_string(prefix.join(".nemo-speech-install")).ok()?;
+    let mut probed = PROBED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((seen, gpu)) = probed.as_ref()
+        && *seen == marker
+    {
+        return gpu.clone();
+    }
+    let gpu = Command::new(prefix.join("bin/nemo-speech"))
+        .args(["--quiet", "doctor", "--json"])
+        .bounded_output()
+        .ok()
+        .and_then(|output| gpu_from_doctor(&output.stdout));
+    *probed = Some((marker, gpu.clone()));
+    gpu
+}
+
+/// The device `nemo-speech doctor --json` would run on with `--backend auto`:
+/// the first one listed, when it is a GPU and the GPU answered.
+fn gpu_from_doctor(report: &[u8]) -> Option<String> {
+    let report: Value = serde_json::from_slice(report).ok()?;
+    if report["accelerator_available"] != true {
+        return None;
+    }
+    let first = report["devices"].as_array()?.first()?;
+    if first["type"] == "cpu" {
+        return None;
+    }
+    first["description"].as_str().map(str::to_owned)
+}
+
+/// The device to start the managed speech server on. The Vulkan build stops
+/// rather than fall back to the CPU when no GPU answers, and it does not know
+/// `cuda`, which the window saves for its GPU choice.
+pub fn managed_speech_device(requested: &str) -> String {
+    if SpeechRuntime::here() != SpeechRuntime::Vulkan {
+        return requested.into();
+    }
+    vulkan_device(requested, vulkan_gpu().is_some()).into()
+}
+
+fn vulkan_device(requested: &str, gpu: bool) -> &str {
+    match requested {
+        _ if !gpu => "cpu",
+        "cuda" => "vulkan",
+        other => other,
     }
 }
 
@@ -375,11 +433,17 @@ pub fn to_json(
     installed_speech: &[String],
     installed_cleanup: &[String],
 ) -> Value {
+    let runtime = SpeechRuntime::here();
+    let gpu = match runtime {
+        SpeechRuntime::Vulkan => vulkan_gpu(),
+        _ => None,
+    };
     catalog_json(
         config,
         installed_speech,
         installed_cleanup,
-        SpeechRuntime::here(),
+        runtime,
+        gpu,
         nvidia_gpu_present(),
     )
 }
@@ -389,13 +453,22 @@ fn catalog_json(
     installed_speech: &[String],
     installed_cleanup: &[String],
     runtime: SpeechRuntime,
+    vulkan_gpu: Option<String>,
     nvidia_gpu: bool,
 ) -> Value {
     let selected_cleanup = config.cleanup.model.trim_end_matches(":latest");
+    // A Vulkan build runs speech on the CPU when no GPU answered or the
+    // config asks for the CPU.
+    let vulkan_gpu = vulkan_gpu.filter(|_| config.backend.device != "cpu");
+    let runtime = match (runtime, &vulkan_gpu) {
+        (SpeechRuntime::Vulkan, None) => SpeechRuntime::Cpu,
+        _ => runtime,
+    };
     json!({
         "speech": serialize(SPEECH, installed_speech, config.backend.nemo_model(), runtime),
         "cleanup": serialize(CLEANUP, installed_cleanup, selected_cleanup, runtime),
         "speech_runtime": runtime.as_str(),
+        "speech_gpu": vulkan_gpu.unwrap_or_default(),
         "nvidia_gpu": nvidia_gpu,
     })
 }
@@ -900,6 +973,7 @@ mod tests {
             &[chosen.to_string()],
             &[],
             SpeechRuntime::Cuda,
+            None,
             true,
         );
         let speech = value["speech"].as_array().unwrap();
@@ -922,16 +996,17 @@ mod tests {
             Some(SpeechRuntime::Cuda)
         );
         assert_eq!(
-            SpeechRuntime::from_marker("0.1.0 linux x86_64 vulkan"),
-            None
+            SpeechRuntime::from_marker("0.3.0 linux x86_64 vulkan\n"),
+            Some(SpeechRuntime::Vulkan)
         );
+        assert_eq!(SpeechRuntime::from_marker("0.3.0 linux x86_64 metal"), None);
         assert_eq!(SpeechRuntime::from_marker(""), None);
     }
 
     #[test]
     fn speech_hardware_lines_follow_the_runtime_build() {
         let config = Config::default();
-        let cpu = catalog_json(&config, &[], &[], SpeechRuntime::Cpu, false);
+        let cpu = catalog_json(&config, &[], &[], SpeechRuntime::Cpu, None, false);
         assert_eq!(cpu["speech_runtime"], "cpu");
         assert_eq!(cpu["nvidia_gpu"], false);
         assert_eq!(
@@ -941,7 +1016,7 @@ mod tests {
         assert_eq!(cpu["cleanup"][0]["hardware"], "About 10 GB of GPU memory");
         assert!(cpu["speech"][0].get("cpu_hardware").is_none());
 
-        let cuda = catalog_json(&config, &[], &[], SpeechRuntime::Cuda, true);
+        let cuda = catalog_json(&config, &[], &[], SpeechRuntime::Cuda, None, true);
         assert_eq!(cuda["speech_runtime"], "cuda");
         assert_eq!(cuda["nvidia_gpu"], true);
         assert_eq!(
@@ -950,6 +1025,61 @@ mod tests {
         );
         for entry in SPEECH {
             assert!(entry.cpu_hardware.ends_with("of memory."), "{}", entry.id);
+        }
+
+        let gpu = Some("AMD Radeon 780M (RADV PHOENIX)".to_string());
+        let vulkan = catalog_json(&config, &[], &[], SpeechRuntime::Vulkan, gpu, false);
+        assert_eq!(vulkan["speech_runtime"], "vulkan");
+        assert_eq!(vulkan["speech_gpu"], "AMD Radeon 780M (RADV PHOENIX)");
+        assert_eq!(
+            vulkan["speech"][0]["hardware"],
+            cuda["speech"][0]["hardware"]
+        );
+
+        // A Vulkan build whose GPU did not answer runs on the CPU, and says so.
+        let fallback = catalog_json(&config, &[], &[], SpeechRuntime::Vulkan, None, false);
+        assert_eq!(fallback["speech_runtime"], "cpu");
+        assert_eq!(fallback["speech_gpu"], "");
+        assert_eq!(
+            fallback["speech"][0]["hardware"],
+            cpu["speech"][0]["hardware"]
+        );
+
+        // So does one told to use the CPU.
+        let mut on_cpu = Config::default();
+        on_cpu.backend.device = "cpu".into();
+        let gpu = Some("AMD Radeon 780M (RADV PHOENIX)".to_string());
+        let forced = catalog_json(&on_cpu, &[], &[], SpeechRuntime::Vulkan, gpu, false);
+        assert_eq!(forced["speech_runtime"], "cpu");
+        assert_eq!(forced["speech_gpu"], "");
+    }
+
+    #[test]
+    fn the_vulkan_gpu_is_the_device_doctor_lists_first() {
+        let doctor = |accelerator: bool, devices: &str| {
+            format!(r#"{{"accelerator_available": {accelerator}, "devices": [{devices}]}}"#)
+        };
+        let radeon =
+            r#"{"type": "integrated-gpu", "description": "AMD Radeon 780M (RADV PHOENIX)"}"#;
+        let cpu = r#"{"type": "cpu", "description": "AMD Ryzen 7 7840U"}"#;
+        assert_eq!(
+            gpu_from_doctor(doctor(true, &format!("{radeon}, {cpu}")).as_bytes()).as_deref(),
+            Some("AMD Radeon 780M (RADV PHOENIX)")
+        );
+        // A driver with no GPU behind it lists only the CPU.
+        assert_eq!(gpu_from_doctor(doctor(false, cpu).as_bytes()), None);
+        assert_eq!(gpu_from_doctor(doctor(true, cpu).as_bytes()), None);
+        assert_eq!(gpu_from_doctor(b"nemo-speech: error"), None);
+    }
+
+    #[test]
+    fn the_vulkan_build_starts_on_the_cpu_without_a_gpu_and_never_on_cuda() {
+        assert_eq!(vulkan_device("auto", true), "auto");
+        assert_eq!(vulkan_device("vulkan", true), "vulkan");
+        assert_eq!(vulkan_device("cuda", true), "vulkan");
+        assert_eq!(vulkan_device("cpu", true), "cpu");
+        for requested in ["auto", "vulkan", "cuda", "cpu"] {
+            assert_eq!(vulkan_device(requested, false), "cpu", "{requested}");
         }
     }
 }

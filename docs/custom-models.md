@@ -102,8 +102,11 @@ sent. Linux process and socket information must be available to the client.
 
 `speech_device` accepts `auto`, `cpu`, `cuda`, `vulkan` or `metal`. It selects
 a mode in the runtime you have installed; it does not fetch a different build.
-The managed runtime is the CUDA build on a computer with an NVIDIA driver and
-the CPU build everywhere else, so on the CPU build only `auto` and `cpu` work.
+The managed runtime is the CUDA build on a computer with an NVIDIA driver, the
+Vulkan build on one whose GPU answers through Vulkan, and the CPU build
+everywhere else, so on the CPU build only `auto` and `cpu` work. The Vulkan
+build takes `cuda` to mean its GPU, and starts on the CPU when no GPU answers,
+since it would otherwise refuse to start. Set `cpu` to keep speech off the GPU.
 
 In the window: choose **A model file**, then fill **Model file**,
 **Address**, **Language** and **Device**. There is no **Health address**, **API

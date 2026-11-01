@@ -19,7 +19,7 @@ edit by hand.
 | `~/.local/state/omaflow-install/receipt.json` | Records the speech runtime when OmaFlow installed it, so `./uninstall` knows it may delete it |
 | `$XDG_RUNTIME_DIR/omaflow.sock` and `omaflow-state.json` | Daemon communication and UI state |
 | `$XDG_RUNTIME_DIR/duck-restore` | The output volume replaced by a duck, so a crash cannot leave your speakers turned down |
-| `~/.local/lib/nemo-speech/` | The managed speech runtime, installed by `scripts/install-nemo.sh` with the first speech model you download: the CUDA build when an NVIDIA driver is loaded, the CPU build otherwise. `.nemo-speech-install` in it names the build. Downloading a speech model, or running the script again, switches builds if the driver came or went |
+| `~/.local/lib/nemo-speech/` | The managed speech runtime, installed by `scripts/install-nemo.sh` with the first speech model you download: the CUDA build when an NVIDIA driver is loaded, the Vulkan build when a GPU answers through Vulkan, the CPU build otherwise. `.nemo-speech-install` in it names the build. Downloading a speech model, or running the script again, switches builds if the driver came or went |
 | `~/.cache/nemo-speech/models/` | Managed speech weights |
 | Ollama server storage | Cleanup weights, potentially shared with other applications |
 

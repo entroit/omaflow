@@ -103,7 +103,7 @@ History is empty unless `history_limit` is above zero.
 |---|---|
 | `model-catalog` | Print the built-in catalog as JSON, with an `installed` and a `selected` flag per entry. |
 | `model-select speech\|cleanup ID` | Switch to a catalog model whose weights are already on disk. |
-| `model-install speech\|cleanup ID` | Download a catalog model, then switch to it. Reports progress to the window and the result as a notification. The first managed speech model also installs the NeMo-Speech runtime: the CUDA build when an NVIDIA driver is loaded, the CPU build otherwise. |
+| `model-install speech\|cleanup ID` | Download a catalog model, then switch to it. Reports progress to the window and the result as a notification. The first managed speech model also installs the NeMo-Speech runtime: the CUDA build when an NVIDIA driver is loaded, the Vulkan build when a GPU answers through Vulkan, the CPU build otherwise. |
 | `configure models JSON` | Save speech and cleanup model selections, including a model or server the catalog does not offer. |
 
 Both `model-select` and `model-install` take an id from `model-catalog`; an

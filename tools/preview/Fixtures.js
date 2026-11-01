@@ -207,6 +207,12 @@ function state(mode, now) {
     s.model_catalog = { speech: CATALOG.speech.map(function(e, i) { return Object.assign({}, e, { hardware: cpuTimes[i] }) }),
       cleanup: CATALOG.cleanup, speech_runtime: "cpu", nvidia_gpu: false }
   }
+  // An AMD or Intel GPU: the Vulkan build names the GPU it runs speech on.
+  if (mode === "settings-models-vulkan") {
+    s.gpu_memory_mib = 0
+    s.model_catalog = { speech: CATALOG.speech, cleanup: CATALOG.cleanup, speech_runtime: "vulkan",
+      speech_gpu: "AMD Radeon 780M Graphics (RADV PHOENIX)", nvidia_gpu: false }
+  }
   if (mode === "settings-models-downloading")
     s.model_downloads = { "nvidia/parakeet-ctc-1.1b": { state: "downloading", percent: 62, message: "730 MB of 1.2 GB" } }
   if (mode === "settings-cleanup-light") s.cleanup_level = "light"

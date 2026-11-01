@@ -181,7 +181,15 @@ omarchy() {
     assert json.loads(result.stdout)['cleanup']['model'] == 'alternate-cleanup'
     nemo = base/'.local/lib/nemo-speech/bin/nemo-speech'
     nemo.parent.mkdir(parents=True)
-    nemo.write_text('#!/usr/bin/python3\nimport json,sys; print(json.dumps(sys.argv[1:]))\n')
+    nemo.write_text('''#!/usr/bin/python3
+import json, os, sys
+if 'doctor' in sys.argv:
+    gpu = os.environ.get('TEST_GPU') == '1'
+    devices = [{'type': 'integrated-gpu', 'description': 'Test Radeon'}] if gpu else []
+    print(json.dumps({'accelerator_available': gpu, 'devices': devices + [{'type': 'cpu', 'description': 'Test CPU'}]}))
+else:
+    print(json.dumps(sys.argv[1:]))
+''')
     nemo.chmod(0o755)
     binary = ROOT/'target/release/omaflow'
     result = subprocess.run([str(binary), 'serve-asr'], env=alternate_env, capture_output=True, text=True, timeout=5)
@@ -195,6 +203,16 @@ omarchy() {
     assert arguments[arguments.index('--asr-model')+1] == str(cached)
     assert arguments[arguments.index('--backend')+1] == 'cpu'
     assert arguments[arguments.index('--port')+1] == '18765'
+    # The Vulkan build knows no `cuda`, which the window saves for its GPU
+    # choice, and stops rather than use the CPU when no GPU answers.
+    (nemo.parent.parent/'.nemo-speech-install').write_text('0.3.0 linux x86_64 vulkan\n')
+    alternate.write_text(alternate.read_text().replace('device="cpu"', 'device="cuda"'))
+    for gpu, device in [('1', 'vulkan'), ('0', 'cpu')]:
+        result = subprocess.run([str(binary), 'serve-asr'], env=dict(alternate_env, TEST_GPU=gpu), capture_output=True, text=True, timeout=5)
+        assert result.returncode == 0, result.stderr
+        arguments = json.loads(result.stdout)
+        assert arguments[arguments.index('--backend')+1] == device, (gpu, arguments)
+    (nemo.parent.parent/'.nemo-speech-install').unlink()
     cached.unlink()
     result = subprocess.run([str(binary), 'serve-asr'], env=alternate_env, capture_output=True, text=True, timeout=5)
     assert result.returncode == 78 and not result.stdout, result.stderr
@@ -202,29 +220,44 @@ omarchy() {
     print('PASS the configured model drives the managed server arguments')
 
     nemo_source = (ROOT/'scripts/install-nemo.sh').read_text()
-    runtime_version = re.search(r'runtime_version="([0-9]+\.[0-9]+\.[0-9]+)"', nemo_source).group(1)
-    bytes_table = re.search(r'runtime_bytes=\(([^)]*)\)', nemo_source).group(1)
-    sha256_table = re.search(r'runtime_sha256=\(([^)]*)\)', nemo_source).group(1)
-    runtime_bytes = {name: int(value) for name, value in re.findall(r'\[(\w+)\]=([0-9]+)', bytes_table)}
-    runtime_sha256 = dict(re.findall(r'\[(\w+)\]="([0-9a-f]{64})"', sha256_table))
-    assert runtime_version == '0.1.0'
-    assert runtime_bytes == {'cuda': 107310946, 'cpu': 4583913}
+    def pinned_table(name):
+        table = re.search(name + r'=\(([^)]*)\)', nemo_source).group(1)
+        return dict(re.findall(r'\[(\w+)\]="?([0-9a-f.]+)"?', table))
+    runtime_versions = pinned_table('runtime_versions')
+    runtime_bytes = {name: int(value) for name, value in pinned_table('runtime_bytes').items()}
+    runtime_sha256 = pinned_table('runtime_sha256')
+    assert runtime_versions == {'cuda': '0.1.0', 'vulkan': '0.3.0', 'cpu': '0.3.0'}
+    assert runtime_bytes == {'cuda': 107310946, 'vulkan': 19482397, 'cpu': 9605101}
     assert runtime_sha256 == {
         'cuda': 'e68628f396489c98fb353e070efaea5bc4977409ae7734fce56c251a79e29147',
-        'cpu': '0f74131d631ad2c694cf0ec53490866bb6461147959589a69fb6fc231944065b',
+        'vulkan': '2a8b2ca4610b6ea5d659ba10794526f6e5a77fb1623d52c35272a9fd1f74abac',
+        'cpu': '255f12b722ab15b2a38a51cf125d56e3fa97058b528f7e895b39d6a473deb06e',
     }
     assert 'releases/download/v$runtime_version/$runtime_archive' in nemo_source
     for mutable_path in ['raw/main/', 'scripts/install.sh', 'git clone', '.tar.gz.sha256']:
         assert mutable_path not in nemo_source
 
-    def runtime_root(variant):
-        return f'nemo-speech-{runtime_version}-linux-x86_64-{variant}'
+    def runtime_root(variant, version):
+        return f'nemo-speech-{version}-linux-x86_64-{variant}'
 
+    def url(variant):
+        version = runtime_versions[variant]
+        return f'https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v{version}/{runtime_root(variant, version)}.tar.gz'
+
+    def marker(variant):
+        return f'{runtime_versions[variant]} linux x86_64 {variant}\n'
+
+    # The fixture reports the version it was built with, and its GPU answers
+    # `doctor` only when TEST_ACCELERATOR says so.
     def fixture_archive(variant, reported_version):
-        source = base/f'nemo-fixture-source-{variant}-{reported_version}'/runtime_root(variant)
+        source = base/f'nemo-fixture-source-{variant}-{reported_version}'/runtime_root(variant, runtime_versions[variant])
         (source/'bin').mkdir(parents=True)
         (source/'bin/nemo-speech').write_text(f'''#!/usr/bin/bash
 : > "$TEST_RUNTIME_EXECUTED"
+if [[ $* == *doctor* ]]; then
+  printf '{{"accelerator_available": %s}}\\n' "${{TEST_ACCELERATOR:-false}}"
+  exit 0
+fi
 printf 'nemo-speech {reported_version}\\n'
 ''')
         (source/'bin/nemo-speech').chmod(0o755)
@@ -237,7 +270,7 @@ printf 'nemo-speech {reported_version}\\n'
         (source/'share/nemo-speech/model-index.json').write_text('{"models": []}\n')
         archive_path = base/f'runtime-{variant}-{reported_version}.tar.gz'
         with tarfile.open(archive_path, 'w:gz') as archive:
-            archive.add(source, arcname=runtime_root(variant))
+            archive.add(source, arcname=runtime_root(variant, runtime_versions[variant]))
         return archive_path
 
     def pinned_to(archives, name):
@@ -253,7 +286,7 @@ printf 'nemo-speech {reported_version}\\n'
             files, symlinks = {}, {}
             with tarfile.open(archive_path) as archive:
                 for member in archive.getmembers():
-                    relative = str(Path(member.name).relative_to(runtime_root(variant)))
+                    relative = str(Path(member.name).relative_to(runtime_root(variant, runtime_versions[variant])))
                     if member.isfile():
                         files[relative] = hashlib.sha256(archive.extractfile(member).read()).hexdigest()
                     elif member.issym():
@@ -262,13 +295,13 @@ printf 'nemo-speech {reported_version}\\n'
                 'archiveSha256': hashlib.sha256(archive_path.read_bytes()).hexdigest(),
                 'files': files, 'symlinks': symlinks,
             }))
-        text = text.replace('$repo_dir/scripts/nemo-runtime/$variant.json',
-                            '$repo_dir/scripts/' + manifests.name + '/$variant.json')
+        text = text.replace('$repo_dir/scripts/nemo-runtime/$2.json',
+                            '$repo_dir/scripts/' + manifests.name + '/$2.json')
         script.write_text(text)
         script.chmod(0o755)
         return script
 
-    archives = {variant: fixture_archive(variant, runtime_version) for variant in ['cuda', 'cpu']}
+    archives = {variant: fixture_archive(variant, runtime_versions[variant]) for variant in ['cuda', 'vulkan', 'cpu']}
     fixture_repo = base/'nemo-fixture-repo'
     (fixture_repo/'scripts').mkdir(parents=True)
     shutil.copy2(ROOT/'scripts/check-nemo-runtime.py', fixture_repo/'scripts/check-nemo-runtime.py')
@@ -284,7 +317,8 @@ Path(os.environ["TEST_RECEIPT"]).write_text(" ".join(sys.argv[1:]))
 
     nemo_commands = base/'nemo-bin'; nemo_commands.mkdir()
     # The archive served is the one the URL names, so a wrong choice of build
-    # shows up as a wrong marker rather than passing by accident.
+    # shows up as a wrong marker rather than passing by accident. Every URL
+    # asked for is kept, in order.
     (nemo_commands/'curl').write_text(r'''#!/usr/bin/bash
 set -euo pipefail
 printf '%s\n' "$@" > "$TEST_CURL_ARGS"
@@ -302,8 +336,10 @@ while (($#)); do
   esac
 done
 [[ -n $output ]]
+printf '%s\n' "$url" >> "$TEST_CURL_URLS"
 case "$url" in
   *-cuda.tar.gz) cp "$TEST_RUNTIME_ARCHIVE_CUDA" "$output" ;;
+  *-vulkan.tar.gz) cp "$TEST_RUNTIME_ARCHIVE_VULKAN" "$output" ;;
   *-cpu.tar.gz) cp "$TEST_RUNTIME_ARCHIVE_CPU" "$output" ;;
   *) exit 22 ;;
 esac
@@ -326,6 +362,7 @@ fi
         path.chmod(0o755)
 
     curl_args = base/'curl-args'
+    curl_urls = base/'curl-urls'
     executed = base/'nemo-runtime-executed'
     receipt = base/'nemo-runtime-receipt'
     nemo_env = dict(
@@ -334,29 +371,43 @@ fi
         HOME=str(base),
         XDG_STATE_HOME=str(base/'state'),
         TEST_CURL_ARGS=str(curl_args),
+        TEST_CURL_URLS=str(curl_urls),
         TEST_RUNTIME_ARCHIVE_CUDA=str(archives['cuda']),
+        TEST_RUNTIME_ARCHIVE_VULKAN=str(archives['vulkan']),
         TEST_RUNTIME_ARCHIVE_CPU=str(archives['cpu']),
         TEST_RUNTIME_EXECUTED=str(executed),
         TEST_RECEIPT=str(receipt),
     )
     def install(prefix, script=fixture_script, **extra):
+        curl_urls.unlink(missing_ok=True)
         return subprocess.run(
             [str(script), str(prefix)], env=dict(nemo_env, **extra),
             capture_output=True, text=True, timeout=10,
         )
+    def downloaded():
+        return curl_urls.read_text().splitlines() if curl_urls.exists() else []
+
+    # The other half of each driver check is this machine's own hardware.
+    has_nvidia_kernel_driver = Path('/proc/driver/nvidia/version').exists()
+    has_vulkan_driver = bool(list(Path('/dev/dri').glob('renderD*'))) and any(
+        not driver.name.startswith('lvp_icd')
+        for folder in [Path('/usr/share/vulkan/icd.d'), Path('/etc/vulkan/icd.d')] if folder.is_dir()
+        for driver in folder.glob('*.json'))
+    gpu_build = 'vulkan' if has_vulkan_driver else 'cpu'
 
     # Without NVIDIA's driver library the CUDA build cannot even start, so a
-    # machine without it gets the CPU build.
+    # machine without it gets the Vulkan build when a GPU answers through
+    # Vulkan, and the CPU build otherwise.
     prefix = base/'nemo-runtime-good'
-    result = install(prefix)
+    result = install(prefix, TEST_ACCELERATOR='true')
     assert result.returncode == 0, result.stderr
     assert executed.exists() and (prefix/'bin/nemo-speech').exists()
-    assert (prefix/'.nemo-speech-install').read_text() == '0.1.0 linux x86_64 cpu\n'
-    assert (prefix/'share/runtime.txt').read_text() == 'verified cpu fixture\n'
+    assert (prefix/'.nemo-speech-install').read_text() == marker(gpu_build)
+    assert (prefix/'share/runtime.txt').read_text() == f'verified {gpu_build} fixture\n'
     assert receipt.read_text() == f'nemo-runtime {prefix}'
+    assert downloaded() == [url(gpu_build)]
     arguments = curl_args.read_text().splitlines()
-    assert 'https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v0.1.0/nemo-speech-0.1.0-linux-x86_64-cpu.tar.gz' in arguments
-    assert arguments[arguments.index('--max-filesize')+1] == str(archives['cpu'].stat().st_size)
+    assert arguments[arguments.index('--max-filesize')+1] == str(archives[gpu_build].stat().st_size)
     assert arguments[arguments.index('--proto')+1] == '=https'
     assert arguments[arguments.index('--proto-redir')+1] == '=https'
     assert '--tlsv1.2' in arguments
@@ -364,7 +415,7 @@ fi
 
     concurrent = base/'nemo-runtime-concurrent'
     calls = base/'runtime-concurrent-downloads'
-    concurrent_env = dict(nemo_env, TEST_CURL_CALLS=str(calls))
+    concurrent_env = dict(nemo_env, TEST_CURL_CALLS=str(calls), TEST_ACCELERATOR='true')
     first = subprocess.Popen([str(fixture_script), str(concurrent)], env=concurrent_env,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     deadline = time.monotonic() + 5
@@ -397,11 +448,23 @@ fi
     print('PASS runtime installer locking refuses planted links without changing their targets')
 
     # Running it again on the same machine downloads nothing.
-    curl_args.unlink(); receipt.unlink()
-    result = install(prefix)
+    receipt.unlink()
+    result = install(prefix, TEST_ACCELERATOR='true')
     assert result.returncode == 0, result.stderr
-    assert result.stdout == f'NeMo-Speech runtime (cpu) already installed at {prefix}\n'
-    assert not curl_args.exists() and not receipt.exists()
+    assert result.stdout == f'NeMo-Speech runtime ({gpu_build}) already installed at {prefix}\n'
+    assert downloaded() == [] and not receipt.exists()
+
+    # A Vulkan driver whose GPU does not answer gets the CPU build instead.
+    # A Vulkan build already in place stays: the server starts it on the CPU.
+    if has_vulkan_driver:
+        no_gpu = base/'nemo-runtime-no-gpu'
+        result = install(no_gpu)
+        assert result.returncode == 0, result.stderr
+        assert 'No GPU answered through Vulkan' in result.stdout
+        assert downloaded() == [url('vulkan'), url('cpu')]
+        assert (no_gpu/'.nemo-speech-install').read_text() == marker('cpu')
+        assert (no_gpu/'share/runtime.txt').read_text() == 'verified cpu fixture\n'
+        receipt.unlink()
 
     for name, relative in [('executable', 'bin/nemo-speech'),
                            ('library', 'lib/libnemo.so.1'),
@@ -442,28 +505,28 @@ fi
 
     # With the driver library present, the build follows the kernel driver:
     # a machine with an NVIDIA GPU switches to the CUDA build, one without
-    # keeps the CPU build it has.
-    has_nvidia_kernel_driver = Path('/proc/driver/nvidia/version').exists()
-    result = install(prefix, TEST_LIBCUDA='1')
+    # keeps the build it has.
+    result = install(prefix, TEST_LIBCUDA='1', TEST_ACCELERATOR='true')
     assert result.returncode == 0, result.stderr
     if has_nvidia_kernel_driver:
-        assert (prefix/'.nemo-speech-install').read_text() == '0.1.0 linux x86_64 cuda\n'
+        assert (prefix/'.nemo-speech-install').read_text() == marker('cuda')
         assert (prefix/'share/runtime.txt').read_text() == 'verified cuda fixture\n'
-        assert 'https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v0.1.0/nemo-speech-0.1.0-linux-x86_64-cuda.tar.gz' in curl_args.read_text().splitlines()
+        assert downloaded() == [url('cuda')]
         assert not (base/'nemo-runtime-good.old').exists() and not (base/'nemo-runtime-good.new').exists()
         # Losing the driver switches back.
-        result = install(prefix)
+        result = install(prefix, TEST_ACCELERATOR='true')
         assert result.returncode == 0, result.stderr
-        assert (prefix/'.nemo-speech-install').read_text() == '0.1.0 linux x86_64 cpu\n'
+        assert (prefix/'.nemo-speech-install').read_text() == marker(gpu_build)
     else:
-        assert result.stdout == f'NeMo-Speech runtime (cpu) already installed at {prefix}\n'
+        assert (prefix/'.nemo-speech-install').read_text() == marker(gpu_build)
     # Switching builds keeps the prefix OmaFlow created, so no second receipt.
     assert not receipt.exists()
 
     executed.unlink(missing_ok=True)
-    wrong_version_script = pinned_to({'cpu': fixture_archive('cpu', '9.9.9')}, 'install-nemo-wrong-version.sh')
-    result = install(base/'nemo-runtime-wrong-version', script=wrong_version_script,
-                     TEST_RUNTIME_ARCHIVE_CPU=str(base/'runtime-cpu-9.9.9.tar.gz'))
+    wrong = {variant: fixture_archive(variant, '9.9.9') for variant in ['vulkan', 'cpu']}
+    wrong_version_script = pinned_to(wrong, 'install-nemo-wrong-version.sh')
+    result = install(base/'nemo-runtime-wrong-version', script=wrong_version_script, TEST_ACCELERATOR='true',
+                     TEST_RUNTIME_ARCHIVE_VULKAN=str(wrong['vulkan']), TEST_RUNTIME_ARCHIVE_CPU=str(wrong['cpu']))
     assert result.returncode != 0 and 'did not report version' in result.stderr
     assert executed.exists() and not (base/'nemo-runtime-wrong-version').exists()
     executed.unlink()
@@ -482,7 +545,7 @@ fi
     program = 'temporary="$1"\ntrap '+"'"+target+"' EXIT\nexit 0\n"
     result = subprocess.run(['bash','-c',program,'test',str(temporary)], start_new_session=True, timeout=3)
     assert result.returncode == 0 and not temporary.exists()
-    print("PASS the NeMo runtime is one exact, bounded, verified release artifact per build, chosen by the NVIDIA driver, with no source fallback")
+    print("PASS the NeMo runtime is one exact, bounded, verified release artifact per build, chosen by the NVIDIA or Vulkan driver, with no source fallback")
 
     # Call the real catalog module without CLI notifications or a desktop session.
     # Only its checkout lookup and unused daemon callback need adapters here.

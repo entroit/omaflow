@@ -1933,6 +1933,13 @@ pub fn serve_speech() -> Result<(), String> {
         .ok_or("Speech model path must be valid UTF-8")?;
     let binary = PathBuf::from(env::var_os("HOME").ok_or("HOME is not set")?)
         .join(".local/lib/nemo-speech/bin/nemo-speech");
+    let device = crate::catalog::managed_speech_device(&config.backend.device);
+    if device != config.backend.device {
+        eprintln!(
+            "omaflow: starting speech on {device}, since the installed runtime cannot use {}",
+            config.backend.device
+        );
+    }
     let error = Command::new(binary)
         .args([
             "--quiet",
@@ -1940,7 +1947,7 @@ pub fn serve_speech() -> Result<(), String> {
             "--asr-model",
             model,
             "--backend",
-            &config.backend.device,
+            &device,
             "--host",
             host,
             "--port",

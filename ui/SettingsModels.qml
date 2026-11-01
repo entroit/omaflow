@@ -13,6 +13,8 @@ Column {
   // Which runtime build runs speech here. On the CPU the model rows show
   // times instead of GPU memory, and those times come from one computer.
   readonly property bool onCpu: app.modelCatalog.speech_runtime === "cpu"
+  // The GPU the Vulkan build runs speech on, when that is the build here.
+  readonly property string vulkanGpu: app.modelCatalog.speech_runtime === "vulkan" ? String(app.modelCatalog.speech_gpu || "") : ""
   // The model by name, a file of your own by its file name.
   readonly property string currentName: current ? String(current.label || current.id)
     : String(app.modelSettings.speech_model || "").split("/").pop()
@@ -20,8 +22,8 @@ Column {
   PageTitle {
     width: parent.width
     title: "Models"
-    subtitle: page.onCpu ? (page.app.modelCatalog.nvidia_gpu ? "Speech runs on the CPU." : "This computer has no NVIDIA GPU, so speech runs on the CPU.")
-        + " Times below are from a 6-core desktop CPU."
+    subtitle: page.onCpu ? "Speech runs on the CPU. Times below are from a 6-core desktop CPU."
+      : page.vulkanGpu.length > 0 ? "Speech runs on the " + page.vulkanGpu + " through Vulkan."
       : page.memory.length === 0 ? "Speech runs on this computer."
       : (page.app.cleanupLevel === "medium" ? "Speech and cleanup use " : "Speech uses ") + page.memory + " of GPU memory right now."
   }

@@ -81,8 +81,9 @@ with its size, the hardware it needs and its licence. A model's weights download
 only after you choose it.
 
 The first speech model also brings the speech runtime. A computer with an
-NVIDIA driver gets the CUDA build, which runs on the GPU. Any other computer
-gets the CPU build, and the Models page says so. On the CPU of a 6-core
+NVIDIA driver gets the CUDA build. One with an AMD or Intel GPU gets the
+Vulkan build, which runs on that GPU, even a laptop's built-in one. Any other
+computer gets the CPU build. The Models page says which runs. On the CPU of a 6-core
 desktop, the default model turns 30 seconds of speech into text in about
 2 seconds.
 

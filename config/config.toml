@@ -52,7 +52,8 @@ health_endpoint = ""
 # Optional bearer token for a speech server that requires one. Sent as an
 # Authorization header only when it is not empty, and never published.
 api_key = ""
-# auto uses the GPU when there is one, and the CPU otherwise.
+# auto uses the GPU when there is one, and the CPU otherwise. With the Vulkan
+# build, cuda also means its GPU.
 device = "auto"
 status_timeout_ms = 60000
 
