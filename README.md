@@ -101,6 +101,7 @@ Your own model or server works too. [Details →](docs/custom-models.md)
 | Talk hands-free | Double-tap to lock. Press again or click **Stop**. |
 | Stop a hands-free dictation without keeping it | Click **Discard** on the card. |
 | Copy without pasting | Choose **Copy only** in Settings → Basics. |
+| Keep what you had copied | Turn on **Keep my clipboard** in Settings → Basics. |
 | Use an app-specific paste key | Set it in Settings → Advanced → Hotkeys. |
 | Fix a result | Open it in History: see what cleanup changed, fix a word, paste it again. |
 

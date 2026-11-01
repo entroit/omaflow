@@ -403,6 +403,7 @@ struct SurfaceState<'a> {
     feedback_serial: u64,
     keep_models_loaded: bool,
     keep_dictation_audio: bool,
+    restore_clipboard: bool,
     paste_sent: bool,
     /// The shortcut that pastes into the window the last take was for.
     paste_key: Option<&'a PasteShortcut>,
@@ -2456,6 +2457,7 @@ impl Daemon {
             feedback_serial: self.feedback_serial,
             keep_models_loaded: self.effective_config.behavior.keep_models_loaded,
             keep_dictation_audio: self.effective_config.behavior.keep_dictation_audio,
+            restore_clipboard: self.effective_config.behavior.restore_clipboard,
             paste_sent: self.paste_sent,
             paste_key: self.paste_key.as_ref(),
             recording_elapsed_ms: if matches!(self.state.phase(), Phase::Recording { .. }) {

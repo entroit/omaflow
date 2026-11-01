@@ -40,6 +40,10 @@ paste_mode = "auto"
 # be ctrl, shift, alt or super. Settings, Advanced, Hotkeys, Custom paste writes
 # both values together.
 paste_shortcut = { modifiers = ["ctrl"], key = "V" }
+# Put back what was on the clipboard half a second after a dictation is
+# pasted, unless something newer was copied. Text comes back as plain text,
+# an image as an image. A paste that fails keeps the dictation for Ctrl+V.
+restore_clipboard = false
 
 [backend]
 engine = "nemo"

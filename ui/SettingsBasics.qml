@@ -211,9 +211,9 @@ Column {
 
     SettingRow {
       title: "Paste with"
-      caption: "Text also stays on the clipboard"
+      caption: page.app.restoreClipboard && page.app.pasteMode !== "clipboard" ? "Your clipboard comes back afterwards" : "Text also stays on the clipboard"
       alignTop: true
-      last: true
+      last: page.app.pasteMode === "clipboard"
       Column {
         width: parent.width
         spacing: 10
@@ -257,6 +257,16 @@ Column {
           }
         }
       }
+    }
+
+    // Copy only leaves the dictation on the clipboard on purpose.
+    SettingRow {
+      visible: page.app.pasteMode !== "clipboard"
+      title: "Keep my clipboard"
+      caption: "Puts back what you had copied once the dictation is pasted"
+      last: true
+      toggle: restoreToggle
+      Toggle { id: restoreToggle; label: "Keep my clipboard"; checked: page.app.restoreClipboard; onToggled: page.app.preference("restore_clipboard", !checked) }
     }
   }
 }

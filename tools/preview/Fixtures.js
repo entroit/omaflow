@@ -199,6 +199,7 @@ function state(mode, now) {
   if (mode === "history-stoppedempty") { s.history = []; s.published_at_ms = Date.now() - 60000 }
   if (mode === "settings-basics-stopped") s.published_at_ms = Date.now() - 60000
   if (mode === "history-clipboard") s.paste_mode = "clipboard"
+  if (mode === "settings-basics-restore") s.restore_clipboard = true
   // A computer without an NVIDIA GPU: the CPU build, and CPU times in the rows.
   if (mode === "settings-models-cpu") {
     var cpuTimes = ["About 2 seconds per 30 seconds of speech, and 1 GB of memory", "About 5 seconds per 30 seconds of speech, and 2 GB of memory",

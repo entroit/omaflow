@@ -18,7 +18,7 @@ if ((${#modes[@]} == 0)); then
     todos-list todos-inbox-empty todos-hover todos-today todos-upcoming todos-all todos-done todos-rowmenu todos-due todos-due-morning todos-picker todos-remindmenu todos-bubbled todos-later todos-reminder todos-settings todos-folder-move todos-listmenu
     todos-newlist todos-talking todos-editlists todos-folder-edit todos-picker-past todos-narrow settings-basics settings-words settings-privacy settings-privacy-off
     settings-models settings-ownmodel settings-cleanup settings-hotkeys settings-audio settings-audio-manual settings-updates settings-updates-later settings-updates-failed settings-updates-interrupted settings-updates-finish settings-updates-finish-running
-    settings-privacy-audio settings-basics-recording settings-basics-custom settings-basics-light
+    settings-privacy-audio settings-basics-recording settings-basics-custom settings-basics-light settings-basics-restore
     settings-models-missing settings-ownmodel-server settings-cleanup-server
     history-partly history-kept history-tabhint settings-updates-partly settings-models-downloading settings-models-cpu settings-models-vulkan settings-cleanup-light settings-privacy-trim
     overlay-holding overlay-locked overlay-processing overlay-success overlay-result overlay-notice

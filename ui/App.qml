@@ -90,6 +90,7 @@ Item {
   property bool trainingLogEnabled: false
   property bool keepModelsLoaded: true
   property bool keepDictationAudio: false
+  property bool restoreClipboard: false
   property int duckAudioPercent: 70
   property int meterGateDb: -60
   // On, the daemon follows the room's noise and places the threshold itself;
@@ -415,6 +416,7 @@ Item {
     if (!connected) phase = "idle"
     keepModelsLoaded = next.keep_models_loaded !== false
     keepDictationAudio = next.keep_dictation_audio === true
+    restoreClipboard = next.restore_clipboard === true
     historyLimit = Number(next.history_limit || 0)
     var message = String(next.feedback || "")
     var serial = Number(next.feedback_serial)

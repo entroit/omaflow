@@ -6,7 +6,8 @@ use crate::{
 };
 use omaflow_core::{journal, todos};
 use omaflow_platform::desktop::{
-    DELIVERY_LOCK, active_window, active_window_matches, paste, set_clipboard,
+    DELIVERY_LOCK, active_window, active_window_matches, clipboard_to_restore, paste,
+    restore_clipboard_later, set_clipboard,
 };
 pub use omaflow_platform::desktop::{copy_text, paste_shortcut, paste_text_now};
 use omaflow_platform::http::{HttpEndpoint, LocalPolicy};
@@ -1869,6 +1870,10 @@ fn deliver_text(
     if cancel.load(Ordering::Acquire) {
         return Err("dictation cancelled".into());
     }
+    let pasting = config.behavior.paste_mode != PasteMode::Clipboard;
+    let original = (pasting && config.behavior.restore_clipboard)
+        .then(clipboard_to_restore)
+        .flatten();
     let delivery_error = set_clipboard(text.as_bytes(), None)
         .err()
         .unwrap_or_default();
@@ -1878,9 +1883,13 @@ fn deliver_text(
     // on the clipboard in case the app ignores it or no editor has focus.
     let pasted = !cancel.load(Ordering::Acquire)
         && delivery_error.is_empty()
-        && config.behavior.paste_mode != PasteMode::Clipboard
+        && pasting
         && active_window_matches(window)
         && paste(&config.behavior.paste_delivery(), window).is_ok();
+    // A paste that did not go through leaves the transcript for Ctrl+V.
+    if pasted && let Some(original) = original {
+        restore_clipboard_later(original, text.as_bytes());
+    }
     drop(delivery_guard);
     Ok((pasted, delivery_error))
 }

@@ -293,6 +293,8 @@ pub struct Behavior {
     pub keep_models_loaded: bool,
     /// Keep each saved dictation's recording so it can be played back.
     pub keep_dictation_audio: bool,
+    /// Put the previous clipboard back after a dictation is pasted.
+    pub restore_clipboard: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -498,6 +500,7 @@ impl Default for Behavior {
             duck_audio_percent: 70,
             paste_mode: PasteMode::Auto,
             paste_shortcut: PasteShortcut::default(),
+            restore_clipboard: false,
         }
     }
 }
@@ -822,6 +825,7 @@ impl Config {
             | "duck_audio_percent"
             | "keep_models_loaded"
             | "keep_dictation_audio"
+            | "restore_clipboard"
             | "meter_gate_auto" => "behavior",
             "enabled" | "use_window_context" | "style" => "cleanup",
             _ => return Err("Unknown setting".into()),
